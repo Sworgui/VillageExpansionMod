@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+- Corrigido o import de `Heightmap`: no Yarn para Minecraft 1.21.1, a classe pertence a `net.minecraft.world`.
+- Atualizados o número da versão e o nome do artefato no workflow do GitHub Actions.
+
+# Changelog
+
 ## 0.2.0
 
 - Added an A*-planned dirt path between the existing village road network (or the settlement centre) and each new house.

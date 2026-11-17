@@ -32,7 +32,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.GlobalPos;
-import net.minecraft.util.math.Heightmap;
+import net.minecraft.world.Heightmap;
 import net.minecraft.world.World;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.village.VillagerData;
