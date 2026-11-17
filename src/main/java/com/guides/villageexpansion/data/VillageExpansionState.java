@@ -12,6 +12,7 @@ import net.minecraft.world.PersistentState;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Persistent per-dimension record of generated villages and houses.
@@ -48,7 +49,18 @@ public final class VillageExpansionState extends PersistentState {
                 houses.add(BlockPos.fromLong(((NbtLong) houseList.get(h)).longValue()));
             }
 
-            state.villages.add(new VillageRecord(id, center, common, professional, houses));
+            boolean founding = villageNbt.getBoolean("founding");
+            UUID founderUuid = null;
+            String founderText = villageNbt.getString("founderUuid");
+            if (!founderText.isBlank()) {
+                try {
+                    founderUuid = UUID.fromString(founderText);
+                } catch (IllegalArgumentException ignored) {
+                    // Ignore malformed legacy/custom data and leave the village available for recovery.
+                }
+            }
+
+            state.villages.add(new VillageRecord(id, center, common, professional, houses, founding, founderUuid));
             state.nextVillageId = Math.max(state.nextVillageId, id + 1L);
         }
         return state;
@@ -65,6 +77,8 @@ public final class VillageExpansionState extends PersistentState {
             villageNbt.putLong("center", village.center.asLong());
             villageNbt.putInt("commonHouses", village.commonHouses);
             villageNbt.putInt("professionalHouses", village.professionalHouses);
+            villageNbt.putBoolean("founding", village.founding);
+            villageNbt.putString("founderUuid", village.founderUuid == null ? "" : village.founderUuid.toString());
 
             NbtList houseList = new NbtList();
             for (BlockPos house : village.houses) {
@@ -88,10 +102,44 @@ public final class VillageExpansionState extends PersistentState {
             return nearest;
         }
 
-        VillageRecord created = new VillageRecord(nextVillageId++, anchor.toImmutable(), 0, 0, new ArrayList<>());
+        VillageRecord created = new VillageRecord(nextVillageId++, anchor.toImmutable(), 0, 0,
+                new ArrayList<>(), false, null);
         villages.add(created);
         markDirty();
         return created;
+    }
+
+    /** Finds a known settlement near a position, including one that is still being founded. */
+    public VillageRecord findNearbyVillage(BlockPos position, double maxDistance) {
+        double maxDistanceSquared = maxDistance * maxDistance;
+        return villages.stream()
+                .filter(v -> v.center.getSquaredDistance(position) <= maxDistanceSquared)
+                .min(Comparator.comparingDouble(v -> v.center.getSquaredDistance(position)))
+                .orElse(null);
+    }
+
+    /** Creates a new settlement and reserves its two-step founding sequence for one villager. */
+    public VillageRecord createFoundingVillage(BlockPos anchor, UUID founderUuid) {
+        VillageRecord nearby = findNearbyVillage(anchor, 72.0D);
+        if (nearby != null) {
+            return nearby;
+        }
+
+        VillageRecord created = new VillageRecord(nextVillageId++, anchor.toImmutable(), 0, 0,
+                new ArrayList<>(), true, founderUuid);
+        villages.add(created);
+        markDirty();
+        return created;
+    }
+
+    /** Returns the unfinished founding project owned by this villager, if any. */
+    public VillageRecord findFoundingVillageForFounder(UUID founderUuid) {
+        for (VillageRecord village : villages) {
+            if (village.founding && founderUuid.equals(village.founderUuid)) {
+                return village;
+            }
+        }
+        return null;
     }
 
     public VillageRecord getVillage(long id) {
@@ -109,13 +157,18 @@ public final class VillageExpansionState extends PersistentState {
         private int commonHouses;
         private int professionalHouses;
         private final List<BlockPos> houses;
+        private boolean founding;
+        private UUID founderUuid;
 
-        private VillageRecord(long id, BlockPos center, int commonHouses, int professionalHouses, List<BlockPos> houses) {
+        private VillageRecord(long id, BlockPos center, int commonHouses, int professionalHouses,
+                              List<BlockPos> houses, boolean founding, UUID founderUuid) {
             this.id = id;
             this.center = center.toImmutable();
             this.commonHouses = commonHouses;
             this.professionalHouses = professionalHouses;
             this.houses = houses;
+            this.founding = founding;
+            this.founderUuid = founderUuid;
         }
 
         public long id() {
@@ -127,11 +180,29 @@ public final class VillageExpansionState extends PersistentState {
         }
 
         /**
-         * Policy: two ordinary homes are completed before the next job-site home.
-         * Example: C, C, P, C, C, P...
+         * Normal policy: two ordinary homes before each job-site home.
+         * New settlements have a special C, P bootstrap sequence, then use
+         * the normal pattern (C, P, C, C, P, ...).
          */
         public boolean nextHouseIsProfessional() {
+            // A brand-new settlement starts with one ordinary home and then
+            // one matching job-site house before normal 2:1 expansion begins.
+            if (founding) {
+                return commonHouses >= 1 && professionalHouses == 0;
+            }
             return commonHouses >= (professionalHouses + 1) * 2;
+        }
+
+        public boolean isFounding() {
+            return founding;
+        }
+
+        public boolean isFounder(UUID uuid) {
+            return founderUuid != null && founderUuid.equals(uuid);
+        }
+
+        public boolean needsFoundingProfessional() {
+            return founding && commonHouses >= 1 && professionalHouses == 0;
         }
 
         public boolean isNearExistingHouse(BlockPos candidate, double minDistance) {
@@ -154,6 +225,13 @@ public final class VillageExpansionState extends PersistentState {
                 professionalHouses++;
             } else {
                 commonHouses++;
+            }
+
+            // The starter village is considered founded only after both its
+            // first home and its first workstation house have been completed.
+            if (founding && commonHouses >= 1 && professionalHouses >= 1) {
+                founding = false;
+                founderUuid = null;
             }
         }
 

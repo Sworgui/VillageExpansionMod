@@ -3,7 +3,7 @@
   "id": "village_expansion",
   "version": "${version}",
   "name": "Village Expansion",
-  "description": "Villagers expand settlements by clearing land, building roads and homes, and reproducing without requiring beds.",
+  "description": "Villagers can found new settlements, clear land, build roads and homes, and reproduce without requiring beds.",
   "authors": ["Village Expansion Contributors"],
   "contact": {
     "sources": "https://fabricmc.net/"

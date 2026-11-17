@@ -17,6 +17,6 @@ public final class VillageExpansionMod implements ModInitializer {
         BuilderProfession.register();
         ServerTickEvents.END_WORLD_TICK.register(VillageBuilderController::tickWorld);
         ServerTickEvents.END_WORLD_TICK.register(VillageBreedingController::tickWorld);
-        LOGGER.info("Village Expansion initialized: village construction, roads and bed-independent breeding enabled.");
+        LOGGER.info("Village Expansion initialized: village founding, construction, roads and bed-independent breeding enabled.");
     }
 }

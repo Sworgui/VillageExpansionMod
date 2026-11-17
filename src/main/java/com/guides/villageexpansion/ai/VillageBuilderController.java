@@ -62,6 +62,8 @@ public final class VillageBuilderController {
     private static final int TICK_STEP = 10;
     private static final int ASSIGNMENT_SCAN_INTERVAL = 100;
     private static final int RETRY_DELAY = 600;
+    // Several villagers may work on separate house projects in the same settlement.
+    private static final int MAX_BUILDERS_PER_VILLAGE = 3;
     private static final int WOOD_REQUIRED = 88;   // 22 logs converted into plank-equivalent building units
     private static final int STONE_REQUIRED = 16;  // one stone-tool-material item per foundation block
     private static final double NAV_SPEED = 0.82D;
@@ -105,16 +107,7 @@ public final class VillageBuilderController {
         if (!villager.isAlive() || villager.isBaby() || villager.isAiDisabled() || villager.hasCustomer()) {
             return;
         }
-        if (villager.getBrain().getOptionalRegisteredMemory(MemoryModuleType.HOME).isPresent()) {
-            return;
-        }
         if (world.getTime() < RETRY_AT.getOrDefault(villager.getUuid(), 0L)) {
-            return;
-        }
-
-        BlockPos anchor = findVillageAnchor(world, villager);
-        if (anchor == null) {
-            RETRY_AT.put(villager.getUuid(), world.getTime() + RETRY_DELAY);
             return;
         }
 
@@ -122,9 +115,54 @@ public final class VillageBuilderController {
                 VillageExpansionState.TYPE,
                 VillageExpansionState.STORAGE_ID
         );
-        VillageExpansionState.VillageRecord village = saved.findOrCreateVillage(anchor);
 
-        if (hasActiveBuilder(world, village.id())) {
+        // A founder must finish the starter job-site house before the first
+        // bed can permanently turn them into an ordinary resident.
+        VillageExpansionState.VillageRecord foundingVillage =
+                saved.findFoundingVillageForFounder(villager.getUuid());
+        if (foundingVillage != null && foundingVillage.isFounding()) {
+            villager.getBrain().forget(MemoryModuleType.HOME);
+        } else if (villager.getBrain().getOptionalRegisteredMemory(MemoryModuleType.HOME).isPresent()) {
+            return;
+        }
+
+        VillageExpansionState.VillageRecord village;
+        boolean createdSettlement = false;
+
+        if (foundingVillage != null) {
+            village = foundingVillage;
+        } else {
+            BlockPos anchor = findVillageAnchor(world, villager);
+            if (anchor != null) {
+                village = saved.findOrCreateVillage(anchor);
+            } else {
+                // No HOME, bell, bed, or visible village anchor nearby. Check
+                // the persistent records before creating a brand-new one.
+                village = saved.findNearbyVillage(villager.getBlockPos(), 72.0D);
+                if (village == null) {
+                    // This villager can become the founder at its current location.
+                    village = saved.createFoundingVillage(villager.getBlockPos(), villager.getUuid());
+                    createdSettlement = village.isFounding() && village.isFounder(villager.getUuid());
+                }
+            }
+        }
+
+        // The founder owns the two required starter projects. Once the founder
+        // has begun the professional house, other homeless villagers may help
+        // with ordinary houses without competing for the founding workstation.
+        if (village.isFounding() && !village.isFounder(villager.getUuid())) {
+            boolean canAssist = village.needsFoundingProfessional()
+                    && hasActiveFoundingProfessionalProject(world, village);
+            if (!canAssist) {
+                RETRY_AT.put(villager.getUuid(), world.getTime() + 600L);
+                return;
+            }
+        }
+        if (village.isFounding() && village.isFounder(villager.getUuid())) {
+            villager.getBrain().forget(MemoryModuleType.HOME);
+        }
+
+        if (countActiveBuilders(world, village.id()) >= MAX_BUILDERS_PER_VILLAGE) {
             RETRY_AT.put(villager.getUuid(), world.getTime() + 200L);
             return;
         }
@@ -135,9 +173,10 @@ public final class VillageBuilderController {
             return;
         }
 
-        boolean professional = village.nextHouseIsProfessional();
+        boolean professional = nextHouseIsProfessionalWithReservations(world, village);
         BuilderTask task = new BuilderTask(world.getRegistryKey(), village.id(), site, professional,
-                villager.getEquippedStack(EquipmentSlot.MAINHAND).copy(), villager.getVillagerData());
+                village.isFounding(), villager.getEquippedStack(EquipmentSlot.MAINHAND).copy(),
+                villager.getVillagerData());
         task.pathBlocks.addAll(createVillagePath(world, village.center(), site));
         task.treeTargets.addAll(findTreesAlongPath(world, task.pathBlocks, site));
         task.levelOperations.addAll(createLevelOperations(world, site));
@@ -145,14 +184,74 @@ public final class VillageBuilderController {
         applyBuilderProfession(villager, task);
         villager.getNavigation().stop();
 
-        VillageExpansionMod.LOGGER.info("Assigned {} house project to villager {} near {}",
-                professional ? "professional" : "ordinary", uuidShort(villager.getUuid()), site);
+        if (createdSettlement) {
+            VillageExpansionMod.LOGGER.info("Villager {} is founding a new settlement at {}",
+                    uuidShort(villager.getUuid()), village.center());
+        }
+        VillageExpansionMod.LOGGER.info("Assigned {} house project to villager {} near {}{}",
+                professional ? "professional" : "ordinary", uuidShort(villager.getUuid()), site,
+                task.foundingProject ? " (founding sequence)" : "");
     }
 
-    private static boolean hasActiveBuilder(ServerWorld world, long villageId) {
+    private static int countActiveBuilders(ServerWorld world, long villageId) {
         RegistryKey<World> dimension = world.getRegistryKey();
+        int count = 0;
         for (BuilderTask task : ACTIVE_TASKS.values()) {
             if (task.villageId == villageId && task.dimension.equals(dimension)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Include already assigned projects when choosing the next house type. This
+     * reserves the C-C-P sequence across concurrent builders instead of assigning
+     * the same house type to every worker during one assignment scan.
+     */
+    private static boolean hasActiveFoundingProfessionalProject(
+            ServerWorld world, VillageExpansionState.VillageRecord village) {
+        RegistryKey<World> dimension = world.getRegistryKey();
+        for (Map.Entry<UUID, BuilderTask> entry : ACTIVE_TASKS.entrySet()) {
+            BuilderTask active = entry.getValue();
+            if (village.isFounder(entry.getKey()) && active.villageId == village.id()
+                    && active.dimension.equals(dimension) && active.foundingProject && active.professional) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean nextHouseIsProfessionalWithReservations(
+            ServerWorld world, VillageExpansionState.VillageRecord village) {
+        if (village.isFounding()) {
+            // The first eligible project is the founder's professional house.
+            // Supporting builders are assigned ordinary houses while it runs.
+            return village.needsFoundingProfessional()
+                    && !hasActiveFoundingProfessionalProject(world, village);
+        }
+
+        int projectedCommon = village.commonHouses();
+        int projectedProfessional = village.professionalHouses();
+        RegistryKey<World> dimension = world.getRegistryKey();
+        for (BuilderTask active : ACTIVE_TASKS.values()) {
+            if (active.villageId != village.id() || !active.dimension.equals(dimension)) {
+                continue;
+            }
+            if (active.professional) {
+                projectedProfessional++;
+            } else {
+                projectedCommon++;
+            }
+        }
+        return projectedCommon >= (projectedProfessional + 1) * 2;
+    }
+
+    private static boolean isBuildSiteReserved(ServerWorld world, long villageId, BlockPos candidate) {
+        RegistryKey<World> dimension = world.getRegistryKey();
+        for (BuilderTask active : ACTIVE_TASKS.values()) {
+            if (active.villageId == villageId && active.dimension.equals(dimension)
+                    && active.site.getSquaredDistance(candidate) < 10.0D * 10.0D) {
                 return true;
             }
         }
@@ -224,7 +323,8 @@ public final class VillageBuilderController {
                 int x = center.getX() + (int) Math.round(Math.cos(angle) * radius);
                 int z = center.getZ() + (int) Math.round(Math.sin(angle) * radius);
                 BlockPos candidate = createViableSite(world, x, z);
-                if (candidate == null || village.isNearExistingHouse(candidate, 10.0D)) {
+                if (candidate == null || village.isNearExistingHouse(candidate, 10.0D)
+                        || isBuildSiteReserved(world, village.id(), candidate)) {
                     continue;
                 }
                 return candidate;
@@ -670,6 +770,14 @@ public final class VillageBuilderController {
     }
 
     private static void tickTask(ServerWorld world, VillagerEntity villager, BuilderTask task) {
+        // A small green sparkle above the head marks every villager currently
+        // assigned to construction. Spawned server-side so nearby clients see it.
+        if (world.getTime() % 20L == 0L) {
+            world.spawnParticles(ParticleTypes.HAPPY_VILLAGER,
+                    villager.getX(), villager.getY() + 1.75D, villager.getZ(),
+                    2, 0.22D, 0.12D, 0.22D, 0.0D);
+        }
+
         if (task.actionTimer > 0) {
             task.actionTimer--;
         }
@@ -939,6 +1047,21 @@ public final class VillageBuilderController {
         task.actionTimer = 10;
     }
 
+    private static boolean isWoodTargetReserved(ServerWorld world, BlockPos candidate, UUID requester) {
+        RegistryKey<World> dimension = world.getRegistryKey();
+        for (Map.Entry<UUID, BuilderTask> entry : ACTIVE_TASKS.entrySet()) {
+            if (entry.getKey().equals(requester)) {
+                continue;
+            }
+            BuilderTask active = entry.getValue();
+            if (active.dimension.equals(dimension) && active.currentResource != null
+                    && active.currentResource.block().equals(candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static ResourceTarget findWoodTarget(ServerWorld world, BlockPos around, VillagerEntity villager) {
         ResourceTarget best = null;
         double bestDistance = Double.MAX_VALUE;
@@ -953,6 +1076,9 @@ public final class VillageBuilderController {
                 for (int y = groundY + 1; y <= groundY + 14; y++) {
                     BlockPos pos = new BlockPos(x, y, z);
                     if (!isLoaded(world, pos) || !world.getBlockState(pos).isIn(BlockTags.LOGS)) {
+                        continue;
+                    }
+                    if (isWoodTargetReserved(world, pos, villager.getUuid())) {
                         continue;
                     }
                     if (world.getBlockState(pos.down()).isIn(BlockTags.LOGS) || !hasNearbyLeaves(world, pos)) {
@@ -977,7 +1103,8 @@ public final class VillageBuilderController {
         if (task.stone >= STONE_REQUIRED) {
             villager.getNavigation().stop();
             task.moveTarget = null;
-            task.blueprint = createBlueprint(task.site, task.professional);
+            task.blueprint = createBlueprint(task.site, task.professional,
+                    task.foundingProject ? task.originalVillagerData.getProfession() : VillagerProfession.NONE);
             task.stage = Stage.BUILD;
             return;
         }
@@ -1041,6 +1168,21 @@ public final class VillageBuilderController {
         task.actionTimer = 10;
     }
 
+    private static boolean isStoneTargetReserved(ServerWorld world, BlockPos candidate, UUID requester) {
+        RegistryKey<World> dimension = world.getRegistryKey();
+        for (Map.Entry<UUID, BuilderTask> entry : ACTIVE_TASKS.entrySet()) {
+            if (entry.getKey().equals(requester)) {
+                continue;
+            }
+            BuilderTask active = entry.getValue();
+            if (active.dimension.equals(dimension) && active.currentMine != null
+                    && active.currentMine.rock().equals(candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static MiningTarget findStoneTarget(ServerWorld world, BlockPos around, VillagerEntity villager) {
         MiningTarget best = null;
         double bestDistance = Double.MAX_VALUE;
@@ -1060,7 +1202,8 @@ public final class VillageBuilderController {
                 for (int y = surfaceY; y >= Math.max(world.getBottomY(), surfaceY - 12); y--) {
                     BlockPos rockPos = new BlockPos(x, y, z);
                     BlockState rockState = world.getBlockState(rockPos);
-                    if (!rockState.isIn(BlockTags.BASE_STONE_OVERWORLD)) {
+                    if (!rockState.isIn(BlockTags.BASE_STONE_OVERWORLD)
+                            || isStoneTargetReserved(world, rockPos, villager.getUuid())) {
                         continue;
                     }
 
@@ -1202,7 +1345,8 @@ public final class VillageBuilderController {
         task.actionTimer = 2;
     }
 
-    private static List<BlockPlacement> createBlueprint(BlockPos base, boolean professional) {
+    private static List<BlockPlacement> createBlueprint(BlockPos base, boolean professional,
+                                                         VillagerProfession founderProfession) {
         List<BlockPlacement> blocks = new ArrayList<>();
         // Raised foundation and wooden floor.
         for (int x = 0; x < 5; x++) {
@@ -1260,7 +1404,7 @@ public final class VillageBuilderController {
         add(blocks, base, 2, 2, 1, bed.with(BedBlock.PART, BedPart.HEAD));
 
         if (professional) {
-            add(blocks, base, 3, 2, 2, chooseWorkstation(base));
+            add(blocks, base, 3, 2, 2, chooseWorkstation(base, founderProfession));
         }
 
         // Basic interior lighting helps keep newly built homes usable at night.
@@ -1270,8 +1414,33 @@ public final class VillageBuilderController {
         return blocks;
     }
 
-    private static BlockState chooseWorkstation(BlockPos base) {
-        // Rotate through useful vanilla professions based on the site's coordinates.
+    private static BlockState chooseWorkstation(BlockPos base, VillagerProfession founderProfession) {
+        // In a brand-new settlement, make the first job-site house match the
+        // founder's existing job whenever that profession has a vanilla POI.
+        Identifier professionId = Registries.VILLAGER_PROFESSION.getId(founderProfession);
+        if (professionId != null) {
+            BlockState matching = switch (professionId.getPath()) {
+                case "farmer" -> Blocks.COMPOSTER.getDefaultState();
+                case "armorer" -> Blocks.BLAST_FURNACE.getDefaultState();
+                case "toolsmith" -> Blocks.SMITHING_TABLE.getDefaultState();
+                case "weaponsmith" -> Blocks.GRINDSTONE.getDefaultState();
+                case "butcher" -> Blocks.SMOKER.getDefaultState();
+                case "fisherman" -> Blocks.BARREL.getDefaultState();
+                case "cartographer" -> Blocks.CARTOGRAPHY_TABLE.getDefaultState();
+                case "fletcher" -> Blocks.FLETCHING_TABLE.getDefaultState();
+                case "librarian" -> Blocks.LECTERN.getDefaultState();
+                case "mason" -> Blocks.STONECUTTER.getDefaultState();
+                case "leatherworker" -> Blocks.CAULDRON.getDefaultState();
+                case "cleric" -> Blocks.BREWING_STAND.getDefaultState();
+                case "shepherd" -> Blocks.LOOM.getDefaultState();
+                default -> null;
+            };
+            if (matching != null) {
+                return matching;
+            }
+        }
+
+        // For unemployed/nitwit villagers, rotate through useful vanilla jobs.
         BlockState[] workstations = {
                 Blocks.COMPOSTER.getDefaultState(),
                 Blocks.BLAST_FURNACE.getDefaultState(),
@@ -1326,10 +1495,22 @@ public final class VillageBuilderController {
             saved.markDirty();
         }
 
-        // Reserve the bed memory for the builder so it does not immediately
-        // start another house while vanilla POI sensors update.
-        BlockPos bedPos = task.site.add(0, 2, -1);
-        villager.getBrain().remember(MemoryModuleType.HOME, GlobalPos.create(world.getRegistryKey(), bedPos));
+        boolean founderNeedsJobHouse = village != null
+                && village.isFounding()
+                && village.needsFoundingProfessional()
+                && village.isFounder(villager.getUuid());
+
+        // The founder's first home is deliberately left unclaimed for the
+        // moment. The same villager must build the professional house next.
+        // Clear HOME so POI sensors cannot accidentally stop that second step.
+        if (founderNeedsJobHouse) {
+            villager.getBrain().forget(MemoryModuleType.HOME);
+        } else {
+            BlockPos bedPos = task.site.add(0, 2, -1);
+            villager.getBrain().remember(MemoryModuleType.HOME,
+                    GlobalPos.create(world.getRegistryKey(), bedPos));
+        }
+
         villager.getNavigation().stop();
         restoreBuilderProfession(villager, task);
         villager.equipStack(EquipmentSlot.MAINHAND, task.originalMainHand.copy());
@@ -1339,7 +1520,14 @@ public final class VillageBuilderController {
         world.playSound(null, task.site, SoundEvents.BLOCK_WOOD_PLACE, SoundCategory.BLOCKS, 0.9F, 1.0F);
 
         ACTIVE_TASKS.remove(villager.getUuid());
-        RETRY_AT.put(villager.getUuid(), world.getTime() + 24_000L);
+        RETRY_AT.put(villager.getUuid(), world.getTime() + (founderNeedsJobHouse ? 100L : 24_000L));
+        if (founderNeedsJobHouse) {
+            VillageExpansionMod.LOGGER.info("Villager {} completed the starter home at {} and will build the founding job-site house next.",
+                    uuidShort(villager.getUuid()), task.site);
+        } else if (task.foundingProject && village != null && !village.isFounding()) {
+            VillageExpansionMod.LOGGER.info("Villager {} founded a settlement with its first home and professional house.",
+                    uuidShort(villager.getUuid()));
+        }
         VillageExpansionMod.LOGGER.info("Villager {} completed a {} house at {}. Village totals: {} ordinary, {} professional.",
                 uuidShort(villager.getUuid()), task.professional ? "professional" : "ordinary", task.site,
                 village == null ? "?" : village.commonHouses(),
@@ -1411,6 +1599,7 @@ public final class VillageBuilderController {
         private final long villageId;
         private final BlockPos site;
         private final boolean professional;
+        private final boolean foundingProject;
         private final ItemStack originalMainHand;
         private final VillagerData originalVillagerData;
         private final List<BlockPos> treeTargets = new ArrayList<>();
@@ -1436,11 +1625,13 @@ public final class VillageBuilderController {
         private boolean plotVegetationCleared;
 
         private BuilderTask(RegistryKey<World> dimension, long villageId, BlockPos site,
-                            boolean professional, ItemStack originalMainHand, VillagerData originalVillagerData) {
+                            boolean professional, boolean foundingProject,
+                            ItemStack originalMainHand, VillagerData originalVillagerData) {
             this.dimension = dimension;
             this.villageId = villageId;
             this.site = site.toImmutable();
             this.professional = professional;
+            this.foundingProject = foundingProject;
             this.originalMainHand = originalMainHand;
             this.originalVillagerData = originalVillagerData;
         }
