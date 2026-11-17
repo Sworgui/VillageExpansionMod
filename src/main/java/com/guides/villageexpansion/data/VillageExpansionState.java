@@ -4,6 +4,7 @@ import net.minecraft.datafixer.DataFixTypes;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.nbt.NbtList;
+import net.minecraft.nbt.NbtLong;
 import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.PersistentState;
@@ -44,7 +45,7 @@ public final class VillageExpansionState extends PersistentState {
             List<BlockPos> houses = new ArrayList<>();
             NbtList houseList = villageNbt.getList("houses", NbtElement.LONG_TYPE);
             for (int h = 0; h < houseList.size(); h++) {
-                houses.add(BlockPos.fromLong(houseList.getLong(h)));
+                houses.add(BlockPos.fromLong(((NbtLong) houseList.get(h)).longValue()));
             }
 
             state.villages.add(new VillageRecord(id, center, common, professional, houses));

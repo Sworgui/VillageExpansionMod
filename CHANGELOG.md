@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+- Corrigido o carregamento da lista NBT de casas: `NbtList` não possui `getLong(int)` na API Yarn 1.21.1. Agora o código lê o elemento como `NbtLong` e usa `longValue()`.
+- Atualizados a versão do mod, o nome do artefato do GitHub Actions e a documentação para 0.2.2.
+
 ## 0.2.1
 - Corrigido o import de `Heightmap`: no Yarn para Minecraft 1.21.1, a classe pertence a `net.minecraft.world`.
 - Atualizados o número da versão e o nome do artefato no workflow do GitHub Actions.

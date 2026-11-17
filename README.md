@@ -4,14 +4,14 @@ Mod para Fabric que faz os Villagers participarem da expansão da própria vila:
 
 ## Alvo desta versão
 
-- Versão corretiva **0.2.1**: corrigido o pacote do import `Heightmap` para `net.minecraft.world.Heightmap`, conforme os mappings Yarn de Minecraft 1.21.1.
+- Versão corretiva **0.2.2**: corrigido o pacote do import `Heightmap` para `net.minecraft.world.Heightmap`, conforme os mappings Yarn de Minecraft 1.21.1.
 
 - Minecraft: **1.21.1**
 - Java: **21**
 - Fabric Loader: **0.16.14 ou superior**
 - Fabric API: **0.116.17+1.21.1**
 - Fabric Loom: **1.10.5**
-- Versão do mod: **0.2.1**
+- Versão do mod: **0.2.2**
 
 > Esta entrega contém o **projeto-fonte**. O `.jar` não foi compilado nem testado dentro de uma instância real do Minecraft neste ambiente.
 
@@ -61,7 +61,7 @@ Como o mod adiciona uma textura de profissão, instale o mod tanto no **servidor
 ### Servidor
 
 1. Instale um servidor Fabric para Minecraft 1.21.1.
-2. Coloque `village-expansion-0.2.1.jar` na pasta `mods` do servidor.
+2. Coloque `village-expansion-0.2.2.jar` na pasta `mods` do servidor.
 3. Coloque uma versão compatível da Fabric API na mesma pasta.
 4. Instale o mesmo mod e Fabric API nas instâncias dos jogadores para carregar a textura personalizada.
 5. Inicie o servidor. A lógica de construção e reprodução roda no lado servidor.
@@ -83,7 +83,7 @@ gradle build
 O arquivo será gerado em:
 
 ```text
-build/libs/village-expansion-0.2.1.jar
+build/libs/village-expansion-0.2.2.jar
 ```
 
 ## Ajustes rápidos
@@ -101,7 +101,7 @@ As constantes principais ficam em `VillageBuilderController.java` e `VillageBree
 
 O raio para escolher lotes fica entre 12 e 36 blocos do centro registrado da vila. A procura por madeira alcança 32 blocos do lote, e a procura por pedra alcança 22 blocos. A busca A* da estrada tem limite de 8.000 nós expandidos por projeto para evitar buscas ilimitadas.
 
-## Limitações conhecidas da versão 0.2.1
+## Limitações conhecidas da versão 0.2.2
 
 - **Somente Minecraft 1.21.1:** versões posteriores precisam de atualização de mappings, dependências e testes próprios. O mesmo JAR não deve ser considerado compatível automaticamente com versões futuras.
 - A descoberta de vila depende de um Villager próximo que já tenha `HOME` ou de um sino/uma cama nas redondezas. Uma área sem esses marcadores pode não ser reconhecida como vila.
@@ -146,6 +146,6 @@ O projeto inclui o workflow `.github/workflows/build.yml`. Para compilar sem ins
 3. Abra a aba **Actions** do repositório.
 4. Se solicitado, habilite os workflows.
 5. Faça um commit/push ou abra o workflow **Build Fabric mod** e clique em **Run workflow**.
-6. Quando a execução terminar com sucesso, abra a execução e baixe o artefato `village-expansion-0.2.1` na seção **Artifacts**.
+6. Quando a execução terminar com sucesso, abra a execução e baixe o artefato `village-expansion-0.2.2` na seção **Artifacts**.
 
 O workflow configura Java 21 e Gradle 8.12 no runner do GitHub, executa `gradle clean build` e disponibiliza o JAR por 14 dias. Se a compilação falhar, abra a etapa **Build mod** para consultar o log.
