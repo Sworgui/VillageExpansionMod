@@ -32,7 +32,7 @@ jobs:
       - name: Upload mod JAR
         uses: actions/upload-artifact@v4
         with:
-          name: village-expansion-0.2.2
-          path: build/libs/village-expansion-0.2.2.jar
+          name: village-expansion-0.2.4
+          path: build/libs/village-expansion-0.2.4.jar
           if-no-files-found: error
           retention-days: 14
