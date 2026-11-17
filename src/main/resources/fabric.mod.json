@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "village_expansion",
+  "version": "${version}",
+  "name": "Village Expansion",
+  "description": "Villagers expand settlements by clearing land, building roads and homes, and reproducing without requiring beds.",
+  "authors": ["Village Expansion Contributors"],
+  "contact": {
+    "sources": "https://fabricmc.net/"
+  },
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.guides.villageexpansion.VillageExpansionMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "=${minecraft_version}",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
