@@ -14,7 +14,10 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.passive.VillagerEntity;
+import net.minecraft.entity.ai.brain.Activity;
+import net.minecraft.entity.ai.brain.Brain;
 import net.minecraft.entity.ai.brain.MemoryModuleType;
+import net.minecraft.entity.ai.brain.Schedule;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -76,7 +79,10 @@ public final class VillageBuilderController {
     }
 
     public static void tickWorld(ServerWorld world) {
-        if (world.getTime() % TICK_STEP != 0L) {
+        boolean isStepTick = world.getTime() % TICK_STEP == 0L;
+        boolean isScanTick = world.getTime() % ASSIGNMENT_SCAN_INTERVAL == 0L;
+
+        if (!isStepTick && ACTIVE_TASKS.isEmpty()) {
             return;
         }
 
@@ -89,17 +95,79 @@ public final class VillageBuilderController {
             BuilderTask task = ACTIVE_TASKS.get(uuid);
             if (task != null) {
                 if (!villager.isAlive() || villager.isRemoved() || !task.dimension.equals(world.getRegistryKey())) {
-                    abandonTask(villager, task);
+                    abandonTask(world, villager, task);
                     continue;
                 }
-                tickTask(world, villager, task);
+
+                // Block vanilla wandering/stroll tasks every tick so the builder stays on route.
+                suppressVanillaBrain(world, villager);
+                maintainBuilderNavigation(villager, task);
+
+                if (isStepTick) {
+                    tickTask(world, villager, task);
+                }
                 continue;
             }
 
-            restoreOrphanedBuilderProfession(villager);
-            if (world.getTime() % ASSIGNMENT_SCAN_INTERVAL == 0L) {
-                tryAssignBuilder(world, villager);
+            if (isStepTick) {
+                restoreOrphanedBuilderProfession(world, villager);
+                if (isScanTick) {
+                    tryAssignBuilder(world, villager);
+                }
             }
+        }
+    }
+
+    /**
+     * Disables vanilla Brain activities (IDLE/WORK/MEET/REST/CORE wandering) and clears
+     * movement memories while the villager is actively assigned to a building project.
+     */
+    private static void suppressVanillaBrain(ServerWorld world, VillagerEntity villager) {
+        Brain<VillagerEntity> brain = villager.getBrain();
+        brain.stopAllTasks(world, villager);
+        brain.setSchedule(Schedule.EMPTY);
+        brain.setCoreActivities(Set.of());
+        brain.resetPossibleActivities(List.of());
+        brain.forget(MemoryModuleType.WALK_TARGET);
+        brain.forget(MemoryModuleType.LOOK_TARGET);
+        brain.forget(MemoryModuleType.INTERACTION_TARGET);
+        brain.forget(MemoryModuleType.BREED_TARGET);
+        brain.forget(MemoryModuleType.MEETING_POINT);
+        brain.forget(MemoryModuleType.JOB_SITE);
+        brain.forget(MemoryModuleType.POTENTIAL_JOB_SITE);
+        brain.forget(MemoryModuleType.CANT_REACH_WALK_TARGET_SINCE);
+        brain.forget(MemoryModuleType.PATH);
+
+        // Keep basic water/lava float behavior active while CORE brain tasks are paused.
+        if (villager.isTouchingWater() || villager.isInLava()) {
+            villager.getJumpControl().setActive();
+        }
+    }
+
+    /**
+     * Ensures in every server tick that the villager keeps moving toward its active
+     * construction moveTarget without stalling or drifting off route.
+     */
+    private static void maintainBuilderNavigation(VillagerEntity villager, BuilderTask task) {
+        BlockPos target = task.moveTarget;
+        if (target == null) {
+            return;
+        }
+        double distanceSquared = villager.squaredDistanceTo(
+                target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D);
+        if (distanceSquared <= 4.0D) {
+            task.moveTarget = null;
+            villager.getNavigation().stop();
+            return;
+        }
+        BlockPos currentNavTarget = villager.getNavigation().getTargetPos();
+        if (villager.getNavigation().isIdle()
+                || currentNavTarget == null
+                || !currentNavTarget.isWithinDistance(target, 1.5D)) {
+            villager.getNavigation().startMovingTo(
+                    target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D, NAV_SPEED);
+        } else {
+            villager.getNavigation().setSpeed(NAV_SPEED);
         }
     }
 
@@ -182,6 +250,7 @@ public final class VillageBuilderController {
         task.levelOperations.addAll(createLevelOperations(world, site));
         ACTIVE_TASKS.put(villager.getUuid(), task);
         applyBuilderProfession(villager, task);
+        suppressVanillaBrain(world, villager);
         villager.getNavigation().stop();
 
         if (createdSettlement) {
@@ -1466,14 +1535,24 @@ public final class VillageBuilderController {
     private static boolean moveNear(VillagerEntity villager, BuilderTask task, BlockPos target, double speed) {
         double distanceSquared = villager.squaredDistanceTo(target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D);
         if (distanceSquared <= 4.0D) {
-            task.moveTarget = target.toImmutable();
+            task.moveTarget = null;
+            villager.getNavigation().stop();
             return true;
         }
 
-        if (task.moveTarget == null || !task.moveTarget.equals(target) || villager.getNavigation().isIdle()) {
-            villager.getNavigation().startMovingTo(target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D, speed);
+        BlockPos currentNavTarget = villager.getNavigation().getTargetPos();
+        boolean wrongDestination = currentNavTarget == null || !currentNavTarget.isWithinDistance(target, 1.5D);
+
+        if (task.moveTarget == null
+                || !task.moveTarget.equals(target)
+                || villager.getNavigation().isIdle()
+                || wrongDestination) {
             task.moveTarget = target.toImmutable();
+            villager.getNavigation().startMovingTo(target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D, speed);
+        } else {
+            villager.getNavigation().setSpeed(speed);
         }
+        villager.getLookControl().lookAt(target.getX() + 0.5D, target.getY() + 0.5D, target.getZ() + 0.5D);
         return false;
     }
 
@@ -1500,6 +1579,10 @@ public final class VillageBuilderController {
                 && village.needsFoundingProfessional()
                 && village.isFounder(villager.getUuid());
 
+        villager.getNavigation().stop();
+        restoreBuilderProfession(villager, task);
+        villager.reinitializeBrain(world);
+
         // The founder's first home is deliberately left unclaimed for the
         // moment. The same villager must build the professional house next.
         // Clear HOME so POI sensors cannot accidentally stop that second step.
@@ -1511,8 +1594,6 @@ public final class VillageBuilderController {
                     GlobalPos.create(world.getRegistryKey(), bedPos));
         }
 
-        villager.getNavigation().stop();
-        restoreBuilderProfession(villager, task);
         villager.equipStack(EquipmentSlot.MAINHAND, task.originalMainHand.copy());
         world.spawnParticles(ParticleTypes.HAPPY_VILLAGER,
                 task.site.getX() + 0.5D, task.site.getY() + 4.0D, task.site.getZ() + 0.5D,
@@ -1534,9 +1615,12 @@ public final class VillageBuilderController {
                 village == null ? "?" : village.professionalHouses());
     }
 
-    private static void abandonTask(VillagerEntity villager, BuilderTask task) {
+    private static void abandonTask(ServerWorld world, VillagerEntity villager, BuilderTask task) {
         villager.getNavigation().stop();
         restoreBuilderProfession(villager, task);
+        if (villager.isAlive() && !villager.isRemoved()) {
+            villager.reinitializeBrain(world);
+        }
         villager.equipStack(EquipmentSlot.MAINHAND, task.originalMainHand.copy());
         ACTIVE_TASKS.remove(villager.getUuid());
         RETRY_AT.put(villager.getUuid(), 0L);
@@ -1554,7 +1638,7 @@ public final class VillageBuilderController {
     }
 
     /** Recovers the original job if the server restarted while a villager was building. */
-    private static void restoreOrphanedBuilderProfession(VillagerEntity villager) {
+    private static void restoreOrphanedBuilderProfession(ServerWorld world, VillagerEntity villager) {
         if (!villager.getVillagerData().getProfession().equals(BuilderProfession.BUILDER)) {
             return;
         }
@@ -1563,6 +1647,7 @@ public final class VillageBuilderController {
                 .findFirst().orElse(null);
         if (savedTag == null) {
             villager.setVillagerData(villager.getVillagerData().withProfession(VillagerProfession.NONE));
+            villager.reinitializeBrain(world);
             return;
         }
         Identifier originalId = Identifier.tryParse(savedTag.substring(ORIGINAL_PROFESSION_TAG_PREFIX.length()));
@@ -1571,6 +1656,7 @@ public final class VillageBuilderController {
                 : Registries.VILLAGER_PROFESSION.getOrEmpty(originalId).orElse(VillagerProfession.NONE);
         villager.setVillagerData(villager.getVillagerData().withProfession(original));
         removeOriginalProfessionTags(villager);
+        villager.reinitializeBrain(world);
     }
 
     private static void removeOriginalProfessionTags(VillagerEntity villager) {

@@ -1,6 +1,7 @@
 # Changelog
 
 ## 0.2.4
+- Blocks vanilla Villager Brain wandering/stroll tasks (`suppressVanillaBrain`) and enforces builder route navigation every tick until the assigned house project finishes, then restores the vanilla Brain (`reinitializeBrain`).
 - Adds a green happy-villager particle sparkle above every villager with an active construction assignment.
 - Allows up to three active builders per village; up to two assistants may build ordinary houses while the founder works on the starter professional house.
 - Reserves active build plots and active wood/stone targets so concurrent workers avoid overlapping house sites and resource extraction.
