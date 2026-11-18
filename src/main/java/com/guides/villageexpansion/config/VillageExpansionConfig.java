@@ -34,12 +34,22 @@ public final class VillageExpansionConfig {
     public static int mineExclusionRadius = 24;
     public static int houseSpacing = 12;
     public static boolean blacksmithToolUpgrades = true;
-    public static int woodRequired = 88;
-    public static int stoneRequired = 16;
+    /** Legacy values retained for config migration; construction now derives exact blueprint requirements. */
+    public static int woodRequired = 0;
+    public static int stoneRequired = 0;
     public static int woodUnitsPerLog = 4;
     public static int woodSearchRadius = 32;
+    public static boolean replantSaplings = true;
+    public static int saplingPlantRadius = 10;
+    public static int materialSearchRadius = 28;
+    public static int materialSearchIntervalTicks = 100;
+    public static boolean useRecipeBookForCrafting = true;
     public static int maxPathSearchNodes = 8000;
     public static int buildBlockDelayTicks = 2;
+    public static int navigationStallTimeoutTicks = 100;
+    public static int navigationReassertIntervalTicks = 10;
+    public static int navigationMaxRepaths = 4;
+    public static int noResourceSearchLimit = 6;
     public static int houseSearchMinRadius = 12;
     public static int houseSearchMaxRadius = 44;
     public static int houseSearchStep = 4;
@@ -81,12 +91,21 @@ public final class VillageExpansionConfig {
             mineExclusionRadius = clamp(integer(json, "mineExclusionRadius", 24), 8, 64);
             houseSpacing = clamp(integer(json, "houseSpacing", 12), 6, 32);
             blacksmithToolUpgrades = bool(json, "blacksmithToolUpgrades", true);
-            woodRequired = clamp(integer(json, "woodRequired", 88), 16, 512);
-            stoneRequired = clamp(integer(json, "stoneRequired", 16), 4, 256);
+            woodRequired = 0; // Deprecated: exact requirements are derived from the selected structure.
+            stoneRequired = 0; // Deprecated: exact requirements are derived from the selected structure.
             woodUnitsPerLog = clamp(integer(json, "woodUnitsPerLog", 4), 1, 8);
             woodSearchRadius = clamp(integer(json, "woodSearchRadius", 32), 8, 96);
+            replantSaplings = bool(json, "replantSaplings", true);
+            saplingPlantRadius = clamp(integer(json, "saplingPlantRadius", 10), 3, 32);
+            materialSearchRadius = clamp(integer(json, "materialSearchRadius", 28), 8, 96);
+            materialSearchIntervalTicks = clamp(integer(json, "materialSearchIntervalTicks", 100), 20, 1200);
+            useRecipeBookForCrafting = bool(json, "useRecipeBookForCrafting", true);
             maxPathSearchNodes = clamp(integer(json, "maxPathSearchNodes", 8000), 500, 50000);
             buildBlockDelayTicks = clamp(integer(json, "buildBlockDelayTicks", 2), 1, 40);
+            navigationStallTimeoutTicks = clamp(integer(json, "navigationStallTimeoutTicks", 100), 40, 1200);
+            navigationReassertIntervalTicks = clamp(integer(json, "navigationReassertIntervalTicks", 10), 1, 100);
+            navigationMaxRepaths = clamp(integer(json, "navigationMaxRepaths", 4), 1, 12);
+            noResourceSearchLimit = clamp(integer(json, "noResourceSearchLimit", 6), 1, 30);
             houseSearchMinRadius = clamp(integer(json, "houseSearchMinRadius", 12), 4, 64);
             houseSearchMaxRadius = clamp(integer(json, "houseSearchMaxRadius", 44), houseSearchMinRadius, 128);
             houseSearchStep = clamp(integer(json, "houseSearchStep", 4), 1, 16);
@@ -127,8 +146,17 @@ public final class VillageExpansionConfig {
         json.addProperty("stoneRequired", stoneRequired);
         json.addProperty("woodUnitsPerLog", woodUnitsPerLog);
         json.addProperty("woodSearchRadius", woodSearchRadius);
+        json.addProperty("replantSaplings", replantSaplings);
+        json.addProperty("saplingPlantRadius", saplingPlantRadius);
+        json.addProperty("materialSearchRadius", materialSearchRadius);
+        json.addProperty("materialSearchIntervalTicks", materialSearchIntervalTicks);
+        json.addProperty("useRecipeBookForCrafting", useRecipeBookForCrafting);
         json.addProperty("maxPathSearchNodes", maxPathSearchNodes);
         json.addProperty("buildBlockDelayTicks", buildBlockDelayTicks);
+        json.addProperty("navigationStallTimeoutTicks", navigationStallTimeoutTicks);
+        json.addProperty("navigationReassertIntervalTicks", navigationReassertIntervalTicks);
+        json.addProperty("navigationMaxRepaths", navigationMaxRepaths);
+        json.addProperty("noResourceSearchLimit", noResourceSearchLimit);
         json.addProperty("houseSearchMinRadius", houseSearchMinRadius);
         json.addProperty("houseSearchMaxRadius", houseSearchMaxRadius);
         json.addProperty("houseSearchStep", houseSearchStep);

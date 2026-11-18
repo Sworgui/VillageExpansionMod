@@ -9,11 +9,7 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
 
-/**
- * Suppresses only the vanilla Brain tick while a builder has the initiative.
- * Navigation, sensing, vanilla mob updates and entity movement continue to tick.
- * Danger and night conditions return control to the Brain for fleeing/sleeping.
- */
+/** Keeps the full vanilla Brain alive, then gives an active construction task the final navigation priority. */
 @Mixin(VillagerEntity.class)
 public abstract class VillagerEntityMixin {
     @Redirect(
@@ -25,9 +21,9 @@ public abstract class VillagerEntityMixin {
     )
     private void villageExpansion$prioritizeConstruction(
             Brain brain, ServerWorld world, LivingEntity entity) {
-        VillagerEntity villager = (VillagerEntity) (Object) this;
-        if (!VillageBuilderController.shouldSuppressVanillaBrain(villager)) {
-            brain.tick(world, entity);
+        brain.tick(world, entity);
+        if (entity instanceof VillagerEntity villager) {
+            VillageBuilderController.afterVanillaBrainTick(villager);
         }
     }
 }

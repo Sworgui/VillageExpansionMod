@@ -1,6 +1,7 @@
 package com.guides.villageexpansion.structures;
 
 import com.guides.villageexpansion.mixin.StructureTemplateAccessor;
+import com.guides.villageexpansion.compat.ProfessionCompatibilityRegistry;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.DoorBlock;
 import net.minecraft.block.enums.DoubleBlockHalf;
@@ -28,6 +29,10 @@ public final class VillageTemplateLibrary {
     public static Optional<HouseTemplate> chooseHouse(ServerWorld world, BlockPos near,
                                                        boolean professional, boolean prioritizeSmith) {
         String style = villageStyle(world, near);
+        if (professional) {
+            Optional<HouseTemplate> modded = ProfessionCompatibilityRegistry.chooseHouse(world, near, style);
+            if (modded.isPresent()) return modded;
+        }
         String base = "village/" + style + "/houses/";
         List<String> candidates = new ArrayList<>();
 
@@ -132,15 +137,25 @@ public final class VillageTemplateLibrary {
                     .thenComparingInt(b -> b.offset().getX()));
             BlockPos workstation = null;
             BlockPos bell = null;
+            Identifier professionId = null;
             for (TemplateBlock block : blocks) {
-                if (isWorkstation(block.state()) && workstation == null) workstation = block.offset();
+                if (isWorkstation(block.state())) {
+                    Identifier candidateProfession = professionForWorkstation(block.state());
+                    boolean configuredExternalStation = ProfessionCompatibilityRegistry
+                            .professionForWorkstation(block.state().getBlock()).isPresent();
+                    if (workstation == null || configuredExternalStation) {
+                        workstation = block.offset();
+                        professionId = candidateProfession;
+                    }
+                }
                 if (block.state().isOf(Blocks.BELL) && bell == null) bell = block.offset();
             }
-            return new HouseTemplate(id, template.getSize(), blocks, bed, door, doorFacing, workstation, bell);
+            return new HouseTemplate(id, template.getSize(), blocks, bed, door, doorFacing,
+                    workstation, bell, professionId);
         });
     }
 
-    private static String villageStyle(ServerWorld world, BlockPos pos) {
+    public static String villageStyle(ServerWorld world, BlockPos pos) {
         String biome = world.getBiome(pos).getKey().map(key -> key.getValue().getPath()).orElse("plains");
         if (biome.contains("desert")) return "desert";
         if (biome.contains("savanna")) return "savanna";
@@ -157,14 +172,33 @@ public final class VillageTemplateLibrary {
                 || state.isOf(Blocks.CARTOGRAPHY_TABLE) || state.isOf(Blocks.FLETCHING_TABLE)
                 || state.isOf(Blocks.LECTERN) || state.isOf(Blocks.STONECUTTER)
                 || state.isOf(Blocks.CAULDRON) || state.isOf(Blocks.BREWING_STAND)
-                || state.isOf(Blocks.LOOM);
+                || state.isOf(Blocks.LOOM) || ProfessionCompatibilityRegistry.isRegisteredWorkstation(state.getBlock());
     }
 
     public record TemplateBlock(BlockPos offset, BlockState state) {}
 
+    private static Identifier professionForWorkstation(BlockState state) {
+        Optional<Identifier> configured = ProfessionCompatibilityRegistry.professionForWorkstation(state.getBlock());
+        if (configured.isPresent()) return configured.get();
+        if (state.isOf(Blocks.COMPOSTER)) return Identifier.of("minecraft", "farmer");
+        if (state.isOf(Blocks.BLAST_FURNACE)) return Identifier.of("minecraft", "armorer");
+        if (state.isOf(Blocks.SMITHING_TABLE)) return Identifier.of("minecraft", "toolsmith");
+        if (state.isOf(Blocks.GRINDSTONE)) return Identifier.of("minecraft", "weaponsmith");
+        if (state.isOf(Blocks.SMOKER)) return Identifier.of("minecraft", "butcher");
+        if (state.isOf(Blocks.BARREL)) return Identifier.of("minecraft", "fisherman");
+        if (state.isOf(Blocks.CARTOGRAPHY_TABLE)) return Identifier.of("minecraft", "cartographer");
+        if (state.isOf(Blocks.FLETCHING_TABLE)) return Identifier.of("minecraft", "fletcher");
+        if (state.isOf(Blocks.LECTERN)) return Identifier.of("minecraft", "librarian");
+        if (state.isOf(Blocks.STONECUTTER)) return Identifier.of("minecraft", "mason");
+        if (state.isOf(Blocks.CAULDRON)) return Identifier.of("minecraft", "leatherworker");
+        if (state.isOf(Blocks.BREWING_STAND)) return Identifier.of("minecraft", "cleric");
+        if (state.isOf(Blocks.LOOM)) return Identifier.of("minecraft", "shepherd");
+        return ProfessionCompatibilityRegistry.professionForWorkstation(state.getBlock()).orElse(null);
+    }
+
     public record HouseTemplate(Identifier id, Vec3i size, List<TemplateBlock> blocks,
                                 BlockPos bedOffset, BlockPos doorOffset, Direction doorFacing,
-                                BlockPos workstationOffset, BlockPos bellOffset) {
+                                BlockPos workstationOffset, BlockPos bellOffset, Identifier professionId) {
         public boolean hasUsefulHomeFeatures() {
             return bedOffset != null && !blocks.isEmpty();
         }

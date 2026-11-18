@@ -1,64 +1,83 @@
 # Changelog
 
-## 1.0.0 — Major village simulation update
+## 1.2.1 - Tree-only wood gathering and exact structure quantities
 
-### Builder behavior and scheduling
-- Replaced the full `VillagerEntity.mobTick` cancellation with a redirect of the vanilla `Brain.tick` call. Construction now takes priority over Brain tasks without suppressing the rest of the villager's entity tick.
-- Vanilla Brain control is returned when a hostile mob is nearby, the villager is attacked, or the configured danger pause has not elapsed. The builder resumes its saved stage after the pause.
-- Builders with a remembered HOME go to sleep through the vanilla Brain at night and resume their construction task after dawn. The founder retains the bed from its first home while returning to build the founding profession house.
-- Only unemployed, adult villagers without an assigned HOME can be selected as builders, except for the founding villager that is returning to complete its first profession house while keeping the starter-home bed.
-- Builder cap, navigation speed, danger radius, pause duration, task intervals and construction pacing are configurable.
+### Tree-only wood collection
+- The generic material finder no longer accepts arbitrary blocks just because their dropped item matches the requested item. It now mines only an allowlist of natural raw-resource blocks (sand, red sand, gravel, dirt, stone/deepslate, clay, and matching ore blocks). Finished building blocks such as planks, doors, beds, torches, chests and other placed structures are never used as generic raw-material sources.
+- Logs remain exclusive to the natural-tree harvesting pipeline. A candidate must pass the natural-root, three-log trunk and canopy checks; vanilla persistent/player-placed leaves are not accepted as natural canopy evidence. Nearby beds, doors, workstations and block entities remain protected.
+- Every connected log in the bounded tree volume (including tall trunk sections and branches) is cut one block at a time, and leaves are processed individually for sapling drops. All collected saplings are replanted where light, soil, spacing and path/house reservations allow; nearby sapling item drops are planted directly if the Villager inventory is full.
 
-### Mining and resource gathering
-- Cave search now filters for enclosed, dry cave-floor positions with a solid ceiling and at least one side wall, reducing false positives on open cliffs.
-- If no accessible cave target is found, the worker creates a persistent descending stair mine instead of digging a shallow test hole and filling it back in.
-- Mines are registered to their settlement, reused by later workers and excluded from future house plots.
-- Mine entrances and active resource targets are reserved across loaded and unloaded worker tasks.
-- Tree trunks, terrain blocks, stone and mining targets are broken one block at a time with visible block-breaking progress.
-- Harvest duration uses the held tool's Minecraft mining-speed multiplier and suitability; tool durability is consumed when a block is successfully broken.
-- Builders prefer stronger tools already in their inventory. A nearby blacksmith plus three carried iron ingots allows an upgrade to an iron tool.
-- Mine entrance, current mining face, direction, progress and project targets are saved.
+### Blueprint-wide quantity planning
+- Before gathering a requested block type, the builder counts every still-placeable occurrence of that item remaining in the active house blueprint. It then recursively resolves crafting ingredients for that total instead of requesting one item at a time.
+- Existing inventory is credited against the total. The request count is saved with the task, so collection resumes with the same target after a world restart.
+- Crafting and smelting recipes are used to create the needed outputs. Recipe batch output can still leave a small unavoidable surplus (for example, door recipes make three doors), and a felled tree yields all of its connected logs; those leftovers are retained for later work.
+- Fixed bulk targets such as 88 logs remain disabled. The required amounts come from the selected template and its registered recipe chain.
 
-### Vanilla village architecture
-- House selection now reads Minecraft's built-in structure templates instead of relying on a single generic 5×5 house whenever a matching template is available.
-- Biome styles map to plains, desert, savanna, taiga or snowy village template families; unsupported styles use plains as a fallback.
-- Professional projects prefer vanilla toolsmith, weaponsmith or armorer templates when the settlement needs its first blacksmith-type worksite.
-- The founding settlement attempts to place a matching vanilla meeting-point structure with a bell.
-- The settlement remains in founding state until a bell has been registered and all villagers detected in the loaded settlement area have HOME memory.
+### Safety and migration
+- Pending material quantities are serialized in the active task. Older saves without this field migrate to a one-item request and are recalculated as the blueprint advances.
+- Generic material searches cannot dismantle an existing house component to satisfy a missing finished-block item. If the item cannot be crafted or found through a recognized raw-resource source, the task keeps the request and retries rather than harvesting an arbitrary matching block.
 
-### Co-op and save persistence
-- Homeless unemployed villagers can join an active founding project up to the configured builder limit.
-- Active house reservations and project type reservations prevent concurrent workers from selecting the same plot or breaking the same saved resource target.
-- Construction saves its stage, indices, route, tree target list, tree-cut progress, terrain operations, blueprint index, current resource/mining targets, tool restoration data and mine state.
-- Saved tasks resume when their villager is loaded again; old 0.2.x task snapshots regenerate missing route data for backward compatibility.
+### Validation notes
+- JSON and source syntax checks are included in the release preparation, but this source has not been compiled against Fabric/Minecraft dependencies or play-tested in-game in the creation environment. GitHub Actions remains the authoritative build check.
 
-### Appearance and configuration
-- Added an original builder profession overlay featuring a yellow hard hat and orange workwear, including the zombie-villager profession texture variant.
-- Added English and Brazilian Portuguese profession names.
-- Added `config/village_expansion.json`, generated on first launch, including movement, resource search, mine, construction, danger, particle and breeding settings.
+## 1.2.0 - Tree-safe harvesting and demand-driven materials
 
-### Known scope boundaries in 1.0.0
-- The builder does not yet run a complete vanilla crafting/furnace workflow for wool-to-bed, sand-to-glass, fuel, or recipe-based material conversion. Vanilla house templates supply their planned blocks directly, while the resource check abstracts wood and stone consumption.
-- Iron tool upgrades require three iron ingots already carried by the builder and a nearby armorer/toolsmith/weaponsmith. The mod does not yet automate ore smelting or trade with that villager.
-- Stair mines receive periodic log supports, but they are not a byte-for-byte reproduction of world-generated mineshafts and do not create rails, minecarts or chests.
-- Cave discovery is restricted to chunks that are already loaded. It does not force-load distant terrain.
-- Vanilla structure template variants are selected from the appropriate biome family when present. If a professional template with a recognizable workstation is unavailable, the mod uses its compact fallback blueprint.
-- The founding completion check considers villagers loaded in the settlement's scan area. Unloaded villagers in distant chunks are not included until they load into that area.
-- The source project has not been compiled or play-tested in this environment. The GitHub Actions workflow is included to run the actual Fabric build; a successful workflow and an in-game test are still required before treating this release as validated.
+### Tree harvesting and replanting
+- Wood gathering now targets verified natural tree roots only. A candidate must be rooted in natural soil, have a three-log vertical trunk and a leaf canopy above it.
+- Logs near beds, doors, workstations or block entities are treated as protected wood, reducing the chance of damaging existing houses or player builds.
+- The worker fells the selected tree one block at a time, including connected trunk/branch logs, then processes leaves individually so sapling drops are collected.
+- Saplings are replanted on valid soil with suitable light and free space. Replanting avoids the active house footprint and reserved village road; saplings without a suitable location stay in inventory for a later attempt.
+- Tree worklists, indexes and log species are persisted, so restarting the world does not restart a partially harvested tree from scratch.
 
-## 0.2.4
-- Added builder particles and up to three simultaneous workers per settlement.
-- Reserved active building plots and resource targets.
+### Exact house material planning
+- The selected structure's block placements are counted into an exact item plan. Each block placement requests its corresponding block item and consumes one item only when the block is placed.
+- Double-height doors and beds consume one item for their lower/foot half; occupied non-replaceable positions are skipped without consuming inventory.
+- Existing inventory is credited first. Missing items are produced through the world's registered crafting recipes, recursively collecting only the ingredients required for the next missing item.
+- Added recipe-based wool sourcing from shearable sheep, plus registered smelting-recipe processing for glass and ore-derived ingredients. Smelting is timed and consumes coal/charcoal while preserving logs, planks and sticks for construction recipes.
+- Added recovery of crafted/smelted output item entities when the Villager inventory was full at the moment a recipe finished.
+- Recipe output batches may produce a small surplus (e.g. a door recipe yields three doors); surplus is retained for later placements or future jobs rather than discarded.
+- Material-plan summaries are written to the log when a construction task is assigned.
 
-## 0.2.3
-- Added settlement founding by an unemployed villager without an existing village.
-- Added the initial common house followed by a professional house.
+### Reliability and persistence
+- Added persisted plot-tree targets so trees occupying the house footprint are cleared before leveling; workers no longer need to reach a potentially blocked central work position before removing those trees.
+- Road obstacles made of leaves and plants are now broken with visible block-breaking progress instead of being deleted instantly.
+- Smelting jobs retain their `SMELT_MATERIAL` state when started from the build stage, fixing a state transition that could otherwise interrupt the processing timer.
+- Furnace fuel selection no longer burns construction planks, logs or sticks; only coal and charcoal are consumed as smelting fuel.
+- Added clay-block sourcing for recipes that need clay balls.
+- Legacy saves in the old bulk `GATHER_WOOD` / `GATHER_STONE` stages are migrated back to demand-driven building when they are not midway through an active tree or mine operation.
 
-## 0.2.2
-- Fixed NBT long-list decoding for house positions.
+### Configuration and compatibility
+- Added no new required config fields. Existing `replantSaplings`, `saplingPlantRadius`, `materialSearchRadius`, `materialSearchIntervalTicks` and `useRecipeBookForCrafting` settings are used by the new material pipeline.
+- Deprecated fixed `woodRequired` and `stoneRequired` stockpile targets remain in the config for migration only; they are forced to zero and are no longer used by new construction tasks.
 
-## 0.2.1
-- Corrected the Yarn 1.21.1 `Heightmap` package import.
+### Known limitations
+- Crafting and smelting use registered recipe data and task timers; they do not operate visible crafting-table or furnace block interfaces.
+- Recipes that output multiple items may leave a small surplus because vanilla recipes are crafted in full batches.
+- Tree identification is block-shape based. Nearby beds, doors, workstations and block entities are protected, but Minecraft has no universal placed-by-player metadata for arbitrary blocks.
+- Full compilation and in-game testing are still required before treating the release as verified.
 
-## 0.2.0
-- Added village paths, builder appearance and bed-independent reproduction.
+## 1.1.0 - AI Recovery and Mod Compatibility
+
+### AI and task recovery
+- The vanilla Villager Brain now ticks continuously. After each Brain tick, Village Expansion compares the current navigation target to the builder's work target and immediately restores the work route if wandering or another ordinary activity replaced it. This preserves vanilla sensing, memory updates, schedules, and emergency behavior.
+- Added navigation progress monitoring, configurable route reassertion, timeout-based repathing and nearby alternate stand positions.
+- Added structured warnings when a builder is repeatedly unable to reach a work target.
+- Fixed a terrain-leveling deadlock where a builder could retry a fill operation forever without dirt or stone. It now switches to a dirt-gathering stage and resumes the saved operation; if the area has no usable dirt after the configured search limit, it skips the blocked fill rather than freezing.
+- Added bounded no-resource search retries. A worker releases a project if it cannot find wood or a safe mine entrance after repeated attempts, allowing a later reassignment rather than waiting indefinitely.
+- Added `GATHER_DIRT` as a resumable persisted task stage.
+
+### Third-party mod compatibility
+- Added an optional JSON compatibility registry under `config/village_expansion/compat/`.
+- Added profession, workstation, biome-style structure, and selection-weight mappings.
+- Loads external NBT structure templates through Minecraft's `StructureTemplateManager`.
+- Checks that a configured template contains both a bed and the exact configured workstation block.
+- Assigns the registered third-party profession and `JOB_SITE` memory after the professional house is completed.
+- Keeps the compatibility optional: the third-party mod does not become a hard dependency, and vanilla houses remain as fallback.
+- Added `docs/MOD_COMPATIBILITY.md` and an example compatibility file.
+
+### Configuration
+- Added `navigationStallTimeoutTicks`, `navigationReassertIntervalTicks`, `navigationMaxRepaths`, and `noResourceSearchLimit` to `config/village_expansion.json`.
+
+### Notes
+- Third-party mods must register a Villager profession and workstation block and expose a compatible NBT structure template. The framework cannot infer custom house-generation logic from arbitrary mods automatically.
+- This release targets Minecraft 1.21.1 with Fabric. Other Minecraft versions require a separately tested build.

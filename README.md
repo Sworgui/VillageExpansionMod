@@ -1,4 +1,4 @@
-# Village Expansion 1.0.0
+# Village Expansion 1.2.1
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -15,8 +15,10 @@ This is a source project. It is not a precompiled JAR. The included GitHub Actio
 
 ### Construction priority, danger and sleep
 
-- While an active construction task is running, the mod suppresses only the villager's vanilla `Brain.tick` call. The villager's normal entity tick, navigation and movement updates continue.
-- If a hostile mob enters the configured danger radius or the villager is attacked, vanilla Brain control is restored so the villager can flee. The construction task pauses for `dangerPauseTicks` and then resumes from its saved stage.
+- The vanilla Villager Brain continues ticking. After each Brain tick, the mod compares its active navigation target with the current construction target and reapplies the construction route if vanilla wandering has replaced it.
+- If a hostile mob enters the configured danger radius or the villager is attacked, construction navigation priority is temporarily yielded so vanilla flee behavior can run. The task pauses for `dangerPauseTicks` and then resumes from its saved stage.
+- A navigation watchdog detects lack of movement progress, retries alternate nearby standing positions, and logs repeated route failures instead of silently waiting forever.
+- If a material search repeatedly fails, the worker changes task or releases the project for a later retry rather than remaining in an endless wait loop.
 - At night, a builder with an assigned `HOME` memory is allowed to use its vanilla schedule to reach and sleep in its bed. The founding villager keeps the first house bed while it returns for the starter profession house. Its construction stage resumes after morning.
 - Only adult villagers with profession `none`, no assigned HOME, and no active customer interaction are eligible to become builders.
 
@@ -38,7 +40,9 @@ The template loader uses one palette per structure, since a structure's palettes
 ### Roads, trees and terrain
 
 - A* path search connects the house entrance to the nearest village route/anchor, with its expansion limit exposed in the config.
-- The builder clears leaves and plants and chops recognized tree trunks one block at a time.
+- The builder recognizes natural trees conservatively: a candidate needs a natural-soil root, a three-block vertical trunk and a canopy of non-persistent leaves. Logs near beds, doors, workstations or block entities are protected to avoid harvesting house structures.
+- A selected tree is fully felled: every connected trunk/branch log and its leaves are broken individually with visible block damage. All available saplings are replanted on valid soil with sufficient light, away from the active house footprint and village road. Nearby sapling item drops are planted directly if the Villager inventory is full.
+- Saplings that cannot be planted immediately remain in the worker's inventory or as nearby item drops for a later planting attempt.
 - Terrain preparation executes a saved sequence of leveling operations. Dirt and stone from the builder's inventory are used for simple fill work.
 - The resulting road uses vanilla `dirt_path` blocks and avoids overwriting non-replaceable structures.
 
@@ -51,13 +55,17 @@ The template loader uses one palette per structure, since a structure's palettes
 - Later projects can reuse registered mine entrances. Active mine entrances and current resource targets are reserved against other workers.
 - Cave scans do not force-load chunks.
 
-### Block harvesting and tools
+### Block harvesting, tools and exact material planning
 
-Tree trunks, stone targets and terrain blocks use visible vanilla block-breaking progress and are removed individually. The work duration is calculated using the held item's mining-speed multiplier and block suitability. A used damageable tool loses durability when a block is successfully broken.
+- Tree logs, leaves, cave stone, ores and surface materials use visible vanilla block-breaking progress. The time is calculated from block hardness, tool mining speed and suitability; damageable tools lose durability when a block is harvested.
+- Wood is requested by exact item and may only be sourced from a verified natural tree. The builder never mines arbitrary log blocks as a wood resource. Tree felling collects the whole selected tree, rather than leaving floating trunks. A conservative nearby-building check protects trees close to beds, doors, workstations and block entities.
+- The selected house template is counted as an item plan. Before gathering an item type, the builder counts every still-placeable occurrence of that item remaining in the blueprint and resolves the recipe ingredients for the total. Existing inventory is deducted, and the saved request count prevents repeated one-at-a-time collection loops. One item is consumed only when its block is placed. Upper door halves and bed head halves do not consume a second item; occupied non-replaceable positions are skipped without consuming materials.
+- Existing inventory is used first. When an item is missing, the builder follows registered crafting recipes recursively and collects only the missing ingredients. Recipe output is produced in normal recipe batches (for example, a door recipe yields three doors), so a small remainder can be carried into later placements or future jobs.
+- Recipe-based material sourcing includes wood from trees, stone and ore from exposed caves/mines, sand and clay from terrain, and wool from shearable sheep. Wool can be crafted into beds through the registered recipe system.
+- Registered smelting recipes (including sand-to-glass and ore processing) are simulated over time and consume coal/charcoal fuel. Coal/charcoal are reserved as processing fuel; the mod does not burn the house's planks, logs or sticks.
+- Crafting and smelting are recipe-driven controller actions with particles, time and ingredient consumption. They do not yet operate a visible crafting-table or furnace block with a physical GUI.
 
-The builder checks its inventory for an appropriate axe, pickaxe or shovel and equips the strongest available one. If a blacksmith-type villager is nearby and the builder already carries at least three iron ingots, the mod can replace the working tool with an iron tool.
-
-**Not yet implemented:** a complete player-like crafting and smelting pipeline. Builders do not yet collect wool and craft beds, smelt sand into glass, gather furnace fuel, or perform every intermediate recipe. Tool upgrades also do not smelt ore or trade with the blacksmith; the ingots must already be present in the worker inventory.
+The builder checks its inventory for an appropriate axe, pickaxe or shovel and equips the strongest available one. If a blacksmith-type villager is nearby and the builder already carries at least three iron ingots, the mod can replace the working tool with an iron tool. Ore smelting is available for recipe ingredients, but the blacksmith does not run a barter/trading interaction.
 
 ### Builder appearance
 
@@ -98,12 +106,21 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "mineExclusionRadius": 24,
   "houseSpacing": 12,
   "blacksmithToolUpgrades": true,
-  "woodRequired": 88,
-  "stoneRequired": 16,
+  "woodRequired": 0,
+  "stoneRequired": 0,
   "woodUnitsPerLog": 4,
   "woodSearchRadius": 32,
+  "replantSaplings": true,
+  "saplingPlantRadius": 10,
+  "materialSearchRadius": 28,
+  "materialSearchIntervalTicks": 100,
+  "useRecipeBookForCrafting": true,
   "maxPathSearchNodes": 8000,
   "buildBlockDelayTicks": 2,
+  "navigationStallTimeoutTicks": 100,
+  "navigationReassertIntervalTicks": 10,
+  "navigationMaxRepaths": 4,
+  "noResourceSearchLimit": 6,
   "houseSearchMinRadius": 12,
   "houseSearchMaxRadius": 44,
   "houseSearchStep": 4,
@@ -130,6 +147,10 @@ All values are clamped to safe ranges when loaded. The most useful controls are:
 | `woodSearchRadius` | Search radius for tree logs |
 | `maxPathSearchNodes` | Upper bound for road pathfinding work |
 | `buildBlockDelayTicks` | Delay between placed house blocks |
+| `navigationStallTimeoutTicks` | Time without measurable progress before repathing |
+| `navigationReassertIntervalTicks` | Maximum interval between construction-route enforcement checks |
+| `navigationMaxRepaths` | Alternate route attempts before a warning/reset |
+| `noResourceSearchLimit` | Failed material searches before a task is skipped or released |
 | `mineExclusionRadius` / `houseSpacing` | Prevents houses from crowding mines or other houses |
 | `breedingPartnerRange` / `breedingScanIntervalTicks` | Bedless breeding search settings |
 
@@ -140,26 +161,28 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.0.0` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.0.0.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.1` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.2.1.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.0.0.jar` in the `mods` folder.
+- Put `village-expansion-1.2.1.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
-## Save compatibility and unfinished work
+## Save compatibility and known limitations
 
-- Active worker task snapshots are stored in the dimension's `PersistentState`. The project stage, progress counters, road positions, tree targets and partial tree-cut list, terrain operations, current resource target, active mining target, mine entrance and mine direction are serialized. Task snapshots are refreshed every 20 world ticks and restored when the villager is loaded again.
+- Active worker task snapshots are stored in the dimension's `PersistentState`. The project stage, progress counters, road positions, plot-tree targets, partial tree-cut list and indexes, terrain operations, current resource target, pending recipe item and exact pending quantity, smelting timer/fuel, active mining target, mine entrance and mine direction are serialized. Task snapshots are refreshed every 20 world ticks and restored when the villager is loaded again.
 - The save loader can read the older task format and rebuilds missing work lists for those older snapshots.
 - If the server crashes between snapshots, up to roughly one second of task bookkeeping can roll back. Already placed blocks remain in the world and are not overwritten if they are no longer replaceable.
 - A mine is a functional generated-by-the-mod stair tunnel with periodic log supports, not a full copy of naturally generated mineshafts.
-- Resource collection is not yet a full player crafting loop; beds, glass and other template blocks are not manufactured from all constituent materials.
-- Blacksmith upgrades require the ingots already in the builder inventory; the mod does not run smelting or barter interactions.
+- Recipe batch sizes can leave a small surplus (for example, crafting one door produces the recipe's full batch). Leftovers are retained for later placements/jobs rather than discarded.
+- Smelting is simulated by the task controller using registered vanilla smelting recipes and timed fuel consumption; the Villager does not walk to and operate a physical furnace block. Crafting similarly uses recipe data rather than a visible crafting-table interface.
+- Blacksmith tool upgrades require the ingots already in the builder inventory; the mod does not run barter interactions.
+- Tree recognition is intentionally conservative. It filters persistent leaves and protects nearby beds, doors, workstations and block entities. Minecraft does not store a universal “player placed” flag for every block; a player-built log structure deliberately shaped like a natural tree and using non-persistent leaves can still resemble a tree to a block-based heuristic.
 - Cave searches only inspect loaded chunks, and professional structures fall back to a compact blueprint when a matching biome template is missing.
 - The founding completion check sees villagers currently loaded in its scan area. A villager in an unloaded chunk is evaluated once it becomes loaded in that area.
 - This release is configured for Minecraft 1.21.1. Later Minecraft versions require their own mappings/dependency update and build verification.
@@ -168,3 +191,8 @@ The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runn
 ## License
 
 MIT. See `LICENSE`.
+
+
+## Third-party mod compatibility
+
+Third-party profession houses can be configured through JSON. See [docs/MOD_COMPATIBILITY.md](docs/MOD_COMPATIBILITY.md) and `examples/compat/examplemod.json`. Compatible entries require the target mod, a registered Villager profession, a workstation block and an NBT structure template containing both a bed and that workstation. Compatibility files are optional; no hard dependency on the third-party mod is added.

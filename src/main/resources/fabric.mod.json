@@ -3,7 +3,7 @@
   "id": "village_expansion",
   "version": "${version}",
   "name": "Village Expansion",
-  "description": "Unemployed villagers can found and expand settlements with biome-native homes, roads, persistent construction tasks and supported mines.",
+  "description": "Villagers found and expand settlements with recoverable AI tasks, biome-native homes and optional third-party profession compatibility.",
   "authors": [
     "Village Expansion Contributors"
   ],

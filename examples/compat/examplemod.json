@@ -1,0 +1,18 @@
+{
+  "modId": "examplemod",
+  "professions": [
+    {
+      "profession": "examplemod:alchemist",
+      "workstation": "examplemod:alchemy_table",
+      "structures": {
+        "plains": "examplemod:village/alchemist_plains",
+        "desert": "examplemod:village/alchemist_desert",
+        "taiga": "examplemod:village/alchemist_taiga",
+        "snowy": "examplemod:village/alchemist_snowy",
+        "savanna": "examplemod:village/alchemist_savanna",
+        "default": "examplemod:village/alchemist_plains"
+      },
+      "weight": 2
+    }
+  ]
+}
