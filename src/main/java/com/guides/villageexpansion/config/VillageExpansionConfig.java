@@ -32,6 +32,10 @@ public final class VillageExpansionConfig {
     public static int blockBreakBaseTicks = 28;
     public static int particleIntervalTicks = 20;
     public static int mineExclusionRadius = 24;
+    /** Failed stone/cobblestone scans before a builder starts a dedicated stair mine. */
+    public static int stoneSearchFailuresBeforeMine = 5;
+    /** Minimum horizontal distance between a village centre and a registered mine entrance. */
+    public static int mineMinimumDistanceFromVillage = 20;
     public static int houseSpacing = 12;
     public static boolean blacksmithToolUpgrades = true;
     /** Legacy values retained for config migration; construction now derives exact blueprint requirements. */
@@ -91,6 +95,9 @@ public final class VillageExpansionConfig {
             blockBreakBaseTicks = clamp(integer(json, "blockBreakBaseTicks", 28), 4, 200);
             particleIntervalTicks = clamp(integer(json, "particleIntervalTicks", 20), 1, 200);
             mineExclusionRadius = clamp(integer(json, "mineExclusionRadius", 24), 8, 64);
+            stoneSearchFailuresBeforeMine = clamp(integer(json, "stoneSearchFailuresBeforeMine", 5), 1, 20);
+            // Keep the requested 20-block safety offset as a hard minimum.
+            mineMinimumDistanceFromVillage = clamp(integer(json, "mineMinimumDistanceFromVillage", 20), 20, 96);
             houseSpacing = clamp(integer(json, "houseSpacing", 12), 6, 32);
             blacksmithToolUpgrades = bool(json, "blacksmithToolUpgrades", true);
             woodRequired = 0; // Deprecated: exact requirements are derived from the selected structure.
@@ -144,6 +151,8 @@ public final class VillageExpansionConfig {
         json.addProperty("blockBreakBaseTicks", blockBreakBaseTicks);
         json.addProperty("particleIntervalTicks", particleIntervalTicks);
         json.addProperty("mineExclusionRadius", mineExclusionRadius);
+        json.addProperty("stoneSearchFailuresBeforeMine", stoneSearchFailuresBeforeMine);
+        json.addProperty("mineMinimumDistanceFromVillage", mineMinimumDistanceFromVillage);
         json.addProperty("houseSpacing", houseSpacing);
         json.addProperty("blacksmithToolUpgrades", blacksmithToolUpgrades);
         json.addProperty("woodRequired", woodRequired);

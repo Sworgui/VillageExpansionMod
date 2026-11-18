@@ -494,6 +494,7 @@ public final class VillageBuilderController {
         nbt.putString("resumeStage", task.resumeStage == null ? "" : task.resumeStage.name());
         nbt.putInt("requiredDirt", task.requiredDirt);
         nbt.putInt("resourceSearchFailures", task.resourceSearchFailures);
+        nbt.putInt("stoneSearchFailures", task.stoneSearchFailures);
         nbt.putString("originalHandItem", Registries.ITEM.getId(task.originalMainHand.getItem()).toString());
         nbt.putInt("originalHandCount", task.originalMainHand.getCount());
         nbt.putInt("originalHandDamage", task.originalMainHand.getDamage());
@@ -566,6 +567,8 @@ public final class VillageBuilderController {
             if (!resumeStage.isBlank()) task.resumeStage = Stage.valueOf(resumeStage);
             task.requiredDirt = nbt.contains("requiredDirt") ? nbt.getInt("requiredDirt") : 0;
             task.resourceSearchFailures = nbt.getInt("resourceSearchFailures");
+            task.stoneSearchFailures = nbt.contains("stoneSearchFailures")
+                    ? Math.max(0, nbt.getInt("stoneSearchFailures")) : 0;
             task.targetProfessionId = Identifier.tryParse(nbt.getString("targetProfession"));
             if (nbt.contains("workstationPos", NbtElement.LONG_TYPE)) {
                 task.workstationPos = BlockPos.fromLong(nbt.getLong("workstationPos"));
@@ -647,10 +650,6 @@ public final class VillageBuilderController {
                         BlockPos.fromLong(nbt.getLong("currentMineStand")), List.of());
             }
             if (task.stage == Stage.GATHER_WOOD && task.currentTreeBase == null) {
-                task.stage = Stage.BUILD;
-                task.resumeStage = null;
-            }
-            if (task.stage == Stage.GATHER_STONE && task.currentMine == null) {
                 task.stage = Stage.BUILD;
                 task.resumeStage = null;
             }
@@ -1678,6 +1677,19 @@ public final class VillageBuilderController {
 
     private static boolean tickBreakBlock(ServerWorld world, VillagerEntity villager, BuilderTask task,
                                           BlockPos pos, ToolKind kind, TagKey<Item> acceptedDrops) {
+        return tickBreakBlock(world, villager, task, pos, kind, acceptedDrops, null);
+    }
+
+    /**
+     * Mines a block using the builder's actual held tool for loot-table evaluation.
+     * World.breakBlock(pos, true, entity) has no tool parameter; using it directly
+     * makes tool-gated loot (stone -> cobblestone, ores -> raw ore, etc.) evaluate
+     * as though the block had been broken with an empty hand. Remove the block
+     * without automatic drops, then invoke Block.dropStacks with the captured tool.
+     */
+    private static boolean tickBreakBlock(ServerWorld world, VillagerEntity villager, BuilderTask task,
+                                          BlockPos pos, ToolKind kind, TagKey<Item> acceptedDrops,
+                                          Item acceptedItem) {
         BlockState state = world.getBlockState(pos);
         if (state.isAir()) { clearBreakingProgress(world, villager, task); return true; }
         if (!isLoaded(world, pos)) return false;
@@ -1704,9 +1716,19 @@ public final class VillageBuilderController {
 
         world.setBlockBreakingInfo(villager.getId(), pos, -1);
         ItemStack usedTool = villager.getEquippedStack(EquipmentSlot.MAINHAND);
-        boolean broken = world.breakBlock(pos, true, villager);
+        ItemStack toolForLoot = usedTool.copy();
+        net.minecraft.block.entity.BlockEntity blockEntity = world.getBlockEntity(pos);
+        boolean broken = world.breakBlock(pos, false, villager);
         if (broken) {
-            collectDrops(world, villager, pos, acceptedDrops);
+            // The state, block entity and tool are captured before removal so
+            // vanilla loot conditions (correct tool/tier, Silk Touch, Fortune)
+            // are evaluated against the same tool the builder used to mine.
+            Block.dropStacks(state, world, pos, blockEntity, villager, toolForLoot);
+            if (acceptedItem != null) {
+                collectSpecificDrops(world, villager, pos, acceptedItem);
+            } else {
+                collectDrops(world, villager, pos, acceptedDrops);
+            }
             if (usedTool.isDamageable()) usedTool.damage(1, villager, EquipmentSlot.MAINHAND);
         }
         task.breakingPos = null;
@@ -1999,6 +2021,8 @@ public final class VillageBuilderController {
                 }
                 task.requiredStone = 1;
                 task.resumeStage = Stage.LEVEL_SITE;
+                task.stoneSearchFailures = 0;
+                task.resourceSearchFailures = 0;
                 task.stage = Stage.GATHER_STONE;
                 task.currentMine = null;
                 task.moveTarget = null;
@@ -2050,6 +2074,8 @@ public final class VillageBuilderController {
             villager.getNavigation().stop();
             task.moveTarget = null;
             task.requestedMoveTarget = null;
+            task.stoneSearchFailures = 0;
+            task.resourceSearchFailures = 0;
             task.stage = Stage.GATHER_STONE;
             return;
         }
@@ -2152,6 +2178,7 @@ public final class VillageBuilderController {
                 : countInventoryItems(villager, ItemTags.STONE_TOOL_MATERIALS);
         if (task.stone >= task.requiredStone) {
             restoreTemporaryStoneRequirement(task);
+            task.stoneSearchFailures = 0;
             villager.getNavigation().stop();
             task.moveTarget = null;
             task.requestedMoveTarget = null;
@@ -2164,13 +2191,15 @@ public final class VillageBuilderController {
             if (world.getTime() < task.nextResourceSearch) return;
             equipBestTool(villager, ToolKind.PICKAXE);
             BlockPos searchFrom = task.mineFace == null ? task.site : task.mineFace;
-            int caveRadius = expandedSearchRadius(VillageExpansionConfig.caveSearchRadius,
-                    task.resourceSearchFailures);
+            int caveRadius = expandedStoneSearchRadius(task.stoneSearchFailures);
             MiningTarget exposed = exactStoneRequest
                     ? findExposedCaveStone(world, searchFrom, villager, task.pendingMaterialItem, caveRadius)
                     : findExposedCaveStone(world, searchFrom, villager, caveRadius);
             if (exposed != null) {
                 task.currentMine = exposed;
+                // A successful scan breaks the streak of unsuccessful searches.
+                task.stoneSearchFailures = 0;
+                task.resourceSearchFailures = 0;
                 task.moveTarget = null;
                 task.requestedMoveTarget = null;
             } else {
@@ -2179,16 +2208,23 @@ public final class VillageBuilderController {
                     return;
                 }
                 task.resourceSearchFailures++;
-                task.stage = Stage.MINE_TUNNEL;
+                task.stoneSearchFailures++;
                 task.nextResourceSearch = world.getTime() + VillageExpansionConfig.caveSearchIntervalTicks;
                 task.moveTarget = null;
                 task.requestedMoveTarget = null;
-                if (task.resourceSearchFailures % Math.max(1, VillageExpansionConfig.noResourceSearchLimit) == 0
-                        && task.mineEntrance == null) {
-                    VillageExpansionMod.LOGGER.warn("Builder {} has not found a cave or safe mine entrance near {}; expanding the search area to {} blocks and keeping the house project active",
-                            uuidShort(villager.getUuid()), task.site,
-                            expandedSearchRadius(Math.max(36, VillageExpansionConfig.caveSearchRadius),
-                                    task.resourceSearchFailures));
+
+                int mineAfterFailures = Math.max(1, VillageExpansionConfig.stoneSearchFailuresBeforeMine);
+                if (task.stoneSearchFailures >= mineAfterFailures) {
+                    task.stage = Stage.MINE_TUNNEL;
+                    VillageExpansionMod.LOGGER.warn(
+                            "Builder {} could not find the requested stone material after {} searches; starting a stair mine at least {} blocks from village centre {}",
+                            uuidShort(villager.getUuid()), task.stoneSearchFailures,
+                            VillageExpansionConfig.mineMinimumDistanceFromVillage,
+                            villageCenterOrSite(getVillageRecord(world, task.villageId), task.site));
+                } else {
+                    VillageExpansionMod.LOGGER.info(
+                            "Builder {} could not find the requested stone material (search {}/{}); widening the cave search before starting a mine",
+                            uuidShort(villager.getUuid()), task.stoneSearchFailures, mineAfterFailures);
                 }
                 return;
             }
@@ -2206,7 +2242,9 @@ public final class VillageBuilderController {
             return;
         }
         equipBestTool(villager, ToolKind.PICKAXE);
-        if (!tickBreakBlock(world, villager, task, mine.rock(), ToolKind.PICKAXE, null)) return;
+        if (!tickBreakBlock(world, villager, task, mine.rock(), ToolKind.PICKAXE,
+                exactStoneRequest ? null : ItemTags.STONE_TOOL_MATERIALS,
+                exactStoneRequest ? task.pendingMaterialItem : null)) return;
         task.stone = exactStoneRequest
                 ? countSpecificItem(villager, task.pendingMaterialItem)
                 : countInventoryItems(villager, ItemTags.STONE_TOOL_MATERIALS);
@@ -2214,6 +2252,7 @@ public final class VillageBuilderController {
         task.moveTarget = null;
         task.requestedMoveTarget = null;
         task.resourceSearchFailures = 0;
+        task.stoneSearchFailures = 0;
         task.nextResourceSearch = world.getTime() + VillageExpansionConfig.caveSearchIntervalTicks;
     }
 
@@ -2246,8 +2285,12 @@ public final class VillageBuilderController {
                     BlockPos stand = new BlockPos(x, y, z);
                     if (!world.getBlockState(stand).isAir() || !world.getBlockState(stand.up()).isAir()
                             || !world.getFluidState(stand).isEmpty() || !world.getFluidState(stand.up()).isEmpty()
-                            || !world.getBlockState(stand.down()).isSolidBlock(world, stand.down())
-                            || !isCaveLikeAirCell(world, stand)) continue;
+                            || !world.getBlockState(stand.down()).isSolidBlock(world, stand.down())) continue;
+                    // General stone collection still prefers a cave. An exact
+                    // material request may also use a safe, exposed rock face on
+                    // a mountain/ravine; requiring a roof here made visible stone
+                    // outcrops invisible to the worker.
+                    if (wantedDrop == null && !isCaveLikeAirCell(world, stand)) continue;
                     for (Direction direction : Direction.Type.HORIZONTAL) {
                         BlockPos rockPos = stand.offset(direction);
                         if (!isLoaded(world, rockPos)) continue;
@@ -2307,6 +2350,7 @@ public final class VillageBuilderController {
                 : countInventoryItems(villager, ItemTags.STONE_TOOL_MATERIALS);
         if (task.stone >= task.requiredStone) {
             restoreTemporaryStoneRequirement(task);
+            task.stoneSearchFailures = 0;
             task.stage = task.resumeStage == null ? Stage.BUILD : task.resumeStage;
             task.resumeStage = null;
             villager.getNavigation().stop();
@@ -2317,7 +2361,10 @@ public final class VillageBuilderController {
         VillageExpansionState.VillageRecord village = saved.getVillage(task.villageId);
         if (task.mineEntrance == null || task.mineFace == null || task.mineDirection == null) {
             BlockPos villageCenter = village == null ? task.site : village.center();
+            int minimumMineDistance = VillageExpansionConfig.mineMinimumDistanceFromVillage;
+            long minimumMineDistanceSquared = (long) minimumMineDistance * minimumMineDistance;
             BlockPos entrance = village == null ? null : village.mines().stream()
+                    .filter(pos -> horizontalDistanceSquared(pos, villageCenter) >= minimumMineDistanceSquared)
                     .filter(pos -> !isMineReserved(world, pos, villager.getUuid()))
                     .min(Comparator.comparingDouble(pos -> pos.getSquaredDistance(villager.getBlockPos())))
                     .orElse(null);
@@ -2371,11 +2418,15 @@ public final class VillageBuilderController {
             return;
         }
         if (!world.getBlockState(feet).isAir()) {
-            if (!tickBreakBlock(world, villager, task, feet, ToolKind.PICKAXE, null)) return;
+            if (!tickBreakBlock(world, villager, task, feet, ToolKind.PICKAXE,
+                    exactStoneRequest ? null : ItemTags.STONE_TOOL_MATERIALS,
+                    exactStoneRequest ? task.pendingMaterialItem : null)) return;
             return;
         }
         if (!world.getBlockState(head).isAir()) {
-            if (!tickBreakBlock(world, villager, task, head, ToolKind.PICKAXE, null)) return;
+            if (!tickBreakBlock(world, villager, task, head, ToolKind.PICKAXE,
+                    exactStoneRequest ? null : ItemTags.STONE_TOOL_MATERIALS,
+                    exactStoneRequest ? task.pendingMaterialItem : null)) return;
             return;
         }
 
@@ -2447,7 +2498,10 @@ public final class VillageBuilderController {
 
     private static BlockPos findMineEntrance(ServerWorld world, BlockPos site, BlockPos villageCenter,
                                              List<BlockPos> knownMines, int maxRadius, UUID requester) {
-        for (int radius = 20; radius <= maxRadius; radius += 4) {
+        int minimumDistance = VillageExpansionConfig.mineMinimumDistanceFromVillage;
+        int searchLimit = Math.max(minimumDistance, maxRadius);
+        long minimumDistanceSquared = (long) minimumDistance * minimumDistance;
+        for (int radius = minimumDistance; radius <= searchLimit; radius += 4) {
             for (int i = 0; i < 32; i++) {
                 double angle = i * (Math.PI * 2.0D / 32.0D);
                 int x = villageCenter.getX() + (int) Math.round(Math.cos(angle) * radius);
@@ -2455,6 +2509,9 @@ public final class VillageBuilderController {
                 int y = findSurfaceY(world, x, z);
                 if (y == Integer.MIN_VALUE) continue;
                 BlockPos ground = new BlockPos(x, y, z);
+                // Enforce the real horizontal distance, not merely the ring index
+                // (the trig samples are rounded to integer block coordinates).
+                if (horizontalDistanceSquared(ground, villageCenter) < minimumDistanceSquared) continue;
                 BlockPos feet = ground.up();
                 BlockPos head = feet.up();
                 if (!isLoaded(world, ground) || !isLoaded(world, head)
@@ -2473,6 +2530,18 @@ public final class VillageBuilderController {
 
     private static BlockPos villageCenterOrSite(VillageExpansionState.VillageRecord village, BlockPos site) {
         return village == null ? site : village.center();
+    }
+
+    private static long horizontalDistanceSquared(BlockPos first, BlockPos second) {
+        long dx = (long) first.getX() - second.getX();
+        long dz = (long) first.getZ() - second.getZ();
+        return dx * dx + dz * dz;
+    }
+
+    private static VillageExpansionState.VillageRecord getVillageRecord(ServerWorld world, long villageId) {
+        VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
+                VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
+        return saved.getVillage(villageId);
     }
 
     private static boolean isMineReserved(ServerWorld world, BlockPos entrance, UUID requester) {
@@ -2612,7 +2681,14 @@ public final class VillageBuilderController {
         return state.getBlock().asItem();
     }
 
-    /** Expand surface-resource searches after repeated misses, up to 96 blocks. */
+    /** Expand stone/cobblestone scans after every miss, up to 96 blocks. */
+    private static int expandedStoneSearchRadius(int failedStoneSearches) {
+        int base = Math.max(8, VillageExpansionConfig.caveSearchRadius);
+        int expansionStep = 8;
+        return Math.min(96, base + Math.max(0, failedStoneSearches) * expansionStep);
+    }
+
+    /** Expand other surface-resource searches after repeated misses, up to 96 blocks. */
     private static int expandedSearchRadius(int configuredRadius, int failedSearches) {
         int base = Math.max(8, configuredRadius);
         int attemptsPerExpansion = Math.max(1, VillageExpansionConfig.noResourceSearchLimit);
@@ -2956,6 +3032,8 @@ public final class VillageBuilderController {
             // the mining routine can create a safe stair tunnel and search its walls.
             task.resumeStage = Stage.GATHER_MATERIAL;
             task.requiredStone = requestedCount;
+            task.stoneSearchFailures = 0;
+            task.resourceSearchFailures = 0;
             task.stage = Stage.GATHER_STONE;
             task.currentMine = null;
             task.moveTarget = null;
@@ -3085,8 +3163,8 @@ public final class VillageBuilderController {
         if (new ItemStack(wanted).isIn(ItemTags.STONE_TOOL_MATERIALS)) return true;
         String path = Registries.ITEM.getId(wanted).getPath();
         return switch (path) {
-            case "coal", "raw_iron", "raw_copper", "raw_gold", "redstone",
-                    "lapis_lazuli", "diamond", "emerald" -> true;
+            case "cobblestone", "cobbled_deepslate", "coal", "raw_iron", "raw_copper",
+                    "raw_gold", "redstone", "lapis_lazuli", "diamond", "emerald" -> true;
             default -> false;
         };
     }
@@ -3677,6 +3755,7 @@ public final class VillageBuilderController {
         private int navigationRepathCount;
         private int navigationFallbackIndex;
         private int resourceSearchFailures;
+        private int stoneSearchFailures;
         private int requiredDirt;
         private Stage resumeStage;
         private Identifier targetProfessionId;

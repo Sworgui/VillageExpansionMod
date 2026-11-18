@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.6 - Delayed stair-mine fallback and village-distance safety
+
+- Stone and exact cobblestone/ore collection now performs five completed cave/exposed-rock searches before switching to a self-dug stair mine. The search radius grows by 8 blocks after each miss (up to 96) and the threshold is configurable with `stoneSearchFailuresBeforeMine` (default 5).
+- The failed-search counter is specific to stone gathering, is saved in the active task NBT, and resumes across server/world reloads; wood and dirt search failures no longer accidentally trigger an early mine.
+- New mine entrances and reused registered entrances are checked using horizontal distance from the village centre. The default minimum is 20 blocks, and the config clamps this value so it cannot be reduced below 20.
+- A stone-gathering task with no current mining target is no longer incorrectly reset to BUILD when restored after a reload.
+- Added regression scenarios for the five-search threshold, the 20-block mine offset, saved counter restoration and old mine locations.
+
+### Validation
+- Source-level consistency checks and ZIP integrity checks are run during packaging. A Fabric build and Minecraft runtime simulation are still required through GitHub Actions and an in-game test world.
+
+## 1.2.5
+
+- Fixed block loot generation: mining now evaluates vanilla loot tables with the actual tool held by the builder. This restores cobblestone from stone and normal raw drops from pickaxe-gated ores.
+- Exact stone/ore requests now collect only their requested item while tunneling, preventing unrelated debris from filling the villager inventory and blocking the required drop.
+- Exact cave/mining requests can target safe exposed rock faces on mountains and ravines, not only blocks found under a cave-like ceiling.
+- Existing active tasks are compatible; no world reset or task reset is required. No saved task migration is needed because `cobblestone` remains the same requested inventory item; the mining path now generates it correctly.
+
 ## 1.2.4 - Resource recovery and collision-safe construction
 
 - Fixed the `Faltando: grass_block` deadlock. A blueprint now requests `dirt`, which is what vanilla grass blocks drop without Silk Touch. Existing saved tasks with a pending `grass_block` request are migrated to `dirt` on restore.

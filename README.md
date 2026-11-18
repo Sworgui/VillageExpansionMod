@@ -1,4 +1,4 @@
-# Village Expansion 1.2.4
+# Village Expansion 1.2.6
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -48,8 +48,8 @@ The template loader uses one palette per structure, since a structure's palettes
 
 ### Caves and mines
 
-- Before digging, the builder scans already-loaded chunks for safe cave-floor candidates with air for the villager, a solid floor, a ceiling and at least one side wall.
-- If a suitable exposed stone/ore target is found, it moves to that target and mines the block.
+- Before digging, the builder scans already-loaded chunks for safe cave-floor candidates with air for the villager, a solid floor, a ceiling and at least one side wall. During an exact material request it can also use an exposed rock face on a mountain or ravine, provided there is safe standing room.
+- If a suitable exposed stone/ore target is found, it moves to that target and mines the block using the held pickaxe for vanilla loot-table evaluation.
 - If no cave target is found, it opens a descending stair tunnel. The tunnel is 1×2 clear space, uses cobblestone for an unsupported floor when needed, and periodically places log supports if the worker has logs available.
 - Mine entrances are saved as part of the settlement and are excluded from nearby house-site selection.
 - Later projects can reuse registered mine entrances. Active mine entrances and current resource targets are reserved against other workers.
@@ -57,11 +57,11 @@ The template loader uses one palette per structure, since a structure's palettes
 
 ### Block harvesting, tools and exact material planning
 
-- Tree logs, cave stone, ores and surface materials use visible vanilla block-breaking progress. Leaves are never harvested by the builder. The time is calculated from block hardness, tool mining speed and suitability; damageable tools lose durability when a block is harvested.
+- Tree logs, cave stone, ores and surface materials use visible vanilla block-breaking progress. Leaves are never harvested by the builder. The time is calculated from block hardness, tool mining speed and suitability; damageable tools lose durability when a block is harvested. Loot tables receive the actual held tool, so stone drops cobblestone and pickaxe-gated ores produce their normal drops.
 - Wood is requested by exact item and may only be sourced from a verified natural tree. The builder never mines arbitrary log blocks as a wood resource. Tree felling collects the whole selected tree, rather than leaving floating trunks. A conservative nearby-building check protects trees close to beds, doors, workstations and block entities.
 - The selected house template is counted as an item plan. Before gathering an item type, the builder counts every still-placeable occurrence of that item remaining in the blueprint and resolves the recipe ingredients for the total. Existing inventory is deducted, and the saved request count prevents repeated one-at-a-time collection loops. One item is consumed only when its block is placed. Upper door halves and bed head halves do not consume a second item; occupied non-replaceable positions are skipped without consuming materials.
 - Existing inventory is used first. When an item is missing, the builder follows registered crafting recipes recursively and collects only the missing ingredients. Recipe output is produced in normal recipe batches (for example, a door recipe yields three doors), so a small remainder can be carried into later placements or future jobs.
-- Recipe-based material sourcing includes wood from verified natural trees, stone and ore from exposed caves/mines, sand and clay from terrain, and wool from shearable sheep. Sheep are only sheared after the worker has crafted and equipped shears; wool can then be crafted into beds through the registered recipe system. Grass-block placements are planned as dirt items because vanilla grass blocks drop dirt without Silk Touch.
+- Recipe-based material sourcing includes wood from verified natural trees, stone and ore from exposed caves/mines or safe exposed rock faces, sand and clay from terrain, and wool from shearable sheep. During exact material requests, mining collects only the requested item to avoid filling the worker inventory with unrelated tunnel debris. Sheep are only sheared after the worker has crafted and equipped shears; wool can then be crafted into beds through the registered recipe system. Grass-block placements are planned as dirt items because vanilla grass blocks drop dirt without Silk Touch.
 - Registered smelting recipes (including sand-to-glass and ore processing) are simulated over time and consume coal/charcoal fuel. Coal/charcoal are reserved as processing fuel; the mod does not burn the house's planks, logs or sticks.
 - Crafting and smelting are recipe-driven controller actions with particles, time and ingredient consumption. They do not yet operate a visible crafting-table or furnace block with a physical GUI.
 
@@ -104,6 +104,8 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "blockBreakBaseTicks": 28,
   "particleIntervalTicks": 20,
   "mineExclusionRadius": 24,
+  "stoneSearchFailuresBeforeMine": 5,
+  "mineMinimumDistanceFromVillage": 20,
   "houseSpacing": 12,
   "blacksmithToolUpgrades": true,
   "woodRequired": 0,
@@ -145,6 +147,8 @@ All values are clamped to safe ranges when loaded. The most useful controls are:
 | `caveSearchRadius` / `caveSearchDepth` | Cave resource search area |
 | `caveSearchIntervalTicks` | Delay between cave scans |
 | `mineMaxLength` / `mineSupportInterval` | Stair mine length segment and log support spacing |
+| `stoneSearchFailuresBeforeMine` | Completed unsuccessful stone scans before opening a dedicated mine (default: 5) |
+| `mineMinimumDistanceFromVillage` | Minimum horizontal distance from the village centre to a mine entrance (default: 20; values below 20 are clamped) |
 | `blockBreakBaseTicks` | Overall block-breaking pace multiplier |
 | `woodSearchRadius` | Search radius for tree logs |
 | `maxPathSearchNodes` | Upper bound for road pathfinding work |
@@ -163,21 +167,21 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.4` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.2.4.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.6` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.2.6.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.2.4.jar` in the `mods` folder.
+- Put `village-expansion-1.2.6.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
 ## Save compatibility and known limitations
 
-- Active worker task snapshots are stored in the dimension's `PersistentState`. The project stage, progress counters, road positions, plot-tree targets, partial tree-cut list and indexes, terrain operations, current resource target, pending recipe item and exact pending quantity, smelting timer/fuel, active mining target, mine entrance and mine direction are serialized. Task snapshots are refreshed every 20 world ticks and restored when the villager is loaded again.
+- Active worker task snapshots are stored in the dimension's `PersistentState`. The project stage, progress counters, dedicated stone-search failure count, road positions, plot-tree targets, partial tree-cut list and indexes, terrain operations, current resource target, pending recipe item and exact pending quantity, smelting timer/fuel, active mining target, mine entrance and mine direction are serialized. Task snapshots are refreshed every 20 world ticks and restored when the villager is loaded again.
 - The save loader can read the older task format and rebuilds missing work lists for those older snapshots.
 - If the server crashes between snapshots, up to roughly one second of task bookkeeping can roll back. Already placed blocks remain in the world and are not overwritten if they are no longer replaceable.
 - A mine is a functional generated-by-the-mod stair tunnel with periodic log supports, not a full copy of naturally generated mineshafts.
@@ -200,8 +204,12 @@ MIT. See `LICENSE`.
 Third-party profession houses can be configured through JSON. See [docs/MOD_COMPATIBILITY.md](docs/MOD_COMPATIBILITY.md) and `examples/compat/examplemod.json`. Compatible entries require the target mod, a registered Villager profession, a workstation block and an NBT structure template containing both a bed and that workstation. Compatibility files are optional; no hard dependency on the third-party mod is added.
 
 
-## Recovery, material correctness and safer construction (1.2.4)
+## Mining recovery, loot correctness and safer construction (1.2.6)
 
+- Mining no longer calls `world.breakBlock(..., true, villager)` as if that supplied the held pickaxe. The block is removed without automatic drops, then its vanilla loot table is evaluated with the captured tool stack. This fixes the underlying cause for cobblestone and supported ore drops, not just the displayed item name.
+- Exact material requests may target safe exposed stone faces on a mountain or ravine as well as cave walls. When digging a stair mine, only the requested item is collected, so unrelated dirt/gravel drops cannot fill the villager inventory and prevent cobblestone collection.
+- Stone/cobblestone searches now get five completed attempts before the builder starts its own descending stair mine. Each miss expands the next search radius by 8 blocks (up to 96). The failed-search count is saved, so restarting the world does not reset the five-attempt sequence.
+- The builder walks to a mine entrance at least 20 horizontal blocks from the village centre before digging. Existing mine entrances closer than 20 blocks are not reused. Both values have config entries; the mine-distance setting cannot be reduced below 20.
 - Blueprint planning maps `grass_block` to the actual harvested item, `dirt`. Saved tasks from 1.2.3 or earlier that were waiting for the impossible `grass_block` item are migrated to `dirt` when restored.
 - Repeated misses expand wood, dirt, wool, surface-material and cave searches up to 96 blocks. Workers keep their active house project instead of abandoning it after a fixed number of failed searches.
 - If the leveling stage cannot find enough surface dirt after expanding its search, it obtains stone through the cave/stair-mine route and uses that as a fill substitute rather than skipping the terrain operation.
@@ -212,7 +220,7 @@ Third-party profession houses can be configured through JSON. See [docs/MOD_COMP
 - Founding completion checks verify that each loaded villager's remembered HOME position is a bed block. When a remembered bed is broken in a loaded chunk, the villager's stale HOME memory is cleared so it can be assigned a replacement home.
 
 ### Validation
-- Source-level checks, release metadata checks and ZIP integrity checks are run during packaging. This environment does not have Gradle or a Minecraft/Fabric runtime and cannot reach the Gradle distribution service, so the Fabric compile and in-game spawn/biome simulations still need to run through GitHub Actions and Minecraft. Use [docs/TEST_SCENARIOS_1.2.4.md](docs/TEST_SCENARIOS_1.2.4.md) as the manual acceptance checklist.
+- Source-level checks, release metadata checks and ZIP integrity checks are run during packaging. This environment does not have Gradle or a Minecraft/Fabric runtime and cannot reach the Gradle distribution service, so the Fabric compile and in-game spawn/biome simulations still need to run through GitHub Actions and Minecraft. Use [docs/TEST_SCENARIOS_1.2.6.md](docs/TEST_SCENARIOS_1.2.6.md) as the manual acceptance checklist.
 
 ## Material gathering recovery (1.2.3)
 
