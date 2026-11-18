@@ -1,4 +1,4 @@
-# Village Expansion 1.2.3
+# Village Expansion 1.2.4
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -16,9 +16,9 @@ This is a source project. It is not a precompiled JAR. The included GitHub Actio
 ### Construction priority, danger and sleep
 
 - The vanilla Villager Brain continues ticking. After each Brain tick, the mod compares its active navigation target with the current construction target and reapplies the construction route if vanilla wandering has replaced it.
-- If a hostile mob enters the configured danger radius or the villager is attacked, construction navigation priority is temporarily yielded so vanilla flee behavior can run. The task pauses for `dangerPauseTicks` and then resumes from its saved stage.
+- If a hostile mob enters the configured danger radius or the villager is attacked, construction navigation priority is temporarily yielded so vanilla flee behavior can run. The same pause is applied while the villager is burning, drowning or at critically low health (25% or less), giving vanilla movement/safety goals control before construction resumes from its saved stage.
 - A navigation watchdog detects lack of movement progress, retries alternate nearby standing positions, and logs repeated route failures instead of silently waiting forever.
-- If a material search repeatedly fails, the worker logs the exact requested item and retries it; debug labels show the missing item. Stone-like crafting ingredients and supported raw ores can use the underground mining route when no exposed target is found.
+- If a material search repeatedly fails, the worker expands its search radius (up to 96 blocks), logs the exact requested item and retries without discarding the active house project. Stone-like crafting ingredients and supported raw ores can use the underground mining route when no exposed target is found. If surface dirt is unavailable for a leveling fill, the worker can obtain stone through the mine and use it as a substitute.
 - At night, a builder with an assigned `HOME` memory is allowed to use its vanilla schedule to reach and sleep in its bed. The founding villager keeps the first house bed while it returns for the starter profession house. Its construction stage resumes after morning.
 - Only adult villagers with profession `none`, no assigned HOME, and no active customer interaction are eligible to become builders.
 
@@ -28,7 +28,7 @@ This is a source project. It is not a precompiled JAR. The included GitHub Actio
 - The founding sequence attempts one common house, then a professional house; the first professional project prioritizes a smithing-related building.
 - Nearby homeless unemployed villagers may join an active founding project until `maxBuildersPerVillage` is reached.
 - After the founding sequence, house selection follows the normal two-common-houses-to-one-professional-house ratio, accounting for projects already in progress.
-- A vanilla meeting-point template with a bell is placed when possible. A settlement leaves its founding state only when a bell has been registered and all villagers detected in the loaded scan area have HOME memory.
+- A vanilla meeting-point template with a bell is placed when possible. Its pedestal consumes one gold block. A settlement leaves its founding state only when a bell has been registered and all villagers detected in the loaded scan area have a HOME memory pointing to a bed block (verified when that bed chunk is loaded).
 - A builder's temporary profession is removed when the job completes or is abandoned.
 
 ### Houses by biome
@@ -61,7 +61,7 @@ The template loader uses one palette per structure, since a structure's palettes
 - Wood is requested by exact item and may only be sourced from a verified natural tree. The builder never mines arbitrary log blocks as a wood resource. Tree felling collects the whole selected tree, rather than leaving floating trunks. A conservative nearby-building check protects trees close to beds, doors, workstations and block entities.
 - The selected house template is counted as an item plan. Before gathering an item type, the builder counts every still-placeable occurrence of that item remaining in the blueprint and resolves the recipe ingredients for the total. Existing inventory is deducted, and the saved request count prevents repeated one-at-a-time collection loops. One item is consumed only when its block is placed. Upper door halves and bed head halves do not consume a second item; occupied non-replaceable positions are skipped without consuming materials.
 - Existing inventory is used first. When an item is missing, the builder follows registered crafting recipes recursively and collects only the missing ingredients. Recipe output is produced in normal recipe batches (for example, a door recipe yields three doors), so a small remainder can be carried into later placements or future jobs.
-- Recipe-based material sourcing includes wood from trees, stone and ore from exposed caves/mines, sand and clay from terrain, and wool from shearable sheep. Wool can be crafted into beds through the registered recipe system.
+- Recipe-based material sourcing includes wood from verified natural trees, stone and ore from exposed caves/mines, sand and clay from terrain, and wool from shearable sheep. Sheep are only sheared after the worker has crafted and equipped shears; wool can then be crafted into beds through the registered recipe system. Grass-block placements are planned as dirt items because vanilla grass blocks drop dirt without Silk Touch.
 - Registered smelting recipes (including sand-to-glass and ore processing) are simulated over time and consume coal/charcoal fuel. Coal/charcoal are reserved as processing fuel; the mod does not burn the house's planks, logs or sticks.
 - Crafting and smelting are recipe-driven controller actions with particles, time and ingredient consumption. They do not yet operate a visible crafting-table or furnace block with a physical GUI.
 
@@ -152,7 +152,7 @@ All values are clamped to safe ranges when loaded. The most useful controls are:
 | `navigationStallTimeoutTicks` | Time without measurable progress before repathing |
 | `navigationReassertIntervalTicks` | Maximum interval between construction-route enforcement checks |
 | `navigationMaxRepaths` | Alternate route attempts before a warning/reset |
-| `noResourceSearchLimit` | Failed material searches before a task is skipped or released |
+| `noResourceSearchLimit` | Failed searches before the worker expands its search radius or switches to an alternative resource route |
 | `mineExclusionRadius` / `houseSpacing` | Prevents houses from crowding mines or other houses |
 | `breedingPartnerRange` / `breedingScanIntervalTicks` | Bedless breeding search settings |
 
@@ -163,15 +163,15 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.3` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.2.3.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.4` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.2.4.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.2.3.jar` in the `mods` folder.
+- Put `village-expansion-1.2.4.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
@@ -199,6 +199,20 @@ MIT. See `LICENSE`.
 
 Third-party profession houses can be configured through JSON. See [docs/MOD_COMPATIBILITY.md](docs/MOD_COMPATIBILITY.md) and `examples/compat/examplemod.json`. Compatible entries require the target mod, a registered Villager profession, a workstation block and an NBT structure template containing both a bed and that workstation. Compatibility files are optional; no hard dependency on the third-party mod is added.
 
+
+## Recovery, material correctness and safer construction (1.2.4)
+
+- Blueprint planning maps `grass_block` to the actual harvested item, `dirt`. Saved tasks from 1.2.3 or earlier that were waiting for the impossible `grass_block` item are migrated to `dirt` when restored.
+- Repeated misses expand wood, dirt, wool, surface-material and cave searches up to 96 blocks. Workers keep their active house project instead of abandoning it after a fixed number of failed searches.
+- If the leveling stage cannot find enough surface dirt after expanding its search, it obtains stone through the cave/stair-mine route and uses that as a fill substitute rather than skipping the terrain operation.
+- Newly selected mine entrances must have a dry, clear two-block-high approach and are checked against other builders' reserved mine entrances. Registered mine locations continue to be reused by later projects.
+- Construction workers now find standing positions on any solid floor, including the placed wooden floor inside a house. They do not place a block inside a living entity's hitbox; if a villager or mob occupies the target, the builder waits and retries.
+- Wool collection now requires crafted shears. The shears are equipped for the action and their durability is applied to the shears, not the builder's currently equipped pickaxe or axe.
+- A new settlement's meeting point requires one gold block for the bell pedestal. The builder uses the registered recipe/mining/smelting chain to obtain it before registering the bell.
+- Founding completion checks verify that each loaded villager's remembered HOME position is a bed block. When a remembered bed is broken in a loaded chunk, the villager's stale HOME memory is cleared so it can be assigned a replacement home.
+
+### Validation
+- Source-level checks, release metadata checks and ZIP integrity checks are run during packaging. This environment does not have Gradle or a Minecraft/Fabric runtime and cannot reach the Gradle distribution service, so the Fabric compile and in-game spawn/biome simulations still need to run through GitHub Actions and Minecraft. Use [docs/TEST_SCENARIOS_1.2.4.md](docs/TEST_SCENARIOS_1.2.4.md) as the manual acceptance checklist.
 
 ## Material gathering recovery (1.2.3)
 

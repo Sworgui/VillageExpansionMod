@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.4 - Resource recovery and collision-safe construction
+
+- Fixed the `Faltando: grass_block` deadlock. A blueprint now requests `dirt`, which is what vanilla grass blocks drop without Silk Touch. Existing saved tasks with a pending `grass_block` request are migrated to `dirt` on restore.
+- Wood, dirt, wool, surface-material and cave searches progressively expand to a maximum radius of 96 blocks. Failed searches no longer discard the active house project.
+- Terrain leveling now falls back to mining stone for fill material after repeated dirt-search misses instead of skipping the unfilled operation.
+- Mine entrance selection rejects waterlogged/blocked approaches and positions occupied by living entities, and avoids entrances reserved by another active builder. Mine locations remain registered for reuse by later projects.
+- Construction stand-position search now recognizes placed floors as well as natural terrain, allowing workers to finish interior blocks after the house floor and walls exist. Placement waits while a living entity occupies the destination block. The worker also yields its task to vanilla safety behavior while burning, drowning or at critically low health.
+- Sheep are only sheared after the builder has crafted shears. The tool is equipped during shearing and receives the durability damage, preserving the main-hand pickaxe/axe.
+- A founding settlement now obtains and spends one gold block for the meeting-point bell pedestal before registering the bell.
+- Loaded villagers whose remembered HOME block is no longer a bed have that stale memory cleared, making them eligible for a replacement home. Founding completion validates loaded bed blocks rather than relying only on a HOME memory value.
+
+### Validation
+- Static source/metadata checks and ZIP integrity checks pass. Gradle/Fabric compilation and in-game testing could not be run here because Gradle and a Minecraft runtime are not installed and the Gradle distribution could not be reached. GitHub Actions remains the authoritative compile check; the multi-biome spawn scenarios still require an in-game test.
+
 ## 1.2.3 - Material gathering recovery
 
 - Fixed a dead-end in the demand-driven material pipeline: coal and supported raw ores could be requested by crafting/smelting recipes, but the generic collector only searched a shallow surface band and then idled without creating a mining route.
