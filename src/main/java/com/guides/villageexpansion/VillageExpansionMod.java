@@ -22,6 +22,6 @@ public final class VillageExpansionMod implements ModInitializer {
         BuilderProfession.register();
         ServerTickEvents.END_WORLD_TICK.register(VillageBuilderController::tickWorld);
         ServerTickEvents.END_WORLD_TICK.register(VillageBreedingController::tickWorld);
-        LOGGER.info("Village Expansion 1.1.0 initialized: task recovery and optional profession compatibility enabled.");
+        LOGGER.info("Village Expansion 1.2.2 initialized: task recovery and optional profession compatibility enabled.");
     }
 }

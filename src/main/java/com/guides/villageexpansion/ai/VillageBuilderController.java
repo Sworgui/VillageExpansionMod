@@ -53,6 +53,7 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.village.VillagerData;
 import net.minecraft.village.VillagerProfession;
 import net.minecraft.particle.ParticleTypes;
+import net.minecraft.text.Text;
 
 import java.util.ArrayList;
 import java.util.ArrayDeque;
@@ -190,8 +191,32 @@ public final class VillageBuilderController {
                 hostile -> hostile.isAlive() && !hostile.isRemoved()).isEmpty();
     }
 
+    private static final String DEBUG_LABEL_PREFIX = "[VE] ";
+
+    private static void updateDebugLabel(VillagerEntity villager, BuilderTask task) {
+        if (!VillageExpansionConfig.showBuilderTaskLabel) {
+            clearDebugLabel(villager);
+            return;
+        }
+        // Do not overwrite player-assigned names. Unnamed builders receive a
+        // temporary visible name tag that is removed when their project ends.
+        if (villager.getCustomName() != null && !villager.getCustomName().getString().startsWith(DEBUG_LABEL_PREFIX)) return;
+        String label = task.sleepingAtNight ? "Dormindo" :
+                task.pausedUntil > villager.getWorld().getTime() ? "Pausado: perigo" : task.stage.debugName;
+        villager.setCustomName(Text.literal(DEBUG_LABEL_PREFIX + label));
+        villager.setCustomNameVisible(true);
+    }
+
+    private static void clearDebugLabel(VillagerEntity villager) {
+        if (villager.getCustomName() != null && villager.getCustomName().getString().startsWith(DEBUG_LABEL_PREFIX)) {
+            villager.setCustomName(null);
+            villager.setCustomNameVisible(false);
+        }
+    }
+
     private static void tickTask(ServerWorld world, VillagerEntity villager, BuilderTask task) {
         long now = world.getTime();
+        updateDebugLabel(villager, task);
 
         if (nearbyDanger(world, villager)) {
             task.pausedUntil = Math.max(task.pausedUntil, now + VillageExpansionConfig.dangerPauseTicks);
@@ -221,6 +246,12 @@ public final class VillageBuilderController {
             world.spawnParticles(ParticleTypes.HAPPY_VILLAGER,
                     villager.getX(), villager.getY() + 1.75D, villager.getZ(),
                     2, 0.22D, 0.12D, 0.22D, 0.0D);
+        }
+        // Leaves decay naturally after the trunk is removed. Periodically collect
+        // only sapling item drops and replant them; leaf blocks are never harvested.
+        if (VillageExpansionConfig.replantSaplings && now % 200L == 0L) {
+            BlockPos origin = task.saplingSearchOrigin == null ? villager.getBlockPos() : task.saplingSearchOrigin;
+            replantSaplings(world, villager, task, origin);
         }
 
         if (task.actionTimer > 0) task.actionTimer--;
@@ -1296,7 +1327,7 @@ public final class VillageBuilderController {
         }
     }
 
-    /** Breaks every log and leaf of one confirmed natural tree individually. */
+    /** Breaks only the connected logs of one confirmed natural tree. Leaves decay naturally. */
     private static boolean tickCutTree(ServerWorld world, VillagerEntity villager, BuilderTask task, BlockPos base) {
         BlockPos naturalRoot;
         if (task.currentTreeBase != null && task.currentTreeBase.equals(base)) {
@@ -1369,44 +1400,12 @@ public final class VillageBuilderController {
             return false;
         }
 
-        if (!task.currentTreeLeavesScanned) {
-            Set<BlockPos> leaves = new HashSet<>();
-            for (BlockPos log : task.currentTreeLogs) {
-                for (int dx = -4; dx <= 4; dx++) {
-                    for (int dy = -3; dy <= 8; dy++) {
-                        for (int dz = -4; dz <= 4; dz++) {
-                            BlockPos candidate = log.add(dx, dy, dz);
-                            if (isLoaded(world, candidate) && world.getBlockState(candidate).isIn(BlockTags.LEAVES)) {
-                                leaves.add(candidate.toImmutable());
-                            }
-                        }
-                    }
-                }
-            }
-            task.currentTreeLeaves.addAll(leaves);
-            task.currentTreeLeaves.sort(Comparator.comparingDouble(pos -> pos.getSquaredDistance(treeOrigin)));
-            task.currentTreeLeavesScanned = true;
-        }
-
-        while (task.currentTreeLeafIndex < task.currentTreeLeaves.size()) {
-            BlockPos leaf = task.currentTreeLeaves.get(task.currentTreeLeafIndex);
-            if (!world.getBlockState(leaf).isIn(BlockTags.LEAVES)) {
-                task.currentTreeLeafIndex++;
-                continue;
-            }
-            BlockPos stand = findStandingPosition(world, leaf, villager);
-            if (stand == null) stand = findStandingPosition(world, base, villager);
-            if (stand == null || !moveNear(villager, task, stand, VillageExpansionConfig.navigationSpeed)) return false;
-            equipBestTool(villager, ToolKind.AXE);
-            if (!tickBreakBlock(world, villager, task, leaf, ToolKind.AXE, ItemTags.SAPLINGS)) return false;
-            task.currentTreeLeafIndex++;
-            return false;
-        }
-
+        // Do not break leaves. Vanilla leaf decay will generate sapling drops
+        // naturally after the connected logs have been removed.
         task.saplingSearchOrigin = base.toImmutable();
         collectDrops(world, villager, base, ItemTags.LOGS);
-        collectDrops(world, villager, base, ItemTags.SAPLINGS);
-        replantSaplings(world, villager, task, base);
+        // Saplings may drop several seconds after the tree is felled. The
+        // periodic sapling pass in tickTask will collect and replant them.
         task.currentTreeBase = null;
         task.currentTreeLogItem = null;
         task.currentTreeLogs.clear();
@@ -1473,8 +1472,23 @@ public final class VillageBuilderController {
     private static BlockPos findSaplingPlantingSpot(ServerWorld world, BuilderTask task,
                                                     BlockPos origin, Block saplingBlock) {
         int radius = VillageExpansionConfig.saplingPlantRadius;
-        BlockPos best = null;
-        double bestDistance = Double.MAX_VALUE;
+        List<BlockPos> candidates = new ArrayList<>();
+        List<BlockPos> existingSaplings = new ArrayList<>();
+        int scanRadius = radius + VillageExpansionConfig.saplingMinimumSpacing;
+        for (int sx = -scanRadius; sx <= scanRadius; sx++) {
+            for (int sz = -scanRadius; sz <= scanRadius; sz++) {
+                int x = origin.getX() + sx;
+                int z = origin.getZ() + sz;
+                int surfaceY = findSurfaceY(world, x, z);
+                if (surfaceY == Integer.MIN_VALUE) continue;
+                for (int sy = -3; sy <= 5; sy++) {
+                    BlockPos check = new BlockPos(x, surfaceY + sy, z);
+                    if (isLoaded(world, check) && world.getBlockState(check).isIn(BlockTags.SAPLINGS)) {
+                        existingSaplings.add(check.toImmutable());
+                    }
+                }
+            }
+        }
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
                 int x = origin.getX() + dx;
@@ -1483,29 +1497,28 @@ public final class VillageBuilderController {
                 if (groundY == Integer.MIN_VALUE) continue;
                 BlockPos ground = new BlockPos(x, groundY, z);
                 BlockPos plantPos = ground.up();
-                if (!isLoaded(world, plantPos) || !world.getBlockState(ground).isSolidBlock(world, ground)
-                        || world.getBlockState(ground).isOf(Blocks.DIRT_PATH)
+                if (!isLoaded(world, plantPos) || !world.getBlockState(ground).isOf(Blocks.DIRT)
+                        && !world.getBlockState(ground).isOf(Blocks.GRASS_BLOCK)
+                        && !world.getBlockState(ground).isOf(Blocks.PODZOL)
+                        && !world.getBlockState(ground).isOf(Blocks.COARSE_DIRT)
                         || !world.getBlockState(plantPos).isAir()
                         || world.getLightLevel(plantPos) < 8
                         || !saplingBlock.getDefaultState().canPlaceAt(world, plantPos)) continue;
                 if (x >= task.site.getX() - 2 && x < task.site.getX() + task.footprintX + 2
                         && z >= task.site.getZ() - 2 && z < task.site.getZ() + task.footprintZ + 2) continue;
-                boolean nearVillagePath = false;
+                boolean nearPath = false;
                 for (BlockPos path : task.pathBlocks) {
-                    if (Math.abs(path.getX() - x) <= 1 && Math.abs(path.getZ() - z) <= 1) {
-                        nearVillagePath = true;
-                        break;
-                    }
+                    if (Math.abs(path.getX() - x) <= 1 && Math.abs(path.getZ() - z) <= 1) { nearPath = true; break; }
                 }
-                if (nearVillagePath) continue;
-                double distance = plantPos.getSquaredDistance(origin);
-                if (distance < bestDistance) {
-                    bestDistance = distance;
-                    best = plantPos;
+                if (nearPath) continue;
+                boolean tooClose = false;
+                for (BlockPos other : existingSaplings) {
+                    if (other.getSquaredDistance(plantPos) < (double) VillageExpansionConfig.saplingMinimumSpacing * VillageExpansionConfig.saplingMinimumSpacing) { tooClose = true; break; }
                 }
+                if (!tooClose) candidates.add(plantPos.toImmutable());
             }
         }
-        return best;
+        return candidates.isEmpty() ? null : candidates.get(world.random.nextInt(candidates.size()));
     }
 
     private enum ToolKind { AXE, PICKAXE, SHOVEL }
@@ -1861,16 +1874,9 @@ public final class VillageBuilderController {
                     // one block at a time by tickCutTree, including their connected trunk logs.
                     if (state.isIn(BlockTags.LOGS)) continue;
                     if (state.isIn(BlockTags.LEAVES)) {
-                        boolean belongsToQueuedTree = roots.stream().anyMatch(root ->
-                                Math.abs(root.getX() - pos.getX()) <= 5
-                                        && Math.abs(root.getZ() - pos.getZ()) <= 5
-                                        && pos.getY() >= root.getY() - 2
-                                        && pos.getY() <= root.getY() + 14);
-                        if (belongsToQueuedTree) continue; // tickCutTree will harvest these leaves and their saplings.
-                        if (world.breakBlock(pos, true, villager)) {
-                            collectDrops(world, villager, pos, ItemTags.SAPLINGS);
-                            task.saplingSearchOrigin = site.toImmutable();
-                        }
+                        // Never harvest leaves. They are left in place to decay naturally
+                        // after the trunk is felled; sapling drops are collected later.
+                        continue;
                     } else if (isPlant(state)) {
                         if (world.breakBlock(pos, true, villager)) collectDrops(world, villager, pos, null);
                     }
@@ -3213,6 +3219,7 @@ public final class VillageBuilderController {
                 8, 1.2D, 0.8D, 1.2D, 0.05D);
         world.playSound(null, task.site, SoundEvents.BLOCK_WOOD_PLACE, SoundCategory.BLOCKS, 0.9F, 1.0F);
 
+        clearDebugLabel(villager);
         ACTIVE_TASKS.remove(villager.getUuid());
         saved.removeActiveTask(villager.getUuid());
         RETRY_AT.put(villager.getUuid(), world.getTime() + (founderNeedsJobHouse ? 100L : 24_000L));
@@ -3234,6 +3241,7 @@ public final class VillageBuilderController {
         villager.getNavigation().stop();
         restoreBuilderProfession(villager, task);
         villager.equipStack(EquipmentSlot.MAINHAND, task.originalMainHand.copy());
+        clearDebugLabel(villager);
         ACTIVE_TASKS.remove(villager.getUuid());
         VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
                 VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
@@ -3285,16 +3293,18 @@ public final class VillageBuilderController {
     }
 
     private enum Stage {
-        CLEAR_PATH,
-        LEVEL_SITE,
-        BUILD_PATH,
-        GATHER_WOOD,
-        GATHER_DIRT,
-        GATHER_STONE,
-        GATHER_MATERIAL,
-        SMELT_MATERIAL,
-        MINE_TUNNEL,
-        BUILD
+        CLEAR_PATH("Limpando terreno"),
+        LEVEL_SITE("Nivelando terreno"),
+        BUILD_PATH("Construindo caminho"),
+        GATHER_WOOD("Coletando madeira"),
+        GATHER_DIRT("Coletando terra"),
+        GATHER_STONE("Coletando pedra"),
+        GATHER_MATERIAL("Coletando materiais"),
+        SMELT_MATERIAL("Fundindo materiais"),
+        MINE_TUNNEL("Escavando mina"),
+        BUILD("Construindo casa");
+        private final String debugName;
+        Stage(String debugName) { this.debugName = debugName; }
     }
 
     private static final class BuilderTask {

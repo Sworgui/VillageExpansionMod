@@ -40,7 +40,9 @@ public final class VillageExpansionConfig {
     public static int woodUnitsPerLog = 4;
     public static int woodSearchRadius = 32;
     public static boolean replantSaplings = true;
-    public static int saplingPlantRadius = 10;
+    public static boolean showBuilderTaskLabel = true;
+    public static int saplingPlantRadius = 32;
+    public static int saplingMinimumSpacing = 8;
     public static int materialSearchRadius = 28;
     public static int materialSearchIntervalTicks = 100;
     public static boolean useRecipeBookForCrafting = true;
@@ -96,7 +98,9 @@ public final class VillageExpansionConfig {
             woodUnitsPerLog = clamp(integer(json, "woodUnitsPerLog", 4), 1, 8);
             woodSearchRadius = clamp(integer(json, "woodSearchRadius", 32), 8, 96);
             replantSaplings = bool(json, "replantSaplings", true);
-            saplingPlantRadius = clamp(integer(json, "saplingPlantRadius", 10), 3, 32);
+            showBuilderTaskLabel = bool(json, "showBuilderTaskLabel", true);
+            saplingPlantRadius = clamp(integer(json, "saplingPlantRadius", 32), 8, 64);
+            saplingMinimumSpacing = clamp(integer(json, "saplingMinimumSpacing", 8), 4, 16);
             materialSearchRadius = clamp(integer(json, "materialSearchRadius", 28), 8, 96);
             materialSearchIntervalTicks = clamp(integer(json, "materialSearchIntervalTicks", 100), 20, 1200);
             useRecipeBookForCrafting = bool(json, "useRecipeBookForCrafting", true);
@@ -147,7 +151,9 @@ public final class VillageExpansionConfig {
         json.addProperty("woodUnitsPerLog", woodUnitsPerLog);
         json.addProperty("woodSearchRadius", woodSearchRadius);
         json.addProperty("replantSaplings", replantSaplings);
+        json.addProperty("showBuilderTaskLabel", showBuilderTaskLabel);
         json.addProperty("saplingPlantRadius", saplingPlantRadius);
+        json.addProperty("saplingMinimumSpacing", saplingMinimumSpacing);
         json.addProperty("materialSearchRadius", materialSearchRadius);
         json.addProperty("materialSearchIntervalTicks", materialSearchIntervalTicks);
         json.addProperty("useRecipeBookForCrafting", useRecipeBookForCrafting);

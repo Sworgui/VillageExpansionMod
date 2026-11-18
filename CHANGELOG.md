@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.2 - Builder task labels and natural leaf decay
+
+- Added a visible temporary `[VE]` label above unnamed builder Villagers showing their current task in Portuguese.
+- Added `showBuilderTaskLabel` configuration option (default `true`). Existing player-assigned names are preserved.
+- Removed all explicit leaf-block harvesting. Builders now harvest trunk logs only and allow vanilla leaf decay to produce sapling drops naturally.
+- Sapling drops are collected opportunistically and planted at randomized suitable dirt/grass locations.
+- Added configurable `saplingMinimumSpacing` (default 8 blocks) and increased default planting search radius to 32 blocks.
+- Sapling replanting is optional and never blocks the construction task when no valid spot or sapling is available.
+
 ## 1.2.1 - Tree-only wood gathering and exact structure quantities
 
 ### Tree-only wood collection

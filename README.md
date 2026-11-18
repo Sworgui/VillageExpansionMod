@@ -1,4 +1,4 @@
-# Village Expansion 1.2.1
+# Village Expansion 1.2.2
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -111,7 +111,9 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "woodUnitsPerLog": 4,
   "woodSearchRadius": 32,
   "replantSaplings": true,
-  "saplingPlantRadius": 10,
+  "saplingPlantRadius": 32,
+  "saplingMinimumSpacing": 8,
+  "showBuilderTaskLabel": true,
   "materialSearchRadius": 28,
   "materialSearchIntervalTicks": 100,
   "useRecipeBookForCrafting": true,
@@ -161,15 +163,15 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.1` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.2.1.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.2` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.2.2.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.2.1.jar` in the `mods` folder.
+- Put `village-expansion-1.2.2.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
@@ -196,3 +198,11 @@ MIT. See `LICENSE`.
 ## Third-party mod compatibility
 
 Third-party profession houses can be configured through JSON. See [docs/MOD_COMPATIBILITY.md](docs/MOD_COMPATIBILITY.md) and `examples/compat/examplemod.json`. Compatible entries require the target mod, a registered Villager profession, a workstation block and an NBT structure template containing both a bed and that workstation. Compatibility files are optional; no hard dependency on the third-party mod is added.
+
+
+## Builder task labels and tree replanting (1.2.2)
+
+- Unnamed active builders display a temporary `[VE]` name label above their head with their current task (Portuguese). Set `showBuilderTaskLabel` to `false` to disable it. Existing player-assigned custom names are not overwritten.
+- Builders no longer break leaf blocks. Leaves decay naturally after logs are removed; sapling item drops are collected opportunistically and re-planted.
+- Sapling planting spots are randomized across suitable dirt/grass ground within `saplingPlantRadius`, with `saplingMinimumSpacing` blocks between saplings (default: 8).
+- Sapling planting is opportunistic and does not block house construction if no saplings drop or no valid planting spot is available.
