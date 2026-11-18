@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.2.8 - Clay, flower ingredient and coal acquisition
+
+- Clay-ball collection now scans underwater clay deposits and chooses a reachable dry shoreline stand position, instead of requiring the builder to stand directly beside clay on a dry surface.
+- Flower items used by crafting recipes are recognized as collectible raw materials by their matching flower blocks. This includes dandelions and other vanilla dye flowers.
+- Save migration preserves pending flower ingredient requests; only non-flower decorative vegetation is cleared as an invalid construction dependency.
+- Coal searches now inspect a wider vertical band for exposed mountain ore and the stair-mine routine checks the local newly exposed tunnel walls for the requested ore after each step. Restoring a saved exact ore/fuel request also preserves its requested quantity instead of overwriting it with the house cobblestone budget.
+- Direct material mining collects only the requested item, reducing inventory pollution from incidental drops.
+
+### Validation
+
+- Java source consistency, JSON/metadata and archive integrity checks are part of release packaging. Gradle/Fabric compilation and Minecraft gameplay simulation remain pending GitHub Actions and in-game verification.
+
+---
+
+
+## 1.2.7 - Decorative vegetation no longer blocks construction
+
+- The blueprint material planner now treats decorative vegetation as optional environmental detail, not mandatory house materials.
+- Items represented by blocks recognized by the builder's vegetation classifier are excluded from exact material requirements.
+- The builder skips decorative plant placements, so templates cannot make it wait for `short_grass` or similar items.
+- On task restore, stale pending requests for recognized plant items are cleared and the villager resumes the stage saved before gathering. Existing progress does not require a world reset.
+
+### Validation
+
+- Java source delimiter/syntax screening, JSON parsing and archive integrity checks pass.
+- Gradle/Fabric compilation and Minecraft gameplay simulation were not available in this environment; GitHub Actions remains the authoritative build check.
+
+---
+
+
 ## 1.2.6 - Delayed stair-mine fallback and village-distance safety
 
 - Stone and exact cobblestone/ore collection now performs five completed cave/exposed-rock searches before switching to a self-dug stair mine. The search radius grows by 8 blocks after each miss (up to 96) and the threshold is configurable with `stoneSearchFailuresBeforeMine` (default 5).

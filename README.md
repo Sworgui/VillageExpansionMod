@@ -1,4 +1,4 @@
-# Village Expansion 1.2.6
+# Village Expansion 1.2.8
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -167,15 +167,15 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.6` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.2.6.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.8` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.2.8.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.2.6.jar` in the `mods` folder.
+- Put `village-expansion-1.2.8.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
@@ -204,6 +204,26 @@ MIT. See `LICENSE`.
 Third-party profession houses can be configured through JSON. See [docs/MOD_COMPATIBILITY.md](docs/MOD_COMPATIBILITY.md) and `examples/compat/examplemod.json`. Compatible entries require the target mod, a registered Villager profession, a workstation block and an NBT structure template containing both a bed and that workstation. Compatibility files are optional; no hard dependency on the third-party mod is added.
 
 
+## Resource acquisition fixes (1.2.8)
+
+- Clay-ball requests now search clay deposits under rivers and lakes and select a nearby dry shoreline work position. The builder no longer relies on a dry stand position directly adjacent to underwater clay.
+- Flower items used as recipe ingredients are now collectible by matching the requested item to its corresponding flower block. This supports dandelions and other dye flowers without making decorative flower placements mandatory in house templates.
+- Save migration no longer clears flower requests. A pending dandelion/dye ingredient survives world reloads, while non-flower decorative plants such as short grass, ferns, vines and snow are still excluded from construction material requests.
+- Coal searches include exposed mountain faces above the builder as well as lower cave levels. During a self-dug mine, the builder checks the newly exposed tunnel walls for the exact requested ore after each completed stair step, rather than relying only on a broad scan every third step.
+- Direct resource collection now picks up only the requested item, preventing unrelated block drops from filling the villager inventory during clay/flower collection.
+
+### Validation
+- Source checks, metadata/JSON checks and ZIP integrity are included in this package. A real Fabric compile and Minecraft simulation still require GitHub Actions and an in-game test world. Use [docs/TEST_SCENARIOS_1.2.8.md](docs/TEST_SCENARIOS_1.2.8.md) for the new regression cases.
+
+## Decorative vegetation is optional (1.2.7)
+
+- Decorative plants present in vanilla structure palettes are not counted as house materials. The builder skips them instead of requesting items such as `short_grass`.
+- If a saved villager was already waiting for `short_grass` or another recognized plant item, the request is cleared on restore and the villager resumes its saved construction stage.
+- This uses the existing vegetation classifier, covering flowers, short/tall grass, ferns, dead bushes, snow layers and vines.
+
+### Validation
+- Source syntax/delimiter screening, metadata checks, JSON parsing and ZIP integrity checks are included in release preparation. This environment does not include Gradle or a Minecraft/Fabric runtime, so a real build and in-game simulation remain pending GitHub Actions and Minecraft. Use [docs/TEST_SCENARIOS_1.2.7.md](docs/TEST_SCENARIOS_1.2.7.md) for regression tests.
+
 ## Mining recovery, loot correctness and safer construction (1.2.6)
 
 - Mining no longer calls `world.breakBlock(..., true, villager)` as if that supplied the held pickaxe. The block is removed without automatic drops, then its vanilla loot table is evaluated with the captured tool stack. This fixes the underlying cause for cobblestone and supported ore drops, not just the displayed item name.
@@ -220,7 +240,7 @@ Third-party profession houses can be configured through JSON. See [docs/MOD_COMP
 - Founding completion checks verify that each loaded villager's remembered HOME position is a bed block. When a remembered bed is broken in a loaded chunk, the villager's stale HOME memory is cleared so it can be assigned a replacement home.
 
 ### Validation
-- Source-level checks, release metadata checks and ZIP integrity checks are run during packaging. This environment does not have Gradle or a Minecraft/Fabric runtime and cannot reach the Gradle distribution service, so the Fabric compile and in-game spawn/biome simulations still need to run through GitHub Actions and Minecraft. Use [docs/TEST_SCENARIOS_1.2.6.md](docs/TEST_SCENARIOS_1.2.6.md) as the manual acceptance checklist.
+- Source-level checks, release metadata checks and ZIP integrity checks are run during packaging. This environment does not have Gradle or a Minecraft/Fabric runtime and cannot reach the Gradle distribution service, so the Fabric compile and in-game spawn/biome simulations still need to run through GitHub Actions and Minecraft. Use [docs/TEST_SCENARIOS_1.2.7.md](docs/TEST_SCENARIOS_1.2.7.md) as the manual acceptance checklist.
 
 ## Material gathering recovery (1.2.3)
 

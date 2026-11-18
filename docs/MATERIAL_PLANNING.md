@@ -20,8 +20,9 @@ This means the builder does not stockpile a fixed amount such as 88 logs. For ex
 | Logs / wood species | Confirmed natural trees of the required wood species |
 | Saplings | Leaf drops from the selected tree; replanted on valid soil when space is available |
 | Cobblestone / stone materials | Stone blocks exposed in caves, accessible mountain/ravine faces, or the mod's saved stair mine; drops are evaluated with the held pickaxe |
-| Coal / ore items | Matching ore blocks in the loaded search area or along the saved stair mine; the held pickaxe is passed to the loot table |
-| Sand / clay | Matching surface terrain blocks |
+| Coal / ore items | Matching ore blocks in the loaded search area, exposed mountain faces, or the saved stair mine; exact ore veins are checked along newly exposed tunnel walls and the held pickaxe is passed to the loot table |
+| Sand / clay balls | Sand from surface terrain; clay from river/lake deposits or exposed clay, worked from a reachable dry shoreline position when underwater |
+| Flower-derived recipe ingredients | Exact matching flower blocks (including dandelions) are collected when a registered dye recipe requires them; flowers included only as template decoration remain optional |
 | Wool | Shearing a living sheep of the required wool color |
 | Glass / smelted ingredients | Registered smelting recipe, timed processing, coal/charcoal fuel |
 | Planks, doors, beds, torches and other craftable blocks | Minecraft's registered crafting recipes |
@@ -38,5 +39,5 @@ Minecraft does not store universal provenance metadata identifying every player-
 
 - Crafting and smelting use recipe data, inventory ingredients, timers and particles. The Villager does not yet place items into a physical crafting table or furnace block GUI.
 - Recipe batch output can leave a small surplus. For example, one door recipe creates three doors; unused output is retained rather than destroyed. Felling one complete tree can also leave extra logs beyond the minimum recipe amount, because all connected tree logs are harvested together and saplings are replanted.
-- The vanilla source finder knows trees, cave stone/ores, safe exposed rock faces for exact requests, common terrain, sheep wool and registered smelting inputs. A third-party material with a custom gathering method needs an additional material-source compatibility entry or code adapter.
+- The vanilla source finder knows trees, cave stone/ores, safe exposed rock faces for exact requests, common terrain, clay deposits beneath rivers/lakes, matching flower blocks used by dye recipes, sheep wool and registered smelting inputs. Underwater clay is mined from a reachable dry shoreline position; fully isolated deposits without a suitable nearby bank remain unavailable until another source is found. A third-party material with a custom gathering method needs an additional material-source compatibility entry or code adapter.
 - If a required raw item cannot be found in loaded chunks or in the nearby search area, the Villager keeps the pending request and retries later rather than substituting an unrelated material.

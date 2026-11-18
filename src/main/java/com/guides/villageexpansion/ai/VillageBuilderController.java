@@ -623,6 +623,20 @@ public final class VillageBuilderController {
             }
             task.pendingMaterialCount = nbt.contains("pendingMaterialCount")
                     ? Math.max(0, nbt.getInt("pendingMaterialCount")) : 1;
+            // Older blueprints could accidentally count decorative plants (for example
+            // short_grass) as house materials. These items are not structural resources;
+            // discard the stale request and resume the saved construction stage.
+            if (isNonStructuralDecorationItem(task.pendingMaterialItem)) {
+                VillageExpansionMod.LOGGER.info(
+                        "Clearing stale decorative material request {} for villager {} and resuming construction",
+                        Registries.ITEM.getId(task.pendingMaterialItem), uuidShort(villager.getUuid()));
+                task.pendingMaterialItem = null;
+                task.pendingMaterialCount = 0;
+                if (task.stage == Stage.GATHER_MATERIAL) {
+                    task.stage = task.resumeStage == null ? Stage.BUILD : task.resumeStage;
+                    task.resumeStage = null;
+                }
+            }
             Identifier deferredMaterialId = Identifier.tryParse(nbt.getString("deferredMaterialItem"));
             if (deferredMaterialId != null) {
                 task.deferredMaterialItem = Registries.ITEM.getOrEmpty(deferredMaterialId).orElse(null);
@@ -685,7 +699,15 @@ public final class VillageBuilderController {
             }
             Map<Item, Integer> restoredMaterialPlan = countBlueprintItems(task.blueprint);
             task.requiredWood = remainingTaggedMaterialRequirement(world, villager, restoredMaterialPlan, ItemTags.LOGS);
-            task.requiredStone = remainingTaggedMaterialRequirement(world, villager, restoredMaterialPlan, ItemTags.STONE_TOOL_MATERIALS);
+            boolean restoringExactMiningRequest = task.resumeStage == Stage.GATHER_MATERIAL
+                    && task.pendingMaterialItem != null
+                    && (task.stage == Stage.GATHER_STONE || task.stage == Stage.MINE_TUNNEL);
+            // The blueprint's cobblestone/stone budget must not overwrite a saved
+            // exact request such as coal fuel or raw ore. The mining controller
+            // compares the exact requested item count against this target.
+            task.requiredStone = restoringExactMiningRequest
+                    ? Math.max(1, task.pendingMaterialCount)
+                    : remainingTaggedMaterialRequirement(world, villager, restoredMaterialPlan, ItemTags.STONE_TOOL_MATERIALS);
             task.wood = countInventoryItems(villager, ItemTags.LOGS);
             task.stone = countInventoryItems(villager, ItemTags.STONE_TOOL_MATERIALS);
 
@@ -2274,8 +2296,14 @@ public final class VillageBuilderController {
 
     private static MiningTarget findExposedCaveStone(ServerWorld world, BlockPos around, VillagerEntity villager,
                                                      Item wantedDrop, int radius) {
-        int minY = Math.max(world.getBottomY() + 2, around.getY() - VillageExpansionConfig.caveSearchDepth);
-        int maxY = Math.min(world.getTopY() - 3, around.getY() + 4);
+        int verticalDepth = wantedDrop == Items.COAL
+                ? Math.max(64, VillageExpansionConfig.caveSearchDepth)
+                : VillageExpansionConfig.caveSearchDepth;
+        int minY = Math.max(world.getBottomY() + 2, around.getY() - verticalDepth);
+        // Coal can be exposed on mountain faces well above the villager's Y level.
+        // Search upward as well as downward for coal-specific requests.
+        int upwardRange = wantedDrop == Items.COAL ? Math.max(48, verticalDepth) : 4;
+        int maxY = Math.min(world.getTopY() - 3, around.getY() + upwardRange);
         MiningTarget best = null;
         double bestDistance = Double.MAX_VALUE;
         for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
@@ -2450,9 +2478,23 @@ public final class VillageBuilderController {
             addMineSupport(world, villager, task.mineFace, task.mineDirection);
         }
 
+        // Exact ore requests inspect the newly exposed tunnel walls immediately.
+        // The previous broad cave scan ran only every third step and could miss a
+        // narrow coal vein behind the builder's current mining face.
+        boolean exactRequest = task.resumeStage == Stage.GATHER_MATERIAL && task.pendingMaterialItem != null;
+        if (exactRequest) {
+            MiningTarget vein = findRequestedMaterialAlongMine(world, task.mineFace,
+                    villager, task.pendingMaterialItem, 3);
+            if (vein != null) {
+                task.currentMine = vein;
+                task.stage = Stage.GATHER_STONE;
+                task.nextResourceSearch = world.getTime() + 1L;
+                return;
+            }
+        }
+
         // A breakthrough is detected by the cave scan, not by filling the tunnel back in.
         if (task.mineSteps % 3 == 0 && world.getTime() >= task.nextResourceSearch) {
-            boolean exactRequest = task.resumeStage == Stage.GATHER_MATERIAL && task.pendingMaterialItem != null;
             int caveRadius = expandedSearchRadius(VillageExpansionConfig.caveSearchRadius,
                     task.resourceSearchFailures);
             MiningTarget cave = exactRequest
@@ -2482,6 +2524,51 @@ public final class VillageBuilderController {
         int horizontal = direction.getAxis() == Direction.Axis.X
                 ? Math.abs(face.getX() - start.getX()) : Math.abs(face.getZ() - start.getZ());
         return Math.max(horizontal, Math.abs(face.getY() - start.getY()));
+    }
+
+    /**
+     * Looks for an exact requested ore/material in the freshly exposed mine walls.
+     * Candidate work positions must be dry, two blocks high and have a solid floor,
+     * so the builder can mine the vein without entering an unsafe cavity.
+     */
+    private static MiningTarget findRequestedMaterialAlongMine(ServerWorld world, BlockPos mineFace,
+                                                                VillagerEntity villager, Item wanted,
+                                                                int radius) {
+        if (wanted == null) return null;
+        MiningTarget best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos orePos = mineFace.add(dx, dy, dz);
+                    if (!isLoaded(world, orePos) || isStoneTargetReserved(world, orePos, villager.getUuid())) continue;
+                    BlockState oreState = world.getBlockState(orePos);
+                    if (!isWantedMaterialBlock(oreState, wanted)
+                            || !isMineableStoneOrOre(oreState, villager)) continue;
+
+                    for (Direction direction : Direction.values()) {
+                        BlockPos stand = orePos.offset(direction);
+                        BlockPos head = stand.up();
+                        BlockPos floor = stand.down();
+                        if (!isLoaded(world, stand) || !isLoaded(world, head) || !isLoaded(world, floor)
+                                || !world.getBlockState(stand).isAir()
+                                || !world.getBlockState(head).isAir()
+                                || !world.getFluidState(stand).isEmpty()
+                                || !world.getFluidState(head).isEmpty()
+                                || !world.getBlockState(floor).isSolidBlock(world, floor)
+                                || hasLivingEntityInBlock(world, stand, villager)
+                                || hasLivingEntityInBlock(world, head, villager)) continue;
+
+                        double distance = stand.getSquaredDistance(villager.getBlockPos());
+                        if (distance < bestDistance) {
+                            bestDistance = distance;
+                            best = new MiningTarget(orePos.toImmutable(), stand.toImmutable(), List.of());
+                        }
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     private static BlockPos findExistingMineFront(ServerWorld world, BlockPos start, Direction direction) {
@@ -2677,8 +2764,31 @@ public final class VillageBuilderController {
      * grass_block drops dirt unless the tool has Silk Touch.
      */
     private static Item requiredItemForBlock(BlockState state) {
+        // Flowers and ground vegetation can appear in some structure palettes as
+        // decorative/environmental blocks. They are not house materials and must
+        // never create an unsatisfiable gather request.
+        if (isPlant(state)) return Items.AIR;
         if (state.isOf(Blocks.GRASS_BLOCK)) return Items.DIRT;
         return state.getBlock().asItem();
+    }
+
+    /**
+     * Detects a saved material request whose item represents optional vegetation.
+     * The registry lookup is safe for non-block items and keeps this migration
+     * generic for flowers and other Plant blocks, not only short_grass.
+     */
+    private static boolean isNonStructuralDecorationItem(Item item) {
+        if (item == null || item == Items.AIR) return false;
+        Identifier itemId = Registries.ITEM.getId(item);
+        return Registries.BLOCK.getOrEmpty(itemId)
+                .map(block -> {
+                    BlockState state = block.getDefaultState();
+                    // Flowers are optional in a blueprint, but they are also real
+                    // recipe ingredients (for example dandelion -> yellow dye).
+                    // Never erase a saved flower request during task migration.
+                    return !state.isIn(BlockTags.FLOWERS) && isPlant(state);
+                })
+                .orElse(false);
     }
 
     /** Expand stone/cobblestone scans after every miss, up to 96 blocks. */
@@ -3106,7 +3216,7 @@ public final class VillageBuilderController {
                 ToolKind tool = state.isIn(BlockTags.BASE_STONE_OVERWORLD) || state.getHardness(world, raw.block()) > 2.5F
                         ? ToolKind.PICKAXE : ToolKind.SHOVEL;
                 equipBestTool(villager, tool);
-                if (tickBreakBlock(world, villager, task, raw.block(), tool, null)) {
+                if (tickBreakBlock(world, villager, task, raw.block(), tool, null, wanted)) {
                     task.resourceSearchFailures = 0;
                 }
                 task.nextMaterialSearch = world.getTime() + 1L;
@@ -3127,6 +3237,9 @@ public final class VillageBuilderController {
 
     private static ResourceTarget findDirectMaterialTarget(ServerWorld world, BlockPos around,
                                                             VillagerEntity villager, Item wanted, int radius) {
+        if (wanted == Items.CLAY_BALL) {
+            return findClayTarget(world, around, villager, radius);
+        }
         ResourceTarget best = null;
         double bestDistance = Double.MAX_VALUE;
         for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
@@ -3145,6 +3258,75 @@ public final class VillageBuilderController {
                     if (distance < bestDistance) { bestDistance = distance; best = new ResourceTarget(block.toImmutable(), stand); }
                 }
             }
+        }
+        return best;
+    }
+
+    /**
+     * Clay commonly generates beneath rivers and lakes. A normal surface-stand
+     * lookup rejects every underwater column, so find a dry bank position within
+     * mining reach and let the builder dig the clay block from the shoreline.
+     */
+    private static ResourceTarget findClayTarget(ServerWorld world, BlockPos around,
+                                                  VillagerEntity villager, int radius) {
+        ResourceTarget best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
+            for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
+                int surfaceY = findSurfaceY(world, x, z);
+                if (surfaceY == Integer.MIN_VALUE) continue;
+                int minY = Math.max(world.getBottomY() + 1, surfaceY - 10);
+                int maxY = Math.min(world.getTopY() - 2, surfaceY + 2);
+                for (int y = minY; y <= maxY; y++) {
+                    BlockPos clay = new BlockPos(x, y, z);
+                    if (!isLoaded(world, clay) || !world.getBlockState(clay).isOf(Blocks.CLAY)) continue;
+                    BlockPos stand = findDryClayWorkStand(world, clay, villager);
+                    if (stand == null) continue;
+                    double distance = clay.getSquaredDistance(villager.getBlockPos());
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = new ResourceTarget(clay.toImmutable(), stand.toImmutable());
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private static BlockPos findDryClayWorkStand(ServerWorld world, BlockPos clay, VillagerEntity villager) {
+        BlockPos best = null;
+        double bestVillagerDistance = Double.MAX_VALUE;
+        // Search a wider ring than the generic adjacent-block finder so a villager
+        // can work from the nearest dry river/lake bank rather than stand in water.
+        for (int radius = 1; radius <= 6; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
+                    int x = clay.getX() + dx;
+                    int z = clay.getZ() + dz;
+                    int groundY = findSurfaceY(world, x, z);
+                    if (groundY == Integer.MIN_VALUE) continue;
+                    BlockPos stand = new BlockPos(x, groundY + 1, z);
+                    BlockPos head = stand.up();
+                    BlockPos floor = stand.down();
+                    if (!isLoaded(world, stand) || !isLoaded(world, head)
+                            || !world.getBlockState(stand).isAir()
+                            || !world.getBlockState(head).isAir()
+                            || !world.getFluidState(stand).isEmpty()
+                            || !world.getFluidState(head).isEmpty()
+                            || !world.getBlockState(floor).isSolidBlock(world, floor)
+                            || hasLivingEntityInBlock(world, stand, villager)
+                            || hasLivingEntityInBlock(world, head, villager)) continue;
+                    // Keep work positions within a practical shoreline reach.
+                    if (stand.getSquaredDistance(clay) > 64.0D) continue;
+                    double villagerDistance = stand.getSquaredDistance(villager.getBlockPos());
+                    if (villagerDistance < bestVillagerDistance) {
+                        bestVillagerDistance = villagerDistance;
+                        best = stand.toImmutable();
+                    }
+                }
+            }
+            if (best != null) break;
         }
         return best;
     }
@@ -3170,9 +3352,15 @@ public final class VillageBuilderController {
     }
 
     private static boolean isWantedMaterialBlock(BlockState state, Item wanted) {
-        String wantedId = Registries.ITEM.getId(wanted).getPath();
-        String blockId = Registries.BLOCK.getId(state.getBlock()).getPath();
-        return switch (wantedId) {
+        Identifier wantedId = Registries.ITEM.getId(wanted);
+        Identifier blockIdentifier = Registries.BLOCK.getId(state.getBlock());
+        String wantedPath = wantedId.getPath();
+        String blockId = blockIdentifier.getPath();
+        // Dye recipes can select different flower items. Match the exact flower
+        // block represented by the requested item rather than hard-coding only
+        // dandelions or treating every flower as decoration.
+        if (state.isIn(BlockTags.FLOWERS) && blockIdentifier.equals(wantedId)) return true;
+        return switch (wantedPath) {
             case "sand" -> state.isOf(Blocks.SAND);
             case "red_sand" -> state.isOf(Blocks.RED_SAND);
             case "gravel" -> state.isOf(Blocks.GRAVEL);
@@ -3203,6 +3391,14 @@ public final class VillageBuilderController {
         if (task.actionTimer > 0) return;
 
         BlockPlacement placement = task.blueprint.get(task.buildIndex);
+        // Skip flowers, short/tall grass, ferns, dead bushes, vines and snow layers
+        // found in a vanilla template palette. They are terrain decoration, not
+        // required construction pieces, and have no place in the material budget.
+        if (isPlant(placement.state)) {
+            task.buildIndex++;
+            task.actionTimer = 1;
+            return;
+        }
         BlockState existing = world.getBlockState(placement.pos);
         if (!existing.isAir() && !existing.isReplaceable()) {
             // Do not overwrite blocks placed by players or another task.
