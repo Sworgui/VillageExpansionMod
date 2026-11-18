@@ -201,8 +201,19 @@ public final class VillageBuilderController {
         // Do not overwrite player-assigned names. Unnamed builders receive a
         // temporary visible name tag that is removed when their project ends.
         if (villager.getCustomName() != null && !villager.getCustomName().getString().startsWith(DEBUG_LABEL_PREFIX)) return;
-        String label = task.sleepingAtNight ? "Dormindo" :
-                task.pausedUntil > villager.getWorld().getTime() ? "Pausado: perigo" : task.stage.debugName;
+        String label;
+        if (task.sleepingAtNight) {
+            label = "Dormindo";
+        } else if (task.pausedUntil > villager.getWorld().getTime()) {
+            label = "Pausado: perigo";
+        } else if (task.pendingMaterialItem != null
+                && (task.stage == Stage.GATHER_MATERIAL
+                    || (task.stage == Stage.GATHER_STONE && task.resumeStage == Stage.GATHER_MATERIAL))) {
+            String itemName = Registries.ITEM.getId(task.pendingMaterialItem).getPath();
+            label = "Faltando: " + itemName + " x" + Math.max(1, task.pendingMaterialCount);
+        } else {
+            label = task.stage.debugName;
+        }
         villager.setCustomName(Text.literal(DEBUG_LABEL_PREFIX + label));
         villager.setCustomNameVisible(true);
     }
@@ -2073,8 +2084,7 @@ public final class VillageBuilderController {
                 task.moveTarget = null;
                 task.requestedMoveTarget = null;
             } else {
-                if (exactStoneRequest && !Registries.ITEM.getId(task.pendingMaterialItem).getPath().equals("cobblestone")
-                        && !Registries.ITEM.getId(task.pendingMaterialItem).getPath().equals("cobbled_deepslate")) {
+                if (exactStoneRequest && !isMineableMaterialRequest(task.pendingMaterialItem)) {
                     task.nextResourceSearch = world.getTime() + VillageExpansionConfig.caveSearchIntervalTicks;
                     return;
                 }
@@ -2287,7 +2297,10 @@ public final class VillageBuilderController {
 
         // A breakthrough is detected by the cave scan, not by filling the tunnel back in.
         if (task.mineSteps % 3 == 0 && world.getTime() >= task.nextResourceSearch) {
-            MiningTarget cave = findExposedCaveStone(world, task.mineFace, villager);
+            boolean exactRequest = task.resumeStage == Stage.GATHER_MATERIAL && task.pendingMaterialItem != null;
+            MiningTarget cave = exactRequest
+                    ? findExposedCaveStone(world, task.mineFace, villager, task.pendingMaterialItem)
+                    : findExposedCaveStone(world, task.mineFace, villager);
             task.nextResourceSearch = world.getTime() + VillageExpansionConfig.caveSearchIntervalTicks;
             if (cave != null) {
                 task.currentMine = cave;
@@ -2778,13 +2791,17 @@ public final class VillageBuilderController {
             }
         }
 
-        if (new ItemStack(wanted).isIn(ItemTags.STONE_TOOL_MATERIALS)) {
+        if (isMineableMaterialRequest(wanted)) {
+            // Stone-like crafting ingredients and raw ores need the mining routine.
+            // The shallow generic block scan cannot find buried coal/ores reliably;
+            // the mining routine can create a safe stair tunnel and search its walls.
             task.resumeStage = Stage.GATHER_MATERIAL;
             task.requiredStone = requestedCount;
             task.stage = Stage.GATHER_STONE;
             task.currentMine = null;
             task.moveTarget = null;
             task.requestedMoveTarget = null;
+            task.nextResourceSearch = world.getTime();
             return;
         }
 
@@ -2864,6 +2881,20 @@ public final class VillageBuilderController {
      * dismantle a door, bed, torch, chest, plank wall or another finished structure
      * when a recipe is unavailable or an item is missing.
      */
+    /**
+     * Items that must be obtained by mining rather than the shallow surface-resource scan.
+     * Keep this limited to resources whose block drops are explicitly supported below.
+     */
+    private static boolean isMineableMaterialRequest(Item wanted) {
+        if (new ItemStack(wanted).isIn(ItemTags.STONE_TOOL_MATERIALS)) return true;
+        String path = Registries.ITEM.getId(wanted).getPath();
+        return switch (path) {
+            case "coal", "raw_iron", "raw_copper", "raw_gold", "redstone",
+                    "lapis_lazuli", "diamond", "emerald" -> true;
+            default -> false;
+        };
+    }
+
     private static boolean isWantedMaterialBlock(BlockState state, Item wanted) {
         String wantedId = Registries.ITEM.getId(wanted).getPath();
         String blockId = Registries.BLOCK.getId(state.getBlock()).getPath();

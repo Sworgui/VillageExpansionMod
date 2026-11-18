@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.3 - Material gathering recovery
+
+- Fixed a dead-end in the demand-driven material pipeline: coal and supported raw ores could be requested by crafting/smelting recipes, but the generic collector only searched a shallow surface band and then idled without creating a mining route.
+- Coal, raw iron, raw copper, raw gold, redstone, lapis lazuli, diamond and emerald requests now enter the cave/mining workflow. If the exact resource is not exposed in an existing cave, the builder can continue its saved stair mine and search the newly exposed tunnel walls for the requested drop.
+- Debug labels now display the exact missing material and quantity (for example, `Faltando: coal x1`) while collecting or mining for a material, instead of the generic `Coletando Materiais` label.
+- The mine's periodic cave scan now filters for the exact requested ore while a material request is active, avoiding detours to unrelated exposed ores.
+
+### Validation
+- Java delimiter checks, resource JSON parsing and ZIP integrity checks pass. A Gradle/Fabric compile and an in-game test are still required; they were not available in this environment.
+
 ## 1.2.2 - Builder task labels and natural leaf decay
 
 - Added a visible temporary `[VE]` label above unnamed builder Villagers showing their current task in Portuguese.
@@ -14,7 +24,7 @@
 ### Tree-only wood collection
 - The generic material finder no longer accepts arbitrary blocks just because their dropped item matches the requested item. It now mines only an allowlist of natural raw-resource blocks (sand, red sand, gravel, dirt, stone/deepslate, clay, and matching ore blocks). Finished building blocks such as planks, doors, beds, torches, chests and other placed structures are never used as generic raw-material sources.
 - Logs remain exclusive to the natural-tree harvesting pipeline. A candidate must pass the natural-root, three-log trunk and canopy checks; vanilla persistent/player-placed leaves are not accepted as natural canopy evidence. Nearby beds, doors, workstations and block entities remain protected.
-- Every connected log in the bounded tree volume (including tall trunk sections and branches) is cut one block at a time, and leaves are processed individually for sapling drops. All collected saplings are replanted where light, soil, spacing and path/house reservations allow; nearby sapling item drops are planted directly if the Villager inventory is full.
+- Every connected log in the bounded tree volume (including tall trunk sections and branches) is cut one block at a time. Leaves are left intact for vanilla decay and later sapling drops. All collected saplings are replanted where light, soil, spacing and path/house reservations allow; nearby sapling item drops are planted directly if the Villager inventory is full.
 
 ### Blueprint-wide quantity planning
 - Before gathering a requested block type, the builder counts every still-placeable occurrence of that item remaining in the active house blueprint. It then recursively resolves crafting ingredients for that total instead of requesting one item at a time.
@@ -34,7 +44,7 @@
 ### Tree harvesting and replanting
 - Wood gathering now targets verified natural tree roots only. A candidate must be rooted in natural soil, have a three-log vertical trunk and a leaf canopy above it.
 - Logs near beds, doors, workstations or block entities are treated as protected wood, reducing the chance of damaging existing houses or player builds.
-- The worker fells the selected tree one block at a time, including connected trunk/branch logs, then processes leaves individually so sapling drops are collected.
+- The worker fells the selected tree one block at a time, including connected trunk/branch logs, then leaves them intact for vanilla decay; sapling drops are collected later.
 - Saplings are replanted on valid soil with suitable light and free space. Replanting avoids the active house footprint and reserved village road; saplings without a suitable location stay in inventory for a later attempt.
 - Tree worklists, indexes and log species are persisted, so restarting the world does not restart a partially harvested tree from scratch.
 

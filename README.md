@@ -1,4 +1,4 @@
-# Village Expansion 1.2.2
+# Village Expansion 1.2.3
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -18,7 +18,7 @@ This is a source project. It is not a precompiled JAR. The included GitHub Actio
 - The vanilla Villager Brain continues ticking. After each Brain tick, the mod compares its active navigation target with the current construction target and reapplies the construction route if vanilla wandering has replaced it.
 - If a hostile mob enters the configured danger radius or the villager is attacked, construction navigation priority is temporarily yielded so vanilla flee behavior can run. The task pauses for `dangerPauseTicks` and then resumes from its saved stage.
 - A navigation watchdog detects lack of movement progress, retries alternate nearby standing positions, and logs repeated route failures instead of silently waiting forever.
-- If a material search repeatedly fails, the worker changes task or releases the project for a later retry rather than remaining in an endless wait loop.
+- If a material search repeatedly fails, the worker logs the exact requested item and retries it; debug labels show the missing item. Stone-like crafting ingredients and supported raw ores can use the underground mining route when no exposed target is found.
 - At night, a builder with an assigned `HOME` memory is allowed to use its vanilla schedule to reach and sleep in its bed. The founding villager keeps the first house bed while it returns for the starter profession house. Its construction stage resumes after morning.
 - Only adult villagers with profession `none`, no assigned HOME, and no active customer interaction are eligible to become builders.
 
@@ -41,7 +41,7 @@ The template loader uses one palette per structure, since a structure's palettes
 
 - A* path search connects the house entrance to the nearest village route/anchor, with its expansion limit exposed in the config.
 - The builder recognizes natural trees conservatively: a candidate needs a natural-soil root, a three-block vertical trunk and a canopy of non-persistent leaves. Logs near beds, doors, workstations or block entities are protected to avoid harvesting house structures.
-- A selected tree is fully felled: every connected trunk/branch log and its leaves are broken individually with visible block damage. All available saplings are replanted on valid soil with sufficient light, away from the active house footprint and village road. Nearby sapling item drops are planted directly if the Villager inventory is full.
+- A selected tree is felled by breaking every connected trunk/branch log individually with visible block damage. Leaves are left intact for vanilla decay; sapling drops are collected later. Saplings are replanted on valid soil with sufficient light, away from the active house footprint and village road. Nearby sapling item drops are planted directly if the Villager inventory is full.
 - Saplings that cannot be planted immediately remain in the worker's inventory or as nearby item drops for a later planting attempt.
 - Terrain preparation executes a saved sequence of leveling operations. Dirt and stone from the builder's inventory are used for simple fill work.
 - The resulting road uses vanilla `dirt_path` blocks and avoids overwriting non-replaceable structures.
@@ -57,7 +57,7 @@ The template loader uses one palette per structure, since a structure's palettes
 
 ### Block harvesting, tools and exact material planning
 
-- Tree logs, leaves, cave stone, ores and surface materials use visible vanilla block-breaking progress. The time is calculated from block hardness, tool mining speed and suitability; damageable tools lose durability when a block is harvested.
+- Tree logs, cave stone, ores and surface materials use visible vanilla block-breaking progress. Leaves are never harvested by the builder. The time is calculated from block hardness, tool mining speed and suitability; damageable tools lose durability when a block is harvested.
 - Wood is requested by exact item and may only be sourced from a verified natural tree. The builder never mines arbitrary log blocks as a wood resource. Tree felling collects the whole selected tree, rather than leaving floating trunks. A conservative nearby-building check protects trees close to beds, doors, workstations and block entities.
 - The selected house template is counted as an item plan. Before gathering an item type, the builder counts every still-placeable occurrence of that item remaining in the blueprint and resolves the recipe ingredients for the total. Existing inventory is deducted, and the saved request count prevents repeated one-at-a-time collection loops. One item is consumed only when its block is placed. Upper door halves and bed head halves do not consume a second item; occupied non-replaceable positions are skipped without consuming materials.
 - Existing inventory is used first. When an item is missing, the builder follows registered crafting recipes recursively and collects only the missing ingredients. Recipe output is produced in normal recipe batches (for example, a door recipe yields three doors), so a small remainder can be carried into later placements or future jobs.
@@ -163,15 +163,15 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.2` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.2.2.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.3` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.2.3.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.2.2.jar` in the `mods` folder.
+- Put `village-expansion-1.2.3.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
@@ -200,7 +200,14 @@ MIT. See `LICENSE`.
 Third-party profession houses can be configured through JSON. See [docs/MOD_COMPATIBILITY.md](docs/MOD_COMPATIBILITY.md) and `examples/compat/examplemod.json`. Compatible entries require the target mod, a registered Villager profession, a workstation block and an NBT structure template containing both a bed and that workstation. Compatibility files are optional; no hard dependency on the third-party mod is added.
 
 
+## Material gathering recovery (1.2.3)
+
+- Ore materials such as coal that are required by crafting or smelting recipes now use the mining route instead of being searched only in the shallow surface layer. If the requested resource is not exposed in a nearby cave, the builder can continue its stair mine and search the newly exposed walls for that exact resource.
+- While waiting for a material, the label above the villager shows the missing item and quantity, such as `[VE] Faltando: coal x1`.
+
 ## Builder task labels and tree replanting (1.2.2)
+
+- Leaves are left intact after the trunk is felled; Minecraft handles their natural decay, and sapling drops are collected later.
 
 - Unnamed active builders display a temporary `[VE]` name label above their head with their current task (Portuguese). Set `showBuilderTaskLabel` to `false` to disable it. Existing player-assigned custom names are not overwritten.
 - Builders no longer break leaf blocks. Leaves decay naturally after logs are removed; sapling item drops are collected opportunistically and re-planted.
