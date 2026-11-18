@@ -13,11 +13,12 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * Persistent per-dimension record of generated villages and houses.
- * Unfinished worker tasks are deliberately runtime-only: if the server stops
- * mid-project, the villager can be assigned again after the next load.
+ * Persistent per-dimension record of generated villages, houses, mines and
+ * unfinished worker tasks. Active task snapshots allow work to resume after reload.
  */
 public final class VillageExpansionState extends PersistentState {
     public static final String STORAGE_ID = "village_expansion_data";
@@ -30,6 +31,7 @@ public final class VillageExpansionState extends PersistentState {
 
     private final List<VillageRecord> villages = new ArrayList<>();
     private long nextVillageId = 1L;
+    private final Map<UUID, NbtCompound> activeTasks = new HashMap<>();
 
     public static VillageExpansionState fromNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup registries) {
         VillageExpansionState state = new VillageExpansionState();
@@ -60,8 +62,28 @@ public final class VillageExpansionState extends PersistentState {
                 }
             }
 
-            state.villages.add(new VillageRecord(id, center, common, professional, houses, founding, founderUuid));
+            List<BlockPos> mines = new ArrayList<>();
+            NbtList mineList = villageNbt.getList("mines", NbtElement.LONG_TYPE);
+            for (int m = 0; m < mineList.size(); m++) {
+                mines.add(BlockPos.fromLong(((NbtLong) mineList.get(m)).longValue()));
+            }
+            boolean bellBuilt = villageNbt.getBoolean("bellBuilt");
+            BlockPos bellPos = villageNbt.contains("bellPos", NbtElement.LONG_TYPE)
+                    ? BlockPos.fromLong(villageNbt.getLong("bellPos")) : null;
+            state.villages.add(new VillageRecord(id, center, common, professional, houses, mines,
+                    founding, founderUuid, bellBuilt, bellPos));
             state.nextVillageId = Math.max(state.nextVillageId, id + 1L);
+        }
+        NbtList taskList = nbt.getList("activeTasks", NbtElement.COMPOUND_TYPE);
+        for (int i = 0; i < taskList.size(); i++) {
+            NbtCompound taskNbt = taskList.getCompound(i);
+            try {
+                UUID villagerId = UUID.fromString(taskNbt.getString("villager"));
+                NbtCompound data = taskNbt.getCompound("data");
+                state.activeTasks.put(villagerId, data.copy());
+            } catch (IllegalArgumentException ignored) {
+                // Ignore an invalid task entry; its villager can be reassigned normally.
+            }
         }
         return state;
     }
@@ -79,6 +101,12 @@ public final class VillageExpansionState extends PersistentState {
             villageNbt.putInt("professionalHouses", village.professionalHouses);
             villageNbt.putBoolean("founding", village.founding);
             villageNbt.putString("founderUuid", village.founderUuid == null ? "" : village.founderUuid.toString());
+            villageNbt.putBoolean("bellBuilt", village.bellBuilt);
+            if (village.bellPos != null) villageNbt.putLong("bellPos", village.bellPos.asLong());
+
+            NbtList mineList = new NbtList();
+            for (BlockPos mine : village.mines) mineList.add(NbtLong.of(mine.asLong()));
+            villageNbt.put("mines", mineList);
 
             NbtList houseList = new NbtList();
             for (BlockPos house : village.houses) {
@@ -89,6 +117,14 @@ public final class VillageExpansionState extends PersistentState {
         }
 
         nbt.put("villages", villageList);
+        NbtList taskList = new NbtList();
+        for (Map.Entry<UUID, NbtCompound> entry : activeTasks.entrySet()) {
+            NbtCompound item = new NbtCompound();
+            item.putString("villager", entry.getKey().toString());
+            item.put("data", entry.getValue().copy());
+            taskList.add(item);
+        }
+        nbt.put("activeTasks", taskList);
         return nbt;
     }
 
@@ -103,7 +139,7 @@ public final class VillageExpansionState extends PersistentState {
         }
 
         VillageRecord created = new VillageRecord(nextVillageId++, anchor.toImmutable(), 0, 0,
-                new ArrayList<>(), false, null);
+                new ArrayList<>(), new ArrayList<>(), false, null, false, null);
         villages.add(created);
         markDirty();
         return created;
@@ -126,7 +162,7 @@ public final class VillageExpansionState extends PersistentState {
         }
 
         VillageRecord created = new VillageRecord(nextVillageId++, anchor.toImmutable(), 0, 0,
-                new ArrayList<>(), true, founderUuid);
+                new ArrayList<>(), new ArrayList<>(), true, founderUuid, false, null);
         villages.add(created);
         markDirty();
         return created;
@@ -140,6 +176,99 @@ public final class VillageExpansionState extends PersistentState {
             }
         }
         return null;
+    }
+
+    public void saveActiveTask(UUID villagerId, NbtCompound taskData) {
+        activeTasks.put(villagerId, taskData.copy());
+        markDirty();
+    }
+
+    public NbtCompound getActiveTask(UUID villagerId) {
+        NbtCompound data = activeTasks.get(villagerId);
+        return data == null ? null : data.copy();
+    }
+
+    public void removeActiveTask(UUID villagerId) {
+        if (activeTasks.remove(villagerId) != null) markDirty();
+    }
+
+    /** Counts persisted projects, including workers whose entity chunks are currently unloaded. */
+    public int getActiveTaskCountForVillage(long villageId) {
+        int count = 0;
+        for (NbtCompound task : activeTasks.values()) {
+            if (task.getLong("village") == villageId) count++;
+        }
+        return count;
+    }
+
+    /** Returns saved construction plots so another worker cannot reserve the same site after reload. */
+    public List<BlockPos> getActiveTaskSitesForVillage(long villageId) {
+        List<BlockPos> sites = new ArrayList<>();
+        for (NbtCompound task : activeTasks.values()) {
+            if (task.getLong("village") == villageId && task.contains("site", NbtElement.LONG_TYPE)) {
+                sites.add(BlockPos.fromLong(task.getLong("site")));
+            }
+        }
+        return sites;
+    }
+
+    /** Returns all saved mine entrances in this dimension, including unloaded workers' reservations. */
+    public List<BlockPos> getActiveTaskMineEntrances(UUID excludedVillager) {
+        List<BlockPos> entrances = new ArrayList<>();
+        for (Map.Entry<UUID, NbtCompound> entry : activeTasks.entrySet()) {
+            if (entry.getKey().equals(excludedVillager)) continue;
+            NbtCompound task = entry.getValue();
+            if (task.contains("mineEntrance", NbtElement.LONG_TYPE)) {
+                entrances.add(BlockPos.fromLong(task.getLong("mineEntrance")));
+            }
+        }
+        return entrances;
+    }
+
+    public List<BlockPos> getActiveTaskResourceBlocks(UUID excludedVillager) {
+        return getTaskPositions("resourceBlock", excludedVillager);
+    }
+
+    public List<BlockPos> getActiveTaskMiningBlocks(UUID excludedVillager) {
+        return getTaskPositions("currentMineRock", excludedVillager);
+    }
+
+    private List<BlockPos> getTaskPositions(String key, UUID excludedVillager) {
+        List<BlockPos> positions = new ArrayList<>();
+        for (Map.Entry<UUID, NbtCompound> entry : activeTasks.entrySet()) {
+            if (entry.getKey().equals(excludedVillager)) continue;
+            NbtCompound task = entry.getValue();
+            if (task.contains(key, NbtElement.LONG_TYPE)) positions.add(BlockPos.fromLong(task.getLong(key)));
+        }
+        return positions;
+    }
+
+    public void registerMine(long villageId, BlockPos entrance) {
+        VillageRecord village = getVillage(villageId);
+        if (village != null && village.addMine(entrance)) markDirty();
+    }
+
+    public void registerBell(long villageId, BlockPos bellPos) {
+        VillageRecord village = getVillage(villageId);
+        if (village != null) {
+            village.setBell(bellPos);
+            markDirty();
+        }
+    }
+
+    public void markVillageFounded(long villageId) {
+        VillageRecord village = getVillage(villageId);
+        if (village != null && village.founding) {
+            village.founding = false;
+            village.founderUuid = null;
+            markDirty();
+        }
+    }
+
+    public List<Long> getFoundingVillageIds() {
+        List<Long> ids = new ArrayList<>();
+        for (VillageRecord village : villages) if (village.founding) ids.add(village.id);
+        return ids;
     }
 
     public VillageRecord getVillage(long id) {
@@ -157,18 +286,25 @@ public final class VillageExpansionState extends PersistentState {
         private int commonHouses;
         private int professionalHouses;
         private final List<BlockPos> houses;
+        private final List<BlockPos> mines;
         private boolean founding;
         private UUID founderUuid;
+        private boolean bellBuilt;
+        private BlockPos bellPos;
 
         private VillageRecord(long id, BlockPos center, int commonHouses, int professionalHouses,
-                              List<BlockPos> houses, boolean founding, UUID founderUuid) {
+                              List<BlockPos> houses, List<BlockPos> mines, boolean founding,
+                              UUID founderUuid, boolean bellBuilt, BlockPos bellPos) {
             this.id = id;
             this.center = center.toImmutable();
             this.commonHouses = commonHouses;
             this.professionalHouses = professionalHouses;
             this.houses = houses;
+            this.mines = mines;
             this.founding = founding;
             this.founderUuid = founderUuid;
+            this.bellBuilt = bellBuilt;
+            this.bellPos = bellPos == null ? null : bellPos.toImmutable();
         }
 
         public long id() {
@@ -205,6 +341,32 @@ public final class VillageExpansionState extends PersistentState {
             return founding && commonHouses >= 1 && professionalHouses == 0;
         }
 
+        public List<BlockPos> mines() {
+            return List.copyOf(mines);
+        }
+
+        public boolean isNearMine(BlockPos candidate, double minDistance) {
+            double distanceSquared = minDistance * minDistance;
+            for (BlockPos mine : mines) {
+                if (mine.getSquaredDistance(candidate) < distanceSquared) return true;
+            }
+            return false;
+        }
+
+        private boolean addMine(BlockPos entrance) {
+            if (mines.stream().anyMatch(existing -> existing.getSquaredDistance(entrance) < 8L * 8L)) return false;
+            mines.add(entrance.toImmutable());
+            return true;
+        }
+
+        private void setBell(BlockPos pos) {
+            bellBuilt = true;
+            bellPos = pos.toImmutable();
+        }
+
+        public boolean hasBell() { return bellBuilt && bellPos != null; }
+        public BlockPos bellPos() { return bellPos; }
+
         public boolean isNearExistingHouse(BlockPos candidate, double minDistance) {
             double minDistanceSquared = minDistance * minDistance;
             for (BlockPos house : houses) {
@@ -227,12 +389,8 @@ public final class VillageExpansionState extends PersistentState {
                 commonHouses++;
             }
 
-            // The starter village is considered founded only after both its
-            // first home and its first workstation house have been completed.
-            if (founding && commonHouses >= 1 && professionalHouses >= 1) {
-                founding = false;
-                founderUuid = null;
-            }
+            // Founding is finalized separately only after a meeting bell exists
+            // and every villager in the settlement has a HOME memory.
         }
 
         public int commonHouses() {

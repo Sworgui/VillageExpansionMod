@@ -1,6 +1,7 @@
 package com.guides.villageexpansion.ai;
 
 import com.guides.villageexpansion.BuilderProfession;
+import com.guides.villageexpansion.config.VillageExpansionConfig;
 import net.minecraft.entity.ai.brain.MemoryModuleType;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.passive.VillagerEntity;
@@ -19,16 +20,11 @@ import java.util.UUID;
  * The vanilla food/readiness checks are retained; only the free-bed check is bypassed.
  */
 public final class VillageBreedingController {
-    private static final long SCAN_INTERVAL = 200L;
-    private static final double PARTNER_RANGE = 8.0D;
-    private static final int PARENT_COOLDOWN = 6_000;
-    private static final int BABY_AGE = -24_000;
-
     private VillageBreedingController() {
     }
 
     public static void tickWorld(ServerWorld world) {
-        if (world.getTime() % SCAN_INTERVAL != 0L) {
+        if (world.getTime() % VillageExpansionConfig.breedingScanIntervalTicks != 0L) {
             return;
         }
 
@@ -45,7 +41,7 @@ public final class VillageBreedingController {
                 continue;
             }
 
-            Box searchBox = villager.getBoundingBox().expand(PARTNER_RANGE);
+            Box searchBox = villager.getBoundingBox().expand(VillageExpansionConfig.breedingPartnerRange);
             VillagerEntity partner = world.getEntitiesByClass(
                             VillagerEntity.class,
                             searchBox,
@@ -53,7 +49,7 @@ public final class VillageBreedingController {
                                     && !paired.contains(candidate.getUuid())
                                     && isReadyPartner(candidate)
                                     && candidate.squaredDistanceTo(villager.getX(), villager.getY(), villager.getZ())
-                                            <= PARTNER_RANGE * PARTNER_RANGE)
+                                            <= VillageExpansionConfig.breedingPartnerRange * VillageExpansionConfig.breedingPartnerRange)
                     .stream()
                     .min((a, b) -> Double.compare(
                             a.squaredDistanceTo(villager.getX(), villager.getY(), villager.getZ()),
@@ -74,7 +70,7 @@ public final class VillageBreedingController {
             double babyY = villager.getY();
             double babyZ = villager.getZ();
             baby.refreshPositionAndAngles(babyX, babyY, babyZ, villager.getYaw(), 0.0F);
-            baby.setBreedingAge(BABY_AGE);
+            baby.setBreedingAge(-VillageExpansionConfig.babyGrowthTicks);
             if (!world.spawnEntity(baby)) {
                 continue;
             }
@@ -82,8 +78,8 @@ public final class VillageBreedingController {
             // Keep vanilla food consumption and cooldowns, but do not require a reserved bed.
             villager.eatForBreeding();
             partner.eatForBreeding();
-            villager.setBreedingAge(PARENT_COOLDOWN);
-            partner.setBreedingAge(PARENT_COOLDOWN);
+            villager.setBreedingAge(VillageExpansionConfig.breedingParentCooldownTicks);
+            partner.setBreedingAge(VillageExpansionConfig.breedingParentCooldownTicks);
             world.spawnParticles(ParticleTypes.HEART,
                     babyX, babyY + 0.8D, babyZ,
                     7, 0.45D, 0.35D, 0.45D, 0.02D);

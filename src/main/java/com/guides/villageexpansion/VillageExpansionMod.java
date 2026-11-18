@@ -2,6 +2,7 @@ package com.guides.villageexpansion;
 
 import com.guides.villageexpansion.ai.VillageBreedingController;
 import com.guides.villageexpansion.ai.VillageBuilderController;
+import com.guides.villageexpansion.config.VillageExpansionConfig;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import org.slf4j.Logger;
@@ -13,6 +14,8 @@ public final class VillageExpansionMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
+        // Load server behavior settings before any worker is scheduled.
+        VillageExpansionConfig.load();
         // Forces registration before any villager is assigned the temporary profession.
         BuilderProfession.register();
         ServerTickEvents.END_WORLD_TICK.register(VillageBuilderController::tickWorld);

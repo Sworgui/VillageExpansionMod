@@ -3,13 +3,18 @@
   "id": "village_expansion",
   "version": "${version}",
   "name": "Village Expansion",
-  "description": "Villagers can found new settlements, clear land, build roads and homes, and reproduce without requiring beds.",
-  "authors": ["Village Expansion Contributors"],
+  "description": "Unemployed villagers can found and expand settlements with biome-native homes, roads, persistent construction tasks and supported mines.",
+  "authors": [
+    "Village Expansion Contributors"
+  ],
   "contact": {
     "sources": "https://fabricmc.net/"
   },
   "license": "MIT",
   "environment": "*",
+  "mixins": [
+    "village_expansion.mixins.json"
+  ],
   "entrypoints": {
     "main": [
       "com.guides.villageexpansion.VillageExpansionMod"
