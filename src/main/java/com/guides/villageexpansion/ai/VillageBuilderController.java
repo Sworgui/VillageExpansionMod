@@ -2943,28 +2943,28 @@ public final class VillageBuilderController {
 
     private static int remainingTaggedMaterialRequirement(ServerWorld world, VillagerEntity villager,
                                                            Map<Item, Integer> plan, TagKey<Item> tag) {
-        int total = estimateRequiredTaggedMaterials(world, plan, tag, 0);
+        int total = estimateRequiredTaggedMaterials(world, villager, plan, tag, 0);
         int credit = countInventoryItems(villager, tag);
         for (Map.Entry<Item, Integer> entry : plan.entrySet()) {
             Item item = entry.getKey();
             if (new ItemStack(item).isIn(tag)) continue;
             int held = Math.min(entry.getValue(), countSpecificItem(villager, item));
-            if (held > 0) credit += estimateTaggedCost(world, item, held, tag, 0, new HashSet<>());
+            if (held > 0) credit += estimateTaggedCost(world, villager, item, held, tag, 0, new HashSet<>());
         }
         return Math.max(0, total - credit);
     }
 
-    private static int estimateRequiredTaggedMaterials(ServerWorld world, Map<Item, Integer> plan,
-                                                        TagKey<Item> targetTag, int depth) {
+    private static int estimateRequiredTaggedMaterials(ServerWorld world, VillagerEntity villager,
+                                                        Map<Item, Integer> plan, TagKey<Item> targetTag, int depth) {
         int total = 0;
         for (Map.Entry<Item, Integer> entry : plan.entrySet()) {
-            total += estimateTaggedCost(world, entry.getKey(), entry.getValue(), targetTag, depth, new HashSet<>());
+            total += estimateTaggedCost(world, villager, entry.getKey(), entry.getValue(), targetTag, depth, new HashSet<>());
         }
         return total;
     }
 
-    private static int estimateTaggedCost(ServerWorld world, Item item, int amount, TagKey<Item> targetTag,
-                                          int depth, Set<Item> visited) {
+    private static int estimateTaggedCost(ServerWorld world, VillagerEntity villager, Item item, int amount,
+                                          TagKey<Item> targetTag, int depth, Set<Item> visited) {
         if (amount <= 0) return 0;
         if (new ItemStack(item).isIn(targetTag)) return amount;
         if (depth >= 8 || !visited.add(item)) return 0;
@@ -2975,12 +2975,12 @@ public final class VillageBuilderController {
             Map<Item, Integer> inputCounts = new HashMap<>();
             for (Ingredient ingredient : entry.value().getIngredients()) {
                 if (ingredient.isEmpty()) continue;
-                Item input = chooseIngredientItem(world, ingredient, null, targetTag);
+                Item input = chooseIngredientItem(world, ingredient, villager, targetTag, batches);
                 if (input != null) inputCounts.merge(input, batches, Integer::sum);
             }
             int total = 0;
             for (Map.Entry<Item, Integer> input : inputCounts.entrySet()) {
-                total += estimateTaggedCost(world, input.getKey(), input.getValue(), targetTag, depth + 1, visited);
+                total += estimateTaggedCost(world, villager, input.getKey(), input.getValue(), targetTag, depth + 1, visited);
             }
             visited.remove(item);
             return total;
@@ -2990,8 +2990,9 @@ public final class VillageBuilderController {
     }
 
     private static Item chooseIngredientItem(ServerWorld world, Ingredient ingredient, VillagerEntity villager,
-                                             TagKey<Item> preferredTag) {
-        return MaterialAcquisitionPlanner.chooseIngredientItem(world, ingredient, villager, preferredTag, 1);
+                                             TagKey<Item> preferredTag, int amount) {
+        return MaterialAcquisitionPlanner.chooseIngredientItem(world, ingredient, villager, preferredTag,
+                Math.max(1, amount));
     }
 
     private static boolean hasCraftingRecipe(ServerWorld world, Item outputItem) {

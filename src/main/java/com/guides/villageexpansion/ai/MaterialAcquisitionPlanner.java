@@ -130,7 +130,8 @@ final class MaterialAcquisitionPlanner {
     }
 
     static boolean hasViablePlan(ServerWorld world, VillagerEntity villager, Item item, int count) {
-        return estimateItemCost(world, villager, item, count, 0, new HashSet<>()) < IMPOSSIBLE;
+        return world != null && villager != null && item != null
+                && estimateItemCost(world, villager, item, count, 0, new HashSet<>()) < IMPOSSIBLE;
     }
 
     /** Exact items are preferred; an equal-or-better tool of the same family is also valid. */
@@ -143,6 +144,7 @@ final class MaterialAcquisitionPlanner {
     }
 
     static boolean shouldUseDirectSource(ServerWorld world, VillagerEntity villager, Item item, int count) {
+        if (world == null || villager == null || item == null) return false;
         SourceKind source = sourceFor(item);
         if (source == SourceKind.NONE) return false;
         int held = countInventory(villager, item);
@@ -164,7 +166,7 @@ final class MaterialAcquisitionPlanner {
 
     static double estimateItemCost(ServerWorld world, VillagerEntity villager, Item item,
                                    int count, int depth, Set<Item> visiting) {
-        if (item == null || item == Items.AIR || count <= 0) return IMPOSSIBLE;
+        if (world == null || villager == null || item == null || item == Items.AIR || count <= 0) return IMPOSSIBLE;
         int held = countInventory(villager, item);
         if (isTool(item) && hasToolOrBetter(villager, item)) held = Math.max(1, held);
         int missing = Math.max(0, count - held);
@@ -453,6 +455,7 @@ final class MaterialAcquisitionPlanner {
 
     static Item chooseIngredientItem(ServerWorld world, Ingredient ingredient, VillagerEntity villager,
                                      net.minecraft.registry.tag.TagKey<Item> preferredTag, int amount) {
+        if (world == null || villager == null || ingredient == null || ingredient.isEmpty()) return null;
         ItemStack chosen = cheapestIngredient(world, villager, ingredient, Math.max(1, amount), 0, new HashSet<>(), preferredTag, Map.of());
         return chosen.isEmpty() ? null : chosen.getItem();
     }
@@ -623,6 +626,7 @@ final class MaterialAcquisitionPlanner {
     }
 
     private static int countInventory(VillagerEntity villager, Item item) {
+        if (villager == null || item == null || item == Items.AIR) return 0;
         int count = 0;
         for (int slot = 0; slot < villager.getInventory().size(); slot++) {
             ItemStack stack = villager.getInventory().getStack(slot);
@@ -636,6 +640,7 @@ final class MaterialAcquisitionPlanner {
     }
 
     static boolean hasToolOrBetter(VillagerEntity villager, Item required) {
+        if (villager == null || required == null || required == Items.AIR) return false;
         if (required == Items.SHEARS) {
             if (villager.getEquippedStack(EquipmentSlot.MAINHAND).isOf(Items.SHEARS)) return true;
             for (int slot = 0; slot < villager.getInventory().size(); slot++) {

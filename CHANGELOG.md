@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.5
+
+- Fixed a server crash during builder assignment: the tagged-material cost estimator previously selected recipe ingredients with a null Villager context, which reached `MaterialAcquisitionPlanner.countInventory()` and threw a NullPointerException.
+- Threaded the actual builder entity through tagged-material estimates and ingredient selection so inventory, equipped tools and nearby professional suppliers are evaluated against the correct worker.
+- Ingredient choice now evaluates the amount required by the recipe batch, instead of always estimating one ingredient item.
+- Added defensive null guards to planner entry points and inventory/tool checks to prevent invalid contexts from crashing the world tick.
+- Added regression scenarios for assignment-time tag estimation, alternative ingredients and invalid null contexts.
+
+
 ## 1.3.4
 
 - Fixed the GitHub Actions compile failure in the 1.3.3 professional supplier feature: declared all supplier visit/rejection state fields on `BuilderTask`.

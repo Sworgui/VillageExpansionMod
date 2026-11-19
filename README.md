@@ -1,4 +1,4 @@
-# Village Expansion 1.3.4
+# Village Expansion 1.3.5
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
