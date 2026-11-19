@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.4
+
+- Fixed the GitHub Actions compile failure in the 1.3.3 professional supplier feature: declared all supplier visit/rejection state fields on `BuilderTask`.
+- Kept provider UUID, visit start time, rejected provider/item and rejection timeout in the persistent task model, matching the existing NBT write/read logic.
+- Updated workflow artifact name and installation instructions to 1.3.4.
+
 ## 1.3.3
 
 - Hardened free acquisition from employed Villagers: builders can collect multiple output stacks from one matching offer in a single visit, reserving one available use for each stack.

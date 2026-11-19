@@ -4446,6 +4446,17 @@ public final class VillageBuilderController {
         private final List<MaterialGoal> materialGoalStack = new ArrayList<>();
         private BlockPos saplingSearchOrigin;
         private long nextMaterialSearch;
+
+        // Persistent state for visits to employed Villager suppliers. These fields
+        // are serialized in writeTask()/restoreTask(); keeping them on BuilderTask
+        // makes the supplier visit survive save/reload and lets failed providers be
+        // temporarily excluded without interrupting the material objective.
+        private UUID professionalProviderUuid;
+        private long professionalVisitStartedAt;
+        private UUID rejectedProfessionalProviderUuid;
+        private Item rejectedProfessionalItem;
+        private long rejectedProfessionalUntil;
+
         private BlockPos mineEntrance;
         // A bounded, remembered quarry prevents random isolated holes across a ravine.
         private BlockPos quarryCenter;

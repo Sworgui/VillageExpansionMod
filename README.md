@@ -1,4 +1,4 @@
-# Village Expansion 1.3.3
+# Village Expansion 1.3.4
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -171,15 +171,15 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.3.3` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.3.3.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.3.4` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.3.4.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.3.3.jar` in the `mods` folder.
+- Put `village-expansion-1.3.4.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
@@ -309,6 +309,15 @@ The source package has been checked for Java syntax-level errors, JSON validity,
 ### Validation
 - Static source, JSON, workflow and ZIP checks are included. GitHub Actions must still confirm the Fabric build; in-game scenarios are documented in [docs/TEST_SCENARIOS_1.3.2.md](docs/TEST_SCENARIOS_1.3.2.md).
 
+
+
+
+## 1.3.4 build fix
+
+- Declared the professional-supplier visit and rejection state directly on `BuilderTask`, matching the fields already written and restored by `VillageBuilderController`.
+- The fields include the active provider UUID, visit start tick, rejected provider UUID, rejected item and rejection expiry tick.
+- This fixes the 41 `cannot find symbol` compiler errors reported by GitHub Actions for the 1.3.3 professional-resource-sharing change.
+- Supplier visit state remains persisted in the task NBT; no save migration is required because missing NBT keys use their normal empty/default values.
 
 ## Professional supply acquisition hardening (1.3.3)
 
