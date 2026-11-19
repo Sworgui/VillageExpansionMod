@@ -28,10 +28,7 @@ import net.minecraft.entity.ai.brain.MemoryModuleType;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.recipe.CraftingRecipe;
 import net.minecraft.recipe.Ingredient;
-import net.minecraft.recipe.RecipeEntry;
-import net.minecraft.recipe.RecipeType;
 import net.minecraft.recipe.SmeltingRecipe;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.ItemTags;
@@ -82,6 +79,9 @@ public final class VillageBuilderController {
 
     private static final Map<UUID, BuilderTask> ACTIVE_TASKS = new HashMap<>();
     private static final Map<UUID, Long> RETRY_AT = new HashMap<>();
+    private static RegistryKey<World> lastLazyPlanningDimension;
+    private static UUID lastLazyPlanningOwner;
+    private static long lastLazyPlanningTick = Long.MIN_VALUE;
 
     private VillageBuilderController() {
     }
@@ -89,6 +89,8 @@ public final class VillageBuilderController {
     public static void tickWorld(ServerWorld world) {
         if (!VillageExpansionConfig.enabled) return;
         if (world.getTime() % VillageExpansionConfig.taskTickInterval != 0L) return;
+        long controllerTickStarted = System.nanoTime();
+        boolean builderAssignedThisTick = false;
 
         VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
                 VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
@@ -123,7 +125,13 @@ public final class VillageBuilderController {
                     abandonTask(world, villager, task);
                     continue;
                 }
+                long taskTickStarted = System.nanoTime();
                 tickTask(world, villager, task);
+                long taskTickMillis = (System.nanoTime() - taskTickStarted) / 1_000_000L;
+                if (taskTickMillis >= 50L) {
+                    VillageExpansionMod.LOGGER.warn("Builder task for villager {} took {} ms in one server tick (stage {})",
+                            uuidShort(uuid), taskTickMillis, task.stage);
+                }
                 // A task may complete or be abandoned during tickTask. Never
                 // resurrect its NBT snapshot after completeProject removed it.
                 if (ACTIVE_TASKS.get(uuid) == task && world.getTime() % 20L == 0L) {
@@ -133,12 +141,32 @@ public final class VillageBuilderController {
             }
 
             restoreOrphanedBuilderProfession(villager);
-            if (world.getTime() % VillageExpansionConfig.assignmentScanInterval == 0L) {
+            if (!builderAssignedThisTick
+                    && world.getTime() % VillageExpansionConfig.assignmentScanInterval == 0L) {
+                long assignmentStarted = System.nanoTime();
                 tryAssignBuilder(world, villager);
+                long assignmentMillis = (System.nanoTime() - assignmentStarted) / 1_000_000L;
+                if (assignmentMillis >= 50L) {
+                    VillageExpansionMod.LOGGER.warn("Builder assignment for villager {} took {} ms in one server tick",
+                            uuidShort(uuid), assignmentMillis);
+                }
+                // Stagger expensive site/template planning across server ticks.
+                // Entity spawning is unaffected; this only limits simultaneous job assignment.
+                builderAssignedThisTick = ACTIVE_TASKS.containsKey(uuid);
             }
         }
 
+        // One round-robin planning slice is allowed per world/controller tick.
+        // Expensive recipe evaluation is spread over time instead of running in
+        // the same tick that a material goal is first requested.
+        advanceOneLazyPlanningStep(world);
+
         if (world.getTime() % 200L == 0L) updateFoundingCompletion(world, saved);
+        long controllerTickMillis = (System.nanoTime() - controllerTickStarted) / 1_000_000L;
+        if (controllerTickMillis >= 50L) {
+            VillageExpansionMod.LOGGER.warn("Village controller world tick took {} ms for {} loaded villagers",
+                    controllerTickMillis, villagers.size());
+        }
     }
 
     /**
@@ -153,7 +181,10 @@ public final class VillageBuilderController {
                 || task.sleepingAtNight || nightWithAssignedHome(villager)) return;
 
         if (task.moveTarget == null) {
-            villager.getNavigation().stop();
+            // The controller has no active destination this tick (for example,
+            // while waiting for a resource-search cooldown or finishing a local
+            // action). Do not cancel the vanilla Brain's idle/look/navigation
+            // behaviors when there is no construction movement command to apply.
             return;
         }
         double distance = villager.squaredDistanceTo(task.moveTarget.getX() + 0.5D,
@@ -219,6 +250,12 @@ public final class VillageBuilderController {
         } else if (task.pendingMaterialItem != null && task.stage == Stage.GATHER_FROM_PROFESSIONAL) {
             String itemName = Registries.ITEM.getId(task.pendingMaterialItem).getPath();
             label = "Buscando profissional: " + itemName;
+        } else if (task.pendingMaterialItem != null
+                && task.lazyMaterialPlans.containsKey(task.pendingMaterialItem)
+                && !task.lazyMaterialPlans.get(task.pendingMaterialItem).complete) {
+            String itemName = Registries.ITEM.getId(task.pendingMaterialItem).getPath();
+            MaterialPlanningJob job = task.lazyMaterialPlans.get(task.pendingMaterialItem);
+            label = "Planejando: " + itemName + " (" + job.phaseLabel() + ")";
         } else if (task.pendingMaterialItem != null
                 && (task.stage == Stage.GATHER_MATERIAL
                     || (task.stage == Stage.GATHER_STONE && task.resumeStage == Stage.GATHER_MATERIAL))) {
@@ -341,7 +378,11 @@ public final class VillageBuilderController {
             return;
         }
 
-        if (countActiveBuilders(world, village.id()) >= VillageExpansionConfig.maxBuildersPerVillage) {
+        int activeBuilders = countActiveBuilders(world, village.id());
+        if (activeBuilders >= VillageExpansionConfig.maxBuildersPerVillage) {
+            VillageExpansionMod.LOGGER.debug("Villager {} remains unemployed: village {} already has {}/{} active builders",
+                    uuidShort(villager.getUuid()), village.id(), activeBuilders,
+                    VillageExpansionConfig.maxBuildersPerVillage);
             RETRY_AT.put(villager.getUuid(), world.getTime() + 200L);
             return;
         }
@@ -1416,6 +1457,21 @@ public final class VillageBuilderController {
         // Cutting first creates the dirt used to fill lower cells.
         cuts.addAll(fills);
         return cuts;
+    }
+
+    /**
+     * Bounded surface lookup for wide resource scans. The old findSurfaceY walked
+     * from build height to bedrock for every X/Z column, which multiplied into
+     * hundreds of thousands of block reads per material search in modpacks.
+     */
+    private static int findSurfaceYFast(ServerWorld world, int x, int z, int maxDepth) {
+        if (!world.isChunkLoaded(new ChunkPos(x >> 4, z >> 4).toLong())) return Integer.MIN_VALUE;
+        int top = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+        int minY = Math.max(world.getBottomY(), top - Math.max(4, maxDepth));
+        for (int y = top; y >= minY; y--) {
+            if (isTerrain(world.getBlockState(new BlockPos(x, y, z)))) return y;
+        }
+        return Integer.MIN_VALUE;
     }
 
     private static int findSurfaceY(ServerWorld world, int x, int z) {
@@ -2941,66 +2997,23 @@ public final class VillageBuilderController {
         return count;
     }
 
+    /**
+     * Computes only the literal log/stone items present in the blueprint.
+     * Recipe dependencies are resolved lazily by ensureItemCountAvailable when
+     * the corresponding block is actually built. Running recursive recipe-cost
+     * searches here for every blueprint item caused exponential work during
+     * builder assignment, especially in modpacks with large ingredient tags.
+     */
     private static int remainingTaggedMaterialRequirement(ServerWorld world, VillagerEntity villager,
                                                            Map<Item, Integer> plan, TagKey<Item> tag) {
-        int total = estimateRequiredTaggedMaterials(world, villager, plan, tag, 0);
-        int credit = countInventoryItems(villager, tag);
+        if (villager == null || plan == null || tag == null) return 0;
+        int literalRequirement = 0;
         for (Map.Entry<Item, Integer> entry : plan.entrySet()) {
-            Item item = entry.getKey();
-            if (new ItemStack(item).isIn(tag)) continue;
-            int held = Math.min(entry.getValue(), countSpecificItem(villager, item));
-            if (held > 0) credit += estimateTaggedCost(world, villager, item, held, tag, 0, new HashSet<>());
-        }
-        return Math.max(0, total - credit);
-    }
-
-    private static int estimateRequiredTaggedMaterials(ServerWorld world, VillagerEntity villager,
-                                                        Map<Item, Integer> plan, TagKey<Item> targetTag, int depth) {
-        int total = 0;
-        for (Map.Entry<Item, Integer> entry : plan.entrySet()) {
-            total += estimateTaggedCost(world, villager, entry.getKey(), entry.getValue(), targetTag, depth, new HashSet<>());
-        }
-        return total;
-    }
-
-    private static int estimateTaggedCost(ServerWorld world, VillagerEntity villager, Item item, int amount,
-                                          TagKey<Item> targetTag, int depth, Set<Item> visited) {
-        if (amount <= 0) return 0;
-        if (new ItemStack(item).isIn(targetTag)) return amount;
-        if (depth >= 8 || !visited.add(item)) return 0;
-        for (RecipeEntry<CraftingRecipe> entry : world.getServer().getRecipeManager().listAllOfType(RecipeType.CRAFTING)) {
-            ItemStack output = entry.value().getResult(world.getRegistryManager());
-            if (output.isEmpty() || output.getItem() != item) continue;
-            int batches = (amount + output.getCount() - 1) / output.getCount();
-            Map<Item, Integer> inputCounts = new HashMap<>();
-            for (Ingredient ingredient : entry.value().getIngredients()) {
-                if (ingredient.isEmpty()) continue;
-                Item input = chooseIngredientItem(world, ingredient, villager, targetTag, batches);
-                if (input != null) inputCounts.merge(input, batches, Integer::sum);
+            if (entry.getKey() != null && new ItemStack(entry.getKey()).isIn(tag)) {
+                literalRequirement += Math.max(0, entry.getValue());
             }
-            int total = 0;
-            for (Map.Entry<Item, Integer> input : inputCounts.entrySet()) {
-                total += estimateTaggedCost(world, villager, input.getKey(), input.getValue(), targetTag, depth + 1, visited);
-            }
-            visited.remove(item);
-            return total;
         }
-        visited.remove(item);
-        return 0;
-    }
-
-    private static Item chooseIngredientItem(ServerWorld world, Ingredient ingredient, VillagerEntity villager,
-                                             TagKey<Item> preferredTag, int amount) {
-        return MaterialAcquisitionPlanner.chooseIngredientItem(world, ingredient, villager, preferredTag,
-                Math.max(1, amount));
-    }
-
-    private static boolean hasCraftingRecipe(ServerWorld world, Item outputItem) {
-        for (RecipeEntry<CraftingRecipe> entry : world.getServer().getRecipeManager().listAllOfType(RecipeType.CRAFTING)) {
-            ItemStack output = entry.value().getResult(world.getRegistryManager());
-            if (!output.isEmpty() && output.getItem() == outputItem) return true;
-        }
-        return false;
+        return Math.max(0, literalRequirement - countInventoryItems(villager, tag));
     }
 
     /** Uses registered crafting/smelting recipes and consumes only the exact ingredients. */
@@ -3050,57 +3063,64 @@ public final class VillageBuilderController {
         if (isToolItem(desired) && MaterialAcquisitionPlanner.hasToolOrBetter(villager, desired)) {
             alreadyHave = Math.max(1, alreadyHave);
         }
-        if (alreadyHave >= amount) return true;
+        if (alreadyHave >= amount) {
+            task.lazyMaterialPlans.remove(desired);
+            return true;
+        }
         int missing = amount - alreadyHave;
 
-        // Professional villagers are checked before direct extraction or crafting.
-        // The builder visits the nearest employed villager (within the configured
-        // 40-block default), receives the missing item for free, and reserves one
-        // available offer use to keep supply finite until normal restocking.
-        UUID excludedProvider = task.rejectedProfessionalItem == desired
-                && world.getTime() < task.rejectedProfessionalUntil
-                ? task.rejectedProfessionalProviderUuid : null;
-        VillagerEntity provider = ProfessionalResourceExchange.findNearestProvider(world, villager, desired, excludedProvider);
-        if (provider != null) {
-            task.pendingMaterialItem = desired;
-            task.pendingMaterialCount = amount;
-            task.professionalProviderUuid = provider.getUuid();
-            task.professionalVisitStartedAt = Math.max(1L, world.getTime());
-            task.stage = Stage.GATHER_FROM_PROFESSIONAL;
-            task.moveTarget = provider.getBlockPos().toImmutable();
-            task.requestedMoveTarget = null;
-            task.nextMaterialSearch = world.getTime();
-            return false;
-        }
-
-        if (depth >= 12 || !visiting.add(desired) || !VillageExpansionConfig.useRecipeBookForCrafting) {
+        if (depth >= 12 || !visiting.add(desired)) {
             task.pendingMaterialItem = desired;
             task.pendingMaterialCount = amount;
             return false;
         }
 
         try {
-            // Prefer a supported direct natural/peaceful source when its estimated
-            // cost beats manufacturing the item. After repeated failed source scans,
-            // allow recipe alternatives rather than circling an unreachable source.
-            int directSourceRetryLimit = Math.max(3, VillageExpansionConfig.noResourceSearchLimit);
-            boolean preferDirectSource = task.resourceSearchFailures < directSourceRetryLimit
-                    && MaterialAcquisitionPlanner.shouldUseDirectSource(world, villager, desired, amount);
-            if (!preferDirectSource) {
-                // Do not take the first recipe returned by the recipe manager. Evaluate
-                // every valid recipe and every Ingredient alternative, preferring the
-                // cheapest dependency chain with a known peaceful/natural source.
-                MaterialAcquisitionPlanner.CraftingChoice crafting =
-                        MaterialAcquisitionPlanner.chooseBestCraftingRecipe(world, villager, desired, amount);
-                MaterialAcquisitionPlanner.StonecuttingChoice stonecutting =
-                        MaterialAcquisitionPlanner.chooseBestStonecuttingRecipe(world, villager, desired, amount);
-                MaterialAcquisitionPlanner.SmeltingChoice smelting =
-                        MaterialAcquisitionPlanner.chooseBestSmeltingRecipe(world, villager, desired, amount);
-                double craftingScore = crafting == null ? Double.POSITIVE_INFINITY : crafting.score();
-                double stonecuttingScore = stonecutting == null ? Double.POSITIVE_INFINITY : stonecutting.score();
-                double smeltingScore = smelting == null ? Double.POSITIVE_INFINITY : smelting.score();
+            MaterialPlanningJob plan = task.lazyMaterialPlans.get(desired);
+            if (plan != null && plan.amount != amount) {
+                task.lazyMaterialPlans.remove(desired);
+                plan = null;
+            }
+            if (plan != null && plan.complete && !plan.viable
+                    && world.getTime() >= task.nextMaterialSearch) {
+                task.lazyMaterialPlans.remove(desired);
+                plan = null;
+            }
 
-                if (crafting != null && craftingScore <= stonecuttingScore && craftingScore <= smeltingScore) {
+            if (plan == null) {
+                // Supplier scanning is also scheduled lazily; it must not run
+                // synchronously for every villager on the same server tick.
+                plan = new MaterialPlanningJob(desired, amount, world.getTime());
+                if (task.planBlockedItem == desired) task.planBlockedItem = null;
+                task.lazyMaterialPlans.put(desired, plan);
+                task.pendingMaterialItem = desired;
+                task.pendingMaterialCount = amount;
+                task.nextMaterialSearch = plan.nextStepAt;
+                return false;
+            }
+
+            if (!plan.complete) {
+                task.pendingMaterialItem = desired;
+                task.pendingMaterialCount = amount;
+                task.nextMaterialSearch = plan.nextStepAt;
+                return false;
+            }
+            if (!plan.viable) {
+                task.pendingMaterialItem = desired;
+                task.pendingMaterialCount = amount;
+                task.nextMaterialSearch = world.getTime() + 200L;
+                return false;
+            }
+
+            // The route and its selected recipe were resolved across several
+            // controller ticks. Reuse that decision; do not synchronously run the
+            // recursive planner again during execution.
+            MaterialAcquisitionPlanner.CraftingChoice crafting = plan.crafting;
+            MaterialAcquisitionPlanner.StonecuttingChoice stonecutting = plan.stonecutting;
+            MaterialAcquisitionPlanner.SmeltingChoice smelting = plan.smelting;
+            if (plan.route != MaterialPlanningRoute.DIRECT
+                    && VillageExpansionConfig.useRecipeBookForCrafting) {
+                if (plan.route == MaterialPlanningRoute.CRAFTING && crafting != null) {
                     if (MaterialAcquisitionPlanner.requiresCraftingTable(crafting.entry().value(), desired)
                             && countSpecificItem(villager, Items.CRAFTING_TABLE) == 0
                             && !ensureItemCountAvailable(world, villager, task, Items.CRAFTING_TABLE,
@@ -3137,7 +3157,7 @@ public final class VillageBuilderController {
                 // Stonecutting is another registered recipe path for blocks such as
                 // walls, stairs and slabs. The stonecutter item is itself a normal
                 // prerequisite, so its iron/stone/plank dependencies are planned too.
-                if (stonecutting != null && stonecuttingScore <= craftingScore && stonecuttingScore <= smeltingScore) {
+                if (plan.route == MaterialPlanningRoute.STONECUTTING && stonecutting != null) {
                     if (countSpecificItem(villager, Items.STONECUTTER) == 0
                             && !ensureItemCountAvailable(world, villager, task, Items.STONECUTTER,
                             1, depth + 1, visiting)) {
@@ -3172,7 +3192,7 @@ public final class VillageBuilderController {
                 // Smelting is also planned through the dependency evaluator. One
                 // cook operation is run at a time; after completion the parent goal
                 // is reevaluated and another batch is started only if still needed.
-                if (smelting != null && smeltingScore <= craftingScore && smeltingScore <= stonecuttingScore) {
+                if (plan.route == MaterialPlanningRoute.SMELTING && smelting != null) {
                     int cookTicks = Math.max(1, smelting.entry().value().getCookingTime());
                     // A furnace is a real dependency in the plan. The processing
                     // animation remains simulated, but the worker must first craft
@@ -3226,6 +3246,202 @@ public final class VillageBuilderController {
             // cycle marker. This is essential when recipes have interchangeable
             // ingredients or multiple ways to craft the same item.
             visiting.remove(desired);
+        }
+    }
+
+    private static void advanceOneLazyPlanningStep(ServerWorld world) {
+        long now = world.getTime();
+        if (world.getRegistryKey().equals(lastLazyPlanningDimension) && lastLazyPlanningTick == now) return;
+
+        List<UUID> owners = new ArrayList<>();
+        for (Map.Entry<UUID, BuilderTask> entry : ACTIVE_TASKS.entrySet()) {
+            BuilderTask task = entry.getValue();
+            if (!task.dimension.equals(world.getRegistryKey()) || task.pendingMaterialItem == null) continue;
+            if (!(world.getEntity(entry.getKey()) instanceof VillagerEntity candidate) || !candidate.isAlive()) continue;
+            MaterialPlanningJob job = task.lazyMaterialPlans.get(task.pendingMaterialItem);
+            if (job != null && !job.complete && now >= job.nextStepAt) owners.add(entry.getKey());
+        }
+        if (owners.isEmpty()) return;
+        owners.sort(Comparator.comparing(UUID::toString));
+
+        UUID selected = null;
+        if (lastLazyPlanningDimension != null && lastLazyPlanningDimension.equals(world.getRegistryKey())
+                && lastLazyPlanningOwner != null) {
+            for (UUID owner : owners) {
+                if (owner.toString().compareTo(lastLazyPlanningOwner.toString()) > 0) {
+                    selected = owner;
+                    break;
+                }
+            }
+        }
+        if (selected == null) selected = owners.get(0);
+
+        BuilderTask task = ACTIVE_TASKS.get(selected);
+        Entity entity = world.getEntity(selected);
+        if (task == null || !(entity instanceof VillagerEntity villager) || !villager.isAlive()) return;
+        MaterialPlanningJob job = task.lazyMaterialPlans.get(task.pendingMaterialItem);
+        if (job == null || job.complete) return;
+
+        lastLazyPlanningDimension = world.getRegistryKey();
+        lastLazyPlanningOwner = selected;
+        lastLazyPlanningTick = now;
+
+        // Check professional suppliers as the first lazy phase. This potentially
+        // expensive nearby-entity/offers scan is globally throttled just like recipe
+        // planning, and happens only once for this material goal.
+        if (!job.providerChecked) {
+            long supplierScanStarted = System.nanoTime();
+            job.providerChecked = true;
+            UUID excludedProvider = task.rejectedProfessionalItem == job.item
+                    && now < task.rejectedProfessionalUntil ? task.rejectedProfessionalProviderUuid : null;
+            VillagerEntity provider = ProfessionalResourceExchange.findNearestProvider(
+                    world, villager, job.item, excludedProvider);
+            long supplierScanMillis = (System.nanoTime() - supplierScanStarted) / 1_000_000L;
+            if (supplierScanMillis >= 25L) {
+                VillageExpansionMod.LOGGER.warn("Lazy professional-supplier scan for {} took {} ms",
+                        Registries.ITEM.getId(job.item), supplierScanMillis);
+            }
+            if (provider != null) {
+                task.professionalProviderUuid = provider.getUuid();
+                task.professionalVisitStartedAt = Math.max(1L, now);
+                task.stage = Stage.GATHER_FROM_PROFESSIONAL;
+                task.moveTarget = provider.getBlockPos().toImmutable();
+                task.requestedMoveTarget = null;
+                task.nextMaterialSearch = now;
+                task.lazyMaterialPlans.remove(job.item);
+                return;
+            }
+            job.nextStepAt = now + 1L;
+            task.nextMaterialSearch = job.nextStepAt;
+            return;
+        }
+
+        // The first recipe index build can be large in modpacks. Build only a
+        // small fixed batch per tick, before evaluating any individual goal.
+        long sliceStarted = System.nanoTime();
+        if (VillageExpansionConfig.useRecipeBookForCrafting
+                && !MaterialAcquisitionPlanner.isRecipeIndexReady(world)) {
+            MaterialAcquisitionPlanner.advanceRecipeIndex(world,
+                    VillageExpansionConfig.lazyPlanningRecipeEntriesPerTick);
+            // Indexing is already bounded to a small batch, so continue on the
+            // next server tick rather than waiting the normal decision interval.
+            job.nextStepAt = now + 1L;
+            task.nextMaterialSearch = job.nextStepAt;
+            long elapsedMillis = (System.nanoTime() - sliceStarted) / 1_000_000L;
+            if (elapsedMillis >= 25L) {
+                VillageExpansionMod.LOGGER.warn("Lazy recipe-index slice took {} ms ({} entries budget)",
+                        elapsedMillis, VillageExpansionConfig.lazyPlanningRecipeEntriesPerTick);
+            }
+            return;
+        }
+
+        job.advance(world, villager);
+        job.nextStepAt = job.complete ? now : now + VillageExpansionConfig.lazyPlanningStepIntervalTicks;
+        long elapsedMillis = (System.nanoTime() - sliceStarted) / 1_000_000L;
+        if (elapsedMillis >= 25L) {
+            VillageExpansionMod.LOGGER.warn("Lazy material-planning slice for {} took {} ms (phase {})",
+                    Registries.ITEM.getId(job.item), elapsedMillis, job.phaseLabel());
+        }
+        if (job.complete && !job.viable) {
+            task.nextMaterialSearch = now + 200L;
+            if (task.planBlockedItem != job.item) {
+                task.planBlockedItem = job.item;
+                VillageExpansionMod.LOGGER.warn(
+                        "Lazy planner found no supported acquisition route for {} x{} (villager {}); the goal will be retried after 200 ticks",
+                        Registries.ITEM.getId(job.item), job.amount, uuidShort(selected));
+            }
+        } else {
+            task.nextMaterialSearch = job.nextStepAt;
+        }
+        if (job.complete) {
+            if (job.viable && task.planBlockedItem == job.item) task.planBlockedItem = null;
+            VillageExpansionMod.LOGGER.debug("Lazy material plan for villager {} resolved {} x{} via {}",
+                    uuidShort(selected), Registries.ITEM.getId(job.item), job.amount, job.route);
+        }
+    }
+
+    private enum MaterialPlanningRoute { DIRECT, CRAFTING, STONECUTTING, SMELTING, NONE }
+
+    /** One resumable decision. Each call to advance() performs exactly one bounded planner phase. */
+    private static final class MaterialPlanningJob {
+        private final Item item;
+        private final int amount;
+        private long nextStepAt;
+        private int phase;
+        private boolean providerChecked;
+        private double directScore = Double.POSITIVE_INFINITY;
+        private MaterialAcquisitionPlanner.CraftingChoice crafting;
+        private MaterialAcquisitionPlanner.StonecuttingChoice stonecutting;
+        private MaterialAcquisitionPlanner.SmeltingChoice smelting;
+        private MaterialPlanningRoute route = MaterialPlanningRoute.NONE;
+        private boolean complete;
+        private boolean viable;
+
+        private MaterialPlanningJob(Item item, int amount, long now) {
+            this.item = item;
+            this.amount = amount;
+            this.nextStepAt = now;
+        }
+
+        private void advance(ServerWorld world, VillagerEntity villager) {
+            if (complete) return;
+            switch (phase++) {
+                case 0 -> directScore = MaterialAcquisitionPlanner.estimateDirectSourceCostForPlanning(
+                        world, villager, item, amount);
+                case 1 -> {
+                    if (VillageExpansionConfig.useRecipeBookForCrafting) {
+                        crafting = MaterialAcquisitionPlanner.chooseBestCraftingRecipe(world, villager, item, amount);
+                    }
+                }
+                case 2 -> {
+                    if (VillageExpansionConfig.useRecipeBookForCrafting) {
+                        stonecutting = MaterialAcquisitionPlanner.chooseBestStonecuttingRecipe(world, villager, item, amount);
+                    }
+                }
+                case 3 -> {
+                    if (VillageExpansionConfig.useRecipeBookForCrafting) {
+                        smelting = MaterialAcquisitionPlanner.chooseBestSmeltingRecipe(world, villager, item, amount);
+                    }
+                    chooseRoute();
+                }
+                default -> chooseRoute();
+            }
+            if (phase >= 4 || !VillageExpansionConfig.useRecipeBookForCrafting && phase >= 1) {
+                chooseRoute();
+                complete = true;
+            }
+        }
+
+        private String phaseLabel() {
+            if (!providerChecked) return "fornecedores";
+            return switch (phase) {
+                case 0 -> "fonte direta";
+                case 1 -> "crafting";
+                case 2 -> "stonecutter";
+                case 3 -> "fundição";
+                default -> "finalizando";
+            };
+        }
+
+        private void chooseRoute() {
+            double craftingScore = crafting == null ? Double.POSITIVE_INFINITY : crafting.score();
+            double cuttingScore = stonecutting == null ? Double.POSITIVE_INFINITY : stonecutting.score();
+            double smeltingScore = smelting == null ? Double.POSITIVE_INFINITY : smelting.score();
+            double recipeScore = Math.min(craftingScore, Math.min(cuttingScore, smeltingScore));
+            if (directScore <= recipeScore && directScore < 1.0e11D) {
+                route = MaterialPlanningRoute.DIRECT;
+            } else if (craftingScore <= cuttingScore && craftingScore <= smeltingScore && crafting != null) {
+                route = MaterialPlanningRoute.CRAFTING;
+            } else if (cuttingScore <= smeltingScore && stonecutting != null) {
+                route = MaterialPlanningRoute.STONECUTTING;
+            } else if (smelting != null) {
+                route = MaterialPlanningRoute.SMELTING;
+            } else if (directScore < 1.0e11D) {
+                route = MaterialPlanningRoute.DIRECT;
+            } else {
+                route = MaterialPlanningRoute.NONE;
+            }
+            viable = route != MaterialPlanningRoute.NONE;
         }
     }
 
@@ -3442,7 +3658,27 @@ public final class VillageBuilderController {
             return;
         }
         int requestedCount = Math.max(1, task.pendingMaterialCount);
-        if (ensureItemCountAvailable(world, villager, task, wanted, requestedCount, 0, new HashSet<>())) {
+        boolean itemAlreadyAvailable = countSpecificItem(villager, wanted) >= requestedCount
+                || (isToolItem(wanted) && MaterialAcquisitionPlanner.hasToolOrBetter(villager, wanted));
+        MaterialPlanningJob activeLazyPlan = task.lazyMaterialPlans.get(wanted);
+        if (!itemAlreadyAvailable && activeLazyPlan != null && !activeLazyPlan.complete) {
+            // The global round-robin scheduler advances this plan in bounded slices.
+            // Do not invoke recursive cost estimation or source scans from this task tick.
+            task.nextMaterialSearch = activeLazyPlan.nextStepAt;
+            return;
+        }
+        // Once a concrete source/work position has been selected, keep executing
+        // that target instead of rebuilding the full recipe/provider decision every tick.
+        // This is especially important for large modded ingredient tags.
+        boolean woolRequest = new ItemStack(wanted).isIn(ItemTags.WOOL);
+        boolean activeAcquisitionTarget = task.currentResource != null
+                || task.currentTreeBase != null || (woolRequest && task.moveTarget != null);
+        boolean shouldEvaluatePlanner = itemAlreadyAvailable
+                || (!activeAcquisitionTarget && world.getTime() >= task.nextMaterialSearch);
+
+        Item requestedGoal = wanted;
+        if (shouldEvaluatePlanner
+                && ensureItemCountAvailable(world, villager, task, wanted, requestedCount, 0, new HashSet<>())) {
             task.resourceSearchFailures = 0;
             if (!resumeDeferredMaterialGoal(task)) {
                 task.pendingMaterialItem = null;
@@ -3458,26 +3694,28 @@ public final class VillageBuilderController {
             return;
         }
         if (task.stage != Stage.GATHER_MATERIAL) return; // Crafting may have started a timed smelting job.
+        if (task.pendingMaterialItem != null && task.pendingMaterialItem != requestedGoal) return;
         if (task.pendingMaterialItem == null) task.pendingMaterialItem = wanted;
-        if (world.getTime() < task.nextMaterialSearch) return;
-        wanted = task.pendingMaterialItem;
-        boolean viablePlan = MaterialAcquisitionPlanner.hasViablePlan(world, villager, wanted, requestedCount);
-        if (!VillageExpansionConfig.useRecipeBookForCrafting
-                && MaterialAcquisitionPlanner.sourceFor(wanted) == MaterialAcquisitionPlanner.SourceKind.NONE
-                && countSpecificItem(villager, wanted) < requestedCount) {
-            viablePlan = false;
-        }
-        if (!viablePlan) {
-            if (task.planBlockedItem != wanted) {
-                task.planBlockedItem = wanted;
-                VillageExpansionMod.LOGGER.error(
-                        "Builder {} has no safe acquisition plan for {}; no crafting recipe or supported peaceful/natural source exists. The project is kept intact for retry or template/source compatibility.",
-                        uuidShort(villager.getUuid()), Registries.ITEM.getId(wanted));
+        if (shouldEvaluatePlanner) {
+            wanted = task.pendingMaterialItem;
+            MaterialPlanningJob completedPlan = task.lazyMaterialPlans.get(wanted);
+            if (completedPlan == null || !completedPlan.complete) return;
+            if (!completedPlan.viable) {
+                if (task.planBlockedItem != wanted) {
+                    task.planBlockedItem = wanted;
+                    VillageExpansionMod.LOGGER.error(
+                            "Builder {} has no safe acquisition plan for {}; the goal remains queued for a later retry.",
+                            uuidShort(villager.getUuid()), Registries.ITEM.getId(wanted));
+                }
+                task.nextMaterialSearch = world.getTime() + 200L;
+                return;
             }
-            task.nextMaterialSearch = world.getTime() + 200L;
+            task.planBlockedItem = null;
+        } else if (!activeAcquisitionTarget && !itemAlreadyAvailable) {
+            // The next retry is driven by nextMaterialSearch. Do not execute an
+            // expensive recursive planner while waiting for that retry window.
             return;
         }
-        task.planBlockedItem = null;
 
         Item rawLogForStripping = strippedLogItemFor(wanted);
         if (rawLogForStripping != null) {
@@ -3635,7 +3873,15 @@ public final class VillageBuilderController {
 
         int searchRadius = expandedSearchRadius(VillageExpansionConfig.materialSearchRadius,
                 task.resourceSearchFailures);
-        ResourceTarget raw = findDirectMaterialTarget(world, task.site, villager, wanted, searchRadius);
+        ResourceTarget raw = task.currentResource;
+        if (raw == null || !isLoaded(world, raw.block()) || !isLoaded(world, raw.stand())
+                || !isWantedMaterialBlock(world.getBlockState(raw.block()), wanted)) {
+            task.currentResource = null;
+            task.moveTarget = null;
+            task.requestedMoveTarget = null;
+            raw = findDirectMaterialTarget(world, task.site, villager, wanted, searchRadius);
+            task.currentResource = raw;
+        }
         if (raw != null) {
             if (moveNear(villager, task, raw.stand(), VillageExpansionConfig.navigationSpeed)) {
                 BlockState state = world.getBlockState(raw.block());
@@ -3644,6 +3890,9 @@ public final class VillageBuilderController {
                 equipBestTool(villager, tool);
                 if (tickBreakBlock(world, villager, task, raw.block(), tool, null, wanted)) {
                     task.resourceSearchFailures = 0;
+                    task.currentResource = null;
+                    task.moveTarget = null;
+                    task.requestedMoveTarget = null;
                 }
                 task.nextMaterialSearch = world.getTime() + 1L;
             }
@@ -3670,7 +3919,7 @@ public final class VillageBuilderController {
         double bestDistance = Double.MAX_VALUE;
         for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
             for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
-                int surfaceY = findSurfaceY(world, x, z);
+                int surfaceY = findSurfaceYFast(world, x, z, 32);
                 if (surfaceY == Integer.MIN_VALUE) continue;
                 for (int y = Math.max(world.getBottomY() + 1, surfaceY - 12); y <= surfaceY + 2; y++) {
                     BlockPos block = new BlockPos(x, y, z);
@@ -3699,7 +3948,7 @@ public final class VillageBuilderController {
         double bestDistance = Double.MAX_VALUE;
         for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
             for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
-                int surfaceY = findSurfaceY(world, x, z);
+                int surfaceY = findSurfaceYFast(world, x, z, 32);
                 if (surfaceY == Integer.MIN_VALUE) continue;
                 int minY = Math.max(world.getBottomY() + 1, surfaceY - 10);
                 int maxY = Math.min(world.getTopY() - 2, surfaceY + 2);
@@ -4445,6 +4694,9 @@ public final class VillageBuilderController {
         private Item deferredMaterialItem;
         private int deferredMaterialCount;
         private final List<MaterialGoal> materialGoalStack = new ArrayList<>();
+        // In-memory resumable plans keyed by requested output. Recipe references
+        // are rebuilt after reload, while the public task goal remains persisted.
+        private final Map<Item, MaterialPlanningJob> lazyMaterialPlans = new HashMap<>();
         private BlockPos saplingSearchOrigin;
         private long nextMaterialSearch;
 

@@ -26,9 +26,13 @@ import java.util.Comparator;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 /**
  * Recursive, recipe-aware acquisition planner for every item requested by a
@@ -36,16 +40,24 @@ import java.util.Set;
  * and only considers acquisition sources the builder controller can execute
  * without hostile-mob drops or arbitrary structure demolition.
  *
- * The planner is intentionally stateless. The controller persists the active
- * leaf goal and its parent stack, while this class deterministically resolves
- * the next dependency whenever a goal is resumed.
+ * The recursive estimator is bounded and is invoked through the controller's
+ * lazy, resumable planning scheduler. Recipe indexes are also built incrementally
+ * so a large modpack never requires a full registry scan in one server tick.
  */
 final class MaterialAcquisitionPlanner {
     private static final int MAX_DEPTH = 12;
+    // A planner decision must never consume an unbounded part of a server tick.
+    // Modpacks can register hundreds of alternatives for common item tags.
+    private static final int MAX_PLANNER_STEPS = 24;
+    private static final int MAX_SOURCE_SCANS = 1;
+    private static final int MAX_INGREDIENT_CANDIDATES = 12;
+    private static final int MAX_RECIPES_PER_OUTPUT = 12;
+    private static final ThreadLocal<PlanningBudget> ACTIVE_BUDGET = new ThreadLocal<>();
     private static final double IMPOSSIBLE = 1.0e12D;
     private static long sourceCacheWindow = Long.MIN_VALUE;
     private static final Map<String, Boolean> SOURCE_AVAILABILITY_CACHE = new HashMap<>();
     private static RecipeManager indexedRecipeManager;
+    private static RecipeIndexBuild pendingRecipeIndex;
     private static Map<Item, List<RecipeEntry<CraftingRecipe>>> CRAFTING_BY_OUTPUT = Map.of();
     private static Map<Item, List<RecipeEntry<SmeltingRecipe>>> SMELTING_BY_OUTPUT = Map.of();
     private static Map<Item, List<RecipeEntry<StonecuttingRecipe>>> STONECUTTING_BY_OUTPUT = Map.of();
@@ -66,36 +78,179 @@ final class MaterialAcquisitionPlanner {
     record SmeltingChoice(RecipeEntry<SmeltingRecipe> entry, Item input, double score) { }
     record StonecuttingChoice(RecipeEntry<StonecuttingRecipe> entry, Item input, double score) { }
 
+    private static final class PlanningBudget {
+        private int steps;
+        private int sourceScans;
+        private int professionalScans;
+        private boolean exhaustionLogged;
+    }
+
+    private static <T> T withPlanningBudget(Supplier<T> action) {
+        boolean ownsBudget = ACTIVE_BUDGET.get() == null;
+        if (ownsBudget) ACTIVE_BUDGET.set(new PlanningBudget());
+        try {
+            return action.get();
+        } finally {
+            if (ownsBudget) ACTIVE_BUDGET.remove();
+        }
+    }
+
+    private static boolean spendPlanningStep() {
+        PlanningBudget budget = ACTIVE_BUDGET.get();
+        if (budget == null) return true;
+        if (++budget.steps <= MAX_PLANNER_STEPS) return true;
+        if (!budget.exhaustionLogged) {
+            budget.exhaustionLogged = true;
+            com.guides.villageexpansion.VillageExpansionMod.LOGGER.warn(
+                    "Material planning reached its {}-step safety budget; using a bounded fallback for this decision",
+                    MAX_PLANNER_STEPS);
+        }
+        return false;
+    }
+
+    private static boolean spendSourceScan() {
+        PlanningBudget budget = ACTIVE_BUDGET.get();
+        return budget == null || ++budget.sourceScans <= MAX_SOURCE_SCANS;
+    }
+
+    static boolean spendProfessionalProviderScan() {
+        PlanningBudget budget = ACTIVE_BUDGET.get();
+        return budget == null || ++budget.professionalScans <= 1;
+    }
+
+    private static <T> List<T> limited(List<T> source, int limit) {
+        if (source == null || source.isEmpty()) return List.of();
+        return source.size() <= limit ? source : source.subList(0, limit);
+    }
+
+    private static double boundedFallbackCost(ServerWorld world, VillagerEntity villager, Item item, int count) {
+        if (world == null || villager == null || item == null || item == Items.AIR || count <= 0) return IMPOSSIBLE;
+        int held = countInventory(villager, item);
+        int missing = Math.max(0, count - held);
+        if (missing == 0) return 0.0D;
+        if (sourceFor(item) != SourceKind.NONE) return 24.0D * missing;
+        // Do not recursively inspect recipes after the budget is exhausted.
+        // A registered recipe is enough to keep the goal eligible for a later,
+        // smaller execution-time query.
+        ensureRecipeIndex(world);
+        if (!CRAFTING_BY_OUTPUT.getOrDefault(item, List.of()).isEmpty()
+                || !STONECUTTING_BY_OUTPUT.getOrDefault(item, List.of()).isEmpty()
+                || !SMELTING_BY_OUTPUT.getOrDefault(item, List.of()).isEmpty()) {
+            return 40.0D * missing;
+        }
+        return IMPOSSIBLE;
+    }
+
     private MaterialAcquisitionPlanner() { }
 
-    private static void ensureRecipeIndex(ServerWorld world) {
+    /**
+     * Recipe indexing is incremental. Modpacks can contribute thousands of
+     * recipes; indexing every output in one server tick caused long stalls
+     * when the first builder requested a material plan.
+     */
+    static boolean isRecipeIndexReady(ServerWorld world) {
+        if (world == null || world.getServer() == null) return false;
         RecipeManager manager = world.getServer().getRecipeManager();
-        if (manager == indexedRecipeManager) return;
-        Map<Item, List<RecipeEntry<CraftingRecipe>>> crafting = new HashMap<>();
-        Map<Item, List<RecipeEntry<SmeltingRecipe>>> smelting = new HashMap<>();
-        Map<Item, List<RecipeEntry<StonecuttingRecipe>>> stonecutting = new HashMap<>();
-        for (RecipeEntry<CraftingRecipe> entry : manager.listAllOfType(RecipeType.CRAFTING)) {
-            ItemStack output = entry.value().getResult(world.getRegistryManager());
-            if (!output.isEmpty()) crafting.computeIfAbsent(output.getItem(), ignored -> new ArrayList<>()).add(entry);
+        if (manager == indexedRecipeManager && pendingRecipeIndex == null) return true;
+        beginRecipeIndexIfNeeded(manager);
+        return false;
+    }
+
+    static boolean advanceRecipeIndex(ServerWorld world, int maxEntries) {
+        if (world == null || world.getServer() == null) return false;
+        RecipeManager manager = world.getServer().getRecipeManager();
+        if (manager == indexedRecipeManager && pendingRecipeIndex == null) return true;
+        beginRecipeIndexIfNeeded(manager);
+        RecipeIndexBuild build = pendingRecipeIndex;
+        if (build == null) return manager == indexedRecipeManager;
+
+        // RecipeManager.keys() exposes a stream over the manager's key set. Keep
+        // its iterator between ticks instead of calling listAllOfType(), which
+        // materializes and filters a full list synchronously for each recipe type.
+        int budget = Math.max(1, maxEntries);
+        while (budget > 0 && build.recipeIds.hasNext()) {
+            Identifier id = build.recipeIds.next();
+            RecipeEntry<?> rawEntry = manager.get(id).orElse(null);
+            if (rawEntry != null) {
+                Object recipe = rawEntry.value();
+                if (recipe instanceof CraftingRecipe craftingRecipe) {
+                    @SuppressWarnings("unchecked")
+                    RecipeEntry<CraftingRecipe> entry = (RecipeEntry<CraftingRecipe>) (RecipeEntry<?>) rawEntry;
+                    ItemStack output = craftingRecipe.getResult(world.getRegistryManager());
+                    if (!output.isEmpty()) build.craftingByOutput
+                            .computeIfAbsent(output.getItem(), ignored -> new ArrayList<>()).add(entry);
+                } else if (recipe instanceof SmeltingRecipe smeltingRecipe) {
+                    @SuppressWarnings("unchecked")
+                    RecipeEntry<SmeltingRecipe> entry = (RecipeEntry<SmeltingRecipe>) (RecipeEntry<?>) rawEntry;
+                    ItemStack output = smeltingRecipe.getResult(world.getRegistryManager());
+                    if (!output.isEmpty()) build.smeltingByOutput
+                            .computeIfAbsent(output.getItem(), ignored -> new ArrayList<>()).add(entry);
+                } else if (recipe instanceof StonecuttingRecipe stonecuttingRecipe) {
+                    @SuppressWarnings("unchecked")
+                    RecipeEntry<StonecuttingRecipe> entry = (RecipeEntry<StonecuttingRecipe>) (RecipeEntry<?>) rawEntry;
+                    ItemStack output = stonecuttingRecipe.getResult(world.getRegistryManager());
+                    if (!output.isEmpty()) build.stonecuttingByOutput
+                            .computeIfAbsent(output.getItem(), ignored -> new ArrayList<>()).add(entry);
+                }
+            }
+            budget--;
         }
-        for (RecipeEntry<SmeltingRecipe> entry : manager.listAllOfType(RecipeType.SMELTING)) {
-            ItemStack output = entry.value().getResult(world.getRegistryManager());
-            if (!output.isEmpty()) smelting.computeIfAbsent(output.getItem(), ignored -> new ArrayList<>()).add(entry);
+
+        if (!build.recipeIds.hasNext()) {
+            CRAFTING_BY_OUTPUT = freezeIndex(build.craftingByOutput);
+            SMELTING_BY_OUTPUT = freezeIndex(build.smeltingByOutput);
+            STONECUTTING_BY_OUTPUT = freezeIndex(build.stonecuttingByOutput);
+            indexedRecipeManager = manager;
+            build.close();
+            pendingRecipeIndex = null;
+            return true;
         }
-        for (RecipeEntry<StonecuttingRecipe> entry : manager.listAllOfType(RecipeType.STONECUTTING)) {
-            ItemStack output = entry.value().getResult(world.getRegistryManager());
-            if (!output.isEmpty()) stonecutting.computeIfAbsent(output.getItem(), ignored -> new ArrayList<>()).add(entry);
+        return false;
+    }
+
+    private static void beginRecipeIndexIfNeeded(RecipeManager manager) {
+        if (manager == indexedRecipeManager || (pendingRecipeIndex != null && pendingRecipeIndex.manager == manager)) return;
+        // A data-pack reload replaces the manager. Close the previous stream
+        // and discard its partial indexes; never publish a mixed generation.
+        if (pendingRecipeIndex != null) pendingRecipeIndex.close();
+        CRAFTING_BY_OUTPUT = Map.of();
+        SMELTING_BY_OUTPUT = Map.of();
+        STONECUTTING_BY_OUTPUT = Map.of();
+        pendingRecipeIndex = new RecipeIndexBuild(manager);
+    }
+
+    private static <T> Map<Item, List<T>> freezeIndex(Map<Item, List<T>> source) {
+        // The builder is discarded after publication and no code retains a
+        // mutable reference to it. Wrapping avoids a second O(all recipes) copy
+        // on the single tick that completes a large modpack's recipe index.
+        return Collections.unmodifiableMap(source);
+    }
+
+    private static final class RecipeIndexBuild {
+        private final RecipeManager manager;
+        private final Stream<Identifier> recipeKeyStream;
+        private final Iterator<Identifier> recipeIds;
+        private final Map<Item, List<RecipeEntry<CraftingRecipe>>> craftingByOutput = new HashMap<>();
+        private final Map<Item, List<RecipeEntry<SmeltingRecipe>>> smeltingByOutput = new HashMap<>();
+        private final Map<Item, List<RecipeEntry<StonecuttingRecipe>>> stonecuttingByOutput = new HashMap<>();
+
+        private RecipeIndexBuild(RecipeManager manager) {
+            this.manager = manager;
+            this.recipeKeyStream = manager.keys();
+            this.recipeIds = recipeKeyStream.iterator();
         }
-        Map<Item, List<RecipeEntry<CraftingRecipe>>> immutableCrafting = new HashMap<>();
-        crafting.forEach((item, entries) -> immutableCrafting.put(item, List.copyOf(entries)));
-        Map<Item, List<RecipeEntry<SmeltingRecipe>>> immutableSmelting = new HashMap<>();
-        smelting.forEach((item, entries) -> immutableSmelting.put(item, List.copyOf(entries)));
-        Map<Item, List<RecipeEntry<StonecuttingRecipe>>> immutableStonecutting = new HashMap<>();
-        stonecutting.forEach((item, entries) -> immutableStonecutting.put(item, List.copyOf(entries)));
-        CRAFTING_BY_OUTPUT = Map.copyOf(immutableCrafting);
-        SMELTING_BY_OUTPUT = Map.copyOf(immutableSmelting);
-        STONECUTTING_BY_OUTPUT = Map.copyOf(immutableStonecutting);
-        indexedRecipeManager = manager;
+
+        private void close() {
+            recipeKeyStream.close();
+        }
+    }
+
+    private static void ensureRecipeIndex(ServerWorld world) {
+        if (world == null || world.getServer() == null) return;
+        RecipeManager manager = world.getServer().getRecipeManager();
+        if (manager != indexedRecipeManager) beginRecipeIndexIfNeeded(manager);
+        // Callers that cannot wait see an empty index until the lazy scheduler
+        // finishes. Execution-time choices are only requested after readiness.
     }
 
     private static List<RecipeEntry<CraftingRecipe>> craftingRecipesFor(ServerWorld world, Item item) {
@@ -144,6 +299,10 @@ final class MaterialAcquisitionPlanner {
     }
 
     static boolean shouldUseDirectSource(ServerWorld world, VillagerEntity villager, Item item, int count) {
+        return withPlanningBudget(() -> shouldUseDirectSourceInternal(world, villager, item, count));
+    }
+
+    private static boolean shouldUseDirectSourceInternal(ServerWorld world, VillagerEntity villager, Item item, int count) {
         if (world == null || villager == null || item == null) return false;
         SourceKind source = sourceFor(item);
         if (source == SourceKind.NONE) return false;
@@ -166,7 +325,13 @@ final class MaterialAcquisitionPlanner {
 
     static double estimateItemCost(ServerWorld world, VillagerEntity villager, Item item,
                                    int count, int depth, Set<Item> visiting) {
+        return withPlanningBudget(() -> estimateItemCostInternal(world, villager, item, count, depth, visiting));
+    }
+
+    private static double estimateItemCostInternal(ServerWorld world, VillagerEntity villager, Item item,
+                                                   int count, int depth, Set<Item> visiting) {
         if (world == null || villager == null || item == null || item == Items.AIR || count <= 0) return IMPOSSIBLE;
+        if (!spendPlanningStep()) return boundedFallbackCost(world, villager, item, count);
         int held = countInventory(villager, item);
         if (isTool(item) && hasToolOrBetter(villager, item)) held = Math.max(1, held);
         int missing = Math.max(0, count - held);
@@ -178,7 +343,7 @@ final class MaterialAcquisitionPlanner {
         // acquisition source and normally beats extracting/crafting the item.
         best = Math.min(best, ProfessionalResourceExchange.estimateCost(world, villager, item, missing));
 
-        for (RecipeEntry<CraftingRecipe> entry : craftingRecipesFor(world, item)) {
+        for (RecipeEntry<CraftingRecipe> entry : limited(craftingRecipesFor(world, item), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != item) continue;
             int batches = (missing + output.getCount() - 1) / output.getCount();
@@ -200,7 +365,7 @@ final class MaterialAcquisitionPlanner {
             if (viable) best = Math.min(best, recipeCost + 1.0D);
         }
 
-        for (RecipeEntry<StonecuttingRecipe> entry : stonecuttingRecipesFor(world, item)) {
+        for (RecipeEntry<StonecuttingRecipe> entry : limited(stonecuttingRecipesFor(world, item), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != item) continue;
             int batches = (missing + output.getCount() - 1) / output.getCount();
@@ -219,7 +384,7 @@ final class MaterialAcquisitionPlanner {
             }
         }
 
-        for (RecipeEntry<SmeltingRecipe> entry : smeltingRecipesFor(world, item)) {
+        for (RecipeEntry<SmeltingRecipe> entry : limited(smeltingRecipesFor(world, item), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != item) continue;
             Ingredient inputIngredient = entry.value().getIngredients().stream()
@@ -249,12 +414,17 @@ final class MaterialAcquisitionPlanner {
 
     static CraftingChoice chooseBestCraftingRecipe(ServerWorld world, VillagerEntity villager,
                                                     Item desired, int amount) {
+        return withPlanningBudget(() -> chooseBestCraftingRecipeInternal(world, villager, desired, amount));
+    }
+
+    private static CraftingChoice chooseBestCraftingRecipeInternal(ServerWorld world, VillagerEntity villager,
+                                                                    Item desired, int amount) {
         CraftingChoice best = null;
         int held = countInventory(villager, desired);
         if (isTool(desired) && hasToolOrBetter(villager, desired)) held = Math.max(1, held);
         int missing = Math.max(0, amount - held);
         if (missing <= 0) return null;
-        for (RecipeEntry<CraftingRecipe> entry : craftingRecipesFor(world, desired)) {
+        for (RecipeEntry<CraftingRecipe> entry : limited(craftingRecipesFor(world, desired), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != desired) continue;
             int batches = (missing + output.getCount() - 1) / output.getCount();
@@ -282,11 +452,16 @@ final class MaterialAcquisitionPlanner {
 
     static StonecuttingChoice chooseBestStonecuttingRecipe(ServerWorld world, VillagerEntity villager,
                                                             Item desired, int amount) {
+        return withPlanningBudget(() -> chooseBestStonecuttingRecipeInternal(world, villager, desired, amount));
+    }
+
+    private static StonecuttingChoice chooseBestStonecuttingRecipeInternal(ServerWorld world, VillagerEntity villager,
+                                                                            Item desired, int amount) {
         StonecuttingChoice best = null;
         int held = countInventory(villager, desired);
         int missing = Math.max(0, amount - held);
         if (missing <= 0) return null;
-        for (RecipeEntry<StonecuttingRecipe> entry : stonecuttingRecipesFor(world, desired)) {
+        for (RecipeEntry<StonecuttingRecipe> entry : limited(stonecuttingRecipesFor(world, desired), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != desired) continue;
             int batches = (missing + output.getCount() - 1) / output.getCount();
@@ -310,12 +485,17 @@ final class MaterialAcquisitionPlanner {
 
     static SmeltingChoice chooseBestSmeltingRecipe(ServerWorld world, VillagerEntity villager,
                                                     Item desired, int amount) {
+        return withPlanningBudget(() -> chooseBestSmeltingRecipeInternal(world, villager, desired, amount));
+    }
+
+    private static SmeltingChoice chooseBestSmeltingRecipeInternal(ServerWorld world, VillagerEntity villager,
+                                                                    Item desired, int amount) {
         SmeltingChoice best = null;
         int held = countInventory(villager, desired);
         if (isTool(desired) && hasToolOrBetter(villager, desired)) held = Math.max(1, held);
         int missing = Math.max(0, amount - held);
         if (missing <= 0) return null;
-        for (RecipeEntry<SmeltingRecipe> entry : smeltingRecipesFor(world, desired)) {
+        for (RecipeEntry<SmeltingRecipe> entry : limited(smeltingRecipesFor(world, desired), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != desired) continue;
             Ingredient inputIngredient = entry.value().getIngredients().stream()
@@ -349,6 +529,7 @@ final class MaterialAcquisitionPlanner {
     private static Map<Item, Integer> chooseRecipeIngredients(ServerWorld world, VillagerEntity villager,
                                                                List<Ingredient> recipeIngredients, int batches,
                                                                int depth, Set<Item> visiting) {
+        if (!spendPlanningStep()) return null;
         Map<Item, Integer> selected = new java.util.LinkedHashMap<>();
         for (Ingredient ingredient : recipeIngredients) {
             if (ingredient.isEmpty()) continue;
@@ -372,7 +553,7 @@ final class MaterialAcquisitionPlanner {
     /** Returns the deepest known prerequisite chain for an item, used to order sibling goals. */
     private static int dependencyDepth(ServerWorld world, VillagerEntity villager, Item item,
                                        int depth, Set<Item> visiting) {
-        if (item == null || item == Items.AIR || depth >= MAX_DEPTH || !visiting.add(item)) return 0;
+        if (!spendPlanningStep() || item == null || item == Items.AIR || depth >= MAX_DEPTH || !visiting.add(item)) return 0;
 
         SourceKind source = sourceFor(item);
         if (source != SourceKind.NONE) {
@@ -388,16 +569,21 @@ final class MaterialAcquisitionPlanner {
         }
 
         int bestRecipeDepth = Integer.MAX_VALUE;
-        for (RecipeEntry<CraftingRecipe> entry : craftingRecipesFor(world, item)) {
+        for (RecipeEntry<CraftingRecipe> entry : limited(craftingRecipesFor(world, item), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != item) continue;
             int recipeDepth = 0;
             for (Ingredient ingredient : entry.value().getIngredients()) {
                 if (ingredient.isEmpty()) continue;
                 int ingredientDepth = Integer.MAX_VALUE;
-                for (ItemStack candidate : ingredient.getMatchingStacks()) {
+                ItemStack[] alternatives = ingredient.getMatchingStacks();
+                int considered = Math.min(alternatives.length, MAX_INGREDIENT_CANDIDATES);
+                for (int i = 0; i < considered; i++) {
+                    ItemStack candidate = alternatives[i];
                     ingredientDepth = Math.min(ingredientDepth, dependencyDepth(world, villager,
                             candidate.getItem(), depth + 1, new HashSet<>(visiting)));
+                    if (ACTIVE_BUDGET.get() != null
+                            && ACTIVE_BUDGET.get().steps >= MAX_PLANNER_STEPS) break;
                 }
                 if (ingredientDepth == Integer.MAX_VALUE) ingredientDepth = 0;
                 recipeDepth = Math.max(recipeDepth, ingredientDepth + 1);
@@ -409,7 +595,7 @@ final class MaterialAcquisitionPlanner {
             }
             bestRecipeDepth = Math.min(bestRecipeDepth, recipeDepth);
         }
-        for (RecipeEntry<StonecuttingRecipe> entry : stonecuttingRecipesFor(world, item)) {
+        for (RecipeEntry<StonecuttingRecipe> entry : limited(stonecuttingRecipesFor(world, item), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != item) continue;
             int recipeDepth = countInventory(villager, Items.STONECUTTER) > 0 ? 0
@@ -419,15 +605,20 @@ final class MaterialAcquisitionPlanner {
                     .filter(candidate -> !candidate.isEmpty()).findFirst().orElse(null);
             if (input != null) {
                 int ingredientDepth = Integer.MAX_VALUE;
-                for (ItemStack candidate : input.getMatchingStacks()) {
+                ItemStack[] alternatives = input.getMatchingStacks();
+                int considered = Math.min(alternatives.length, MAX_INGREDIENT_CANDIDATES);
+                for (int i = 0; i < considered; i++) {
+                    ItemStack candidate = alternatives[i];
                     ingredientDepth = Math.min(ingredientDepth, dependencyDepth(world, villager,
                             candidate.getItem(), depth + 1, new HashSet<>(visiting)));
+                    if (ACTIVE_BUDGET.get() != null
+                            && ACTIVE_BUDGET.get().steps >= MAX_PLANNER_STEPS) break;
                 }
                 if (ingredientDepth != Integer.MAX_VALUE) recipeDepth = Math.max(recipeDepth, ingredientDepth + 1);
             }
             bestRecipeDepth = Math.min(bestRecipeDepth, recipeDepth);
         }
-        for (RecipeEntry<SmeltingRecipe> entry : smeltingRecipesFor(world, item)) {
+        for (RecipeEntry<SmeltingRecipe> entry : limited(smeltingRecipesFor(world, item), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != item) continue;
             int recipeDepth = countInventory(villager, Items.FURNACE) > 0 ? 0
@@ -437,9 +628,14 @@ final class MaterialAcquisitionPlanner {
                     .filter(candidate -> !candidate.isEmpty()).findFirst().orElse(null);
             if (input != null) {
                 int ingredientDepth = Integer.MAX_VALUE;
-                for (ItemStack candidate : input.getMatchingStacks()) {
+                ItemStack[] alternatives = input.getMatchingStacks();
+                int considered = Math.min(alternatives.length, MAX_INGREDIENT_CANDIDATES);
+                for (int i = 0; i < considered; i++) {
+                    ItemStack candidate = alternatives[i];
                     ingredientDepth = Math.min(ingredientDepth, dependencyDepth(world, villager,
                             candidate.getItem(), depth + 1, new HashSet<>(visiting)));
+                    if (ACTIVE_BUDGET.get() != null
+                            && ACTIVE_BUDGET.get().steps >= MAX_PLANNER_STEPS) break;
                 }
                 if (ingredientDepth != Integer.MAX_VALUE) recipeDepth = Math.max(recipeDepth, ingredientDepth + 1);
             }
@@ -455,9 +651,12 @@ final class MaterialAcquisitionPlanner {
 
     static Item chooseIngredientItem(ServerWorld world, Ingredient ingredient, VillagerEntity villager,
                                      net.minecraft.registry.tag.TagKey<Item> preferredTag, int amount) {
-        if (world == null || villager == null || ingredient == null || ingredient.isEmpty()) return null;
-        ItemStack chosen = cheapestIngredient(world, villager, ingredient, Math.max(1, amount), 0, new HashSet<>(), preferredTag, Map.of());
-        return chosen.isEmpty() ? null : chosen.getItem();
+        return withPlanningBudget(() -> {
+            if (world == null || villager == null || ingredient == null || ingredient.isEmpty()) return null;
+            ItemStack chosen = cheapestIngredient(world, villager, ingredient, Math.max(1, amount), 0,
+                    new HashSet<>(), preferredTag, Map.of());
+            return chosen.isEmpty() ? null : chosen.getItem();
+        });
     }
 
     static boolean isSafeNaturalBlock(BlockState state) {
@@ -469,6 +668,14 @@ final class MaterialAcquisitionPlanner {
                 || state.isOf(Blocks.BAMBOO)
                 || state.isOf(Blocks.CACTUS)
                 || state.isIn(BlockTags.FLOWERS);
+    }
+
+    static double estimateDirectSourceCostForPlanning(ServerWorld world, VillagerEntity villager,
+                                                       Item item, int amount) {
+        return withPlanningBudget(() -> {
+            if (world == null || villager == null || item == null || amount <= 0) return IMPOSSIBLE;
+            return estimateDirectSourceCost(world, villager, item, amount, 0, new HashSet<>());
+        });
     }
 
     private static double estimateDirectSourceCost(ServerWorld world, VillagerEntity villager, Item item,
@@ -509,6 +716,7 @@ final class MaterialAcquisitionPlanner {
         String cacheKey = sourceCacheKey(world, villager, wanted, radius, false);
         Boolean cached = SOURCE_AVAILABILITY_CACHE.get(cacheKey);
         if (cached != null) return cached;
+        if (!spendSourceScan()) return false;
         boolean found = false;
         int step = 4;
         search:
@@ -540,6 +748,7 @@ final class MaterialAcquisitionPlanner {
         String cacheKey = sourceCacheKey(world, villager, logItem, radius, true);
         Boolean cached = SOURCE_AVAILABILITY_CACHE.get(cacheKey);
         if (cached != null) return cached;
+        if (!spendSourceScan()) return false;
         boolean found = false;
         int step = 4;
         search:
@@ -603,7 +812,27 @@ final class MaterialAcquisitionPlanner {
                                                   Map<Item, Integer> alreadySelected) {
         ItemStack[] candidates = ingredient.getMatchingStacks();
         if (candidates.length == 0) return ItemStack.EMPTY;
-        List<ItemStack> ordered = new ArrayList<>(List.of(candidates));
+        // Tag alternatives can expand to hundreds of modded items. Keep a small,
+        // representative candidate set and prioritize resources already held,
+        // preferred-tag variants, and sources this executor actually supports.
+        LinkedHashMap<Item, ItemStack> shortlisted = new LinkedHashMap<>();
+        for (ItemStack candidate : candidates) {
+            if (countInventory(villager, candidate.getItem()) > 0) shortlisted.putIfAbsent(candidate.getItem(), candidate);
+        }
+        for (ItemStack candidate : candidates) {
+            if (preferredTag != null && candidate.isIn(preferredTag)) shortlisted.putIfAbsent(candidate.getItem(), candidate);
+        }
+        for (ItemStack candidate : candidates) {
+            if (sourceFor(candidate.getItem()) != SourceKind.NONE) shortlisted.putIfAbsent(candidate.getItem(), candidate);
+        }
+        for (ItemStack candidate : candidates) {
+            if (shortlisted.size() >= MAX_INGREDIENT_CANDIDATES) break;
+            shortlisted.putIfAbsent(candidate.getItem(), candidate);
+        }
+        List<ItemStack> ordered = new ArrayList<>(shortlisted.values());
+        if (ordered.size() > MAX_INGREDIENT_CANDIDATES) {
+            ordered = new ArrayList<>(ordered.subList(0, MAX_INGREDIENT_CANDIDATES));
+        }
         ordered.sort(Comparator.comparingDouble(stack -> {
             Item candidate = stack.getItem();
             int reserved = alreadySelected.getOrDefault(candidate, 0);

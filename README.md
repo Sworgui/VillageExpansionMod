@@ -1,4 +1,4 @@
-# Village Expansion 1.3.5
+# Village Expansion 1.3.7
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -27,6 +27,8 @@ This is a source project. It is not a precompiled JAR. The included GitHub Actio
 - An eligible homeless villager can create a settlement record and begin a starter home. The founder receives that bed immediately and keeps it while returning for the first profession house, allowing the vanilla night schedule to send it home.
 - The founding sequence attempts one common house, then a professional house; the first professional project prioritizes a smithing-related building.
 - Nearby homeless unemployed villagers may join an active founding project until `maxBuildersPerVillage` is reached.
+- `maxBuildersPerVillage` controls how many villagers may work at once; it does not limit or cancel entity spawning from spawn eggs. For reliable spawn tests, use separate unoccupied blocks.
+- Material planning and broad surface searches are rate-limited and cache their selected target so large modpacks do not trigger a full recipe/source scan every server tick.
 - After the founding sequence, house selection follows the normal two-common-houses-to-one-professional-house ratio, accounting for projects already in progress.
 - A vanilla meeting-point template with a bell is placed when possible. Its pedestal consumes one gold block. A settlement leaves its founding state only when a bell has been registered and all villagers detected in the loaded scan area have a HOME memory pointing to a bed block (verified when that bed chunk is loaded).
 - A builder's temporary profession is removed when the job completes or is abandoned.
@@ -328,3 +330,14 @@ The source package has been checked for Java syntax-level errors, JSON validity,
 
 ### Regression checks
 See [docs/TEST_SCENARIOS_1.3.3.md](docs/TEST_SCENARIOS_1.3.3.md). These are manual in-game scenarios and have not been simulated in this environment.
+
+## Lazy Planning (1.3.7)
+
+Material planning is time-sliced. The controller does not evaluate the full recipe tree during the same tick that a material is requested. It advances one bounded phase at a time in a global round-robin queue: direct source evaluation, crafting, stonecutting, and smelting. The recipe index is built by iterating the recipe manager key stream in small batches, rather than creating full filtered lists for each recipe type. This avoids a single large registry scan during the first material request.
+
+New configuration values are written automatically to `config/village_expansion.json`:
+
+- `lazyPlanningStepIntervalTicks` (default `4`): minimum ticks between phases of a material plan. Increasing it lowers planning load but increases acquisition delay.
+- `lazyPlanningRecipeEntriesPerTick` (default `32`): maximum recipe entries inspected in one controller tick while the shared index is being built. Lower values smooth indexing further but delay the first recipe-based plan.
+
+Only one builder planning phase is advanced per world/controller tick. Completed recipe choices are cached for the current task; child dependencies can be acquired without recalculating the parent choice. Transient recipe references are rebuilt after world reload from the persisted material goal.

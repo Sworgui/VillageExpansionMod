@@ -47,6 +47,9 @@ final class ProfessionalResourceExchange {
             POSITIVE_CACHE.remove(key);
         }
         if (NEGATIVE_CACHE.contains(key)) return null;
+        // Recursive cost estimation can consider many different ingredient items.
+        // Permit at most one uncached professional-world scan per planner slice.
+        if (!MaterialAcquisitionPlanner.spendProfessionalProviderScan()) return null;
 
         Box searchBox = builder.getBoundingBox().expand(radius);
         VillagerEntity best = null;

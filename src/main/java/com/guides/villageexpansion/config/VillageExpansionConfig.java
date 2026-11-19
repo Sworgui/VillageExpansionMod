@@ -52,6 +52,9 @@ public final class VillageExpansionConfig {
     public static int saplingMinimumSpacing = 8;
     public static int materialSearchRadius = 28;
     public static int materialSearchIntervalTicks = 100;
+    // Lazy planner advances only one bounded planning slice globally per controller tick.
+    public static int lazyPlanningStepIntervalTicks = 4;
+    public static int lazyPlanningRecipeEntriesPerTick = 32;
     public static boolean useRecipeBookForCrafting = true;
     public static int maxPathSearchNodes = 8000;
     public static int buildBlockDelayTicks = 2;
@@ -115,6 +118,8 @@ public final class VillageExpansionConfig {
             saplingMinimumSpacing = clamp(integer(json, "saplingMinimumSpacing", 8), 4, 16);
             materialSearchRadius = clamp(integer(json, "materialSearchRadius", 28), 8, 96);
             materialSearchIntervalTicks = clamp(integer(json, "materialSearchIntervalTicks", 100), 20, 1200);
+            lazyPlanningStepIntervalTicks = clamp(integer(json, "lazyPlanningStepIntervalTicks", 4), 1, 40);
+            lazyPlanningRecipeEntriesPerTick = clamp(integer(json, "lazyPlanningRecipeEntriesPerTick", 32), 8, 256);
             useRecipeBookForCrafting = bool(json, "useRecipeBookForCrafting", true);
             maxPathSearchNodes = clamp(integer(json, "maxPathSearchNodes", 8000), 500, 50000);
             buildBlockDelayTicks = clamp(integer(json, "buildBlockDelayTicks", 2), 1, 40);
@@ -172,6 +177,8 @@ public final class VillageExpansionConfig {
         json.addProperty("saplingMinimumSpacing", saplingMinimumSpacing);
         json.addProperty("materialSearchRadius", materialSearchRadius);
         json.addProperty("materialSearchIntervalTicks", materialSearchIntervalTicks);
+        json.addProperty("lazyPlanningStepIntervalTicks", lazyPlanningStepIntervalTicks);
+        json.addProperty("lazyPlanningRecipeEntriesPerTick", lazyPlanningRecipeEntriesPerTick);
         json.addProperty("useRecipeBookForCrafting", useRecipeBookForCrafting);
         json.addProperty("maxPathSearchNodes", maxPathSearchNodes);
         json.addProperty("buildBlockDelayTicks", buildBlockDelayTicks);
