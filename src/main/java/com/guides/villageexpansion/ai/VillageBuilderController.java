@@ -78,9 +78,22 @@ public final class VillageBuilderController {
     private static final String ORIGINAL_PROFESSION_TAG_PREFIX = "village_expansion_original_profession=";
 
     private static final Map<UUID, BuilderTask> ACTIVE_TASKS = new HashMap<>();
+    private static final int[][] SAPLING_SPACING_OFFSETS = {
+            {1, 0}, {-1, 0}, {0, 1}, {0, -1},
+            {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+    };
+    private static final int[][] STANDING_OFFSETS = {
+            {1, 0}, {-1, 0}, {0, 1}, {0, -1},
+            {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+    };
+    private static final int[] CAVE_ROOF_PROBES = {2, 4, 7, 10};
+    /** Stable round-robin index; avoids allocating/sorting active task lists every tick. */
+    private static final List<UUID> ACTIVE_TASK_ORDER = new ArrayList<>();
     private static final Map<UUID, Long> RETRY_AT = new HashMap<>();
+    private static final Map<RegistryKey<World>, WorldRuntime> WORLD_RUNTIMES = new HashMap<>();
     private static RegistryKey<World> lastLazyPlanningDimension;
     private static UUID lastLazyPlanningOwner;
+    private static int lazyPlanningCursor;
     private static long lastLazyPlanningTick = Long.MIN_VALUE;
 
     private VillageBuilderController() {
@@ -88,85 +101,236 @@ public final class VillageBuilderController {
 
     public static void tickWorld(ServerWorld world) {
         if (!VillageExpansionConfig.enabled) return;
-        if (world.getTime() % VillageExpansionConfig.taskTickInterval != 0L) return;
+        long now = world.getTime();
+        if (now % VillageExpansionConfig.taskTickInterval != 0L) return;
         long controllerTickStarted = System.nanoTime();
-        boolean builderAssignedThisTick = false;
+        WorldRuntime runtime = WORLD_RUNTIMES.computeIfAbsent(world.getRegistryKey(), ignored -> new WorldRuntime());
 
-        VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
-                VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
-        List<VillagerEntity> villagers = new ArrayList<>();
-        for (Entity entity : world.iterateEntities()) {
-            if (entity instanceof VillagerEntity villager) villagers.add(villager);
+        // Loaded entities are maintained by Fabric lifecycle events. No full-world
+        // entity iteration is performed by the builder controller; saved task
+        // restoration is limited to one villager per tick.
+        if (runtime.savedState == null) {
+            runtime.savedState = world.getPersistentStateManager().getOrCreate(
+                    VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
+        }
+        processOnePendingVillagerLoad(world, runtime);
+        VillageExpansionState saved = runtime.savedState;
+        // A slow save restoration or state initialization uses this tick's budget;
+        // defer the next expensive action instead of stacking work in one tick.
+        boolean allowBuilderSlice = System.nanoTime() - controllerTickStarted < 3_000_000L;
+
+        // Assignment can perform terrain/template/path searches. Attempt at most
+        // one unemployed villager per interval, including failed attempts; a
+        // failed candidate must not trigger a burst of expensive retries for all
+        // remaining villagers in the same tick.
+        if (now >= runtime.nextAssignmentAt && !runtime.loadedVillagerIds.isEmpty()) {
+            long assignmentStarted = System.nanoTime();
+            attemptOneBuilderAssignment(world, runtime, now);
+            if (System.nanoTime() - assignmentStarted >= 3_000_000L) allowBuilderSlice = false;
         }
 
-        // Restore every saved worker before assigning new jobs. This prevents a
-        // loaded world from temporarily exceeding maxBuildersPerVillage while
-        // entities are being iterated in an arbitrary order.
-        for (VillagerEntity villager : villagers) {
-            UUID uuid = villager.getUuid();
-            if (ACTIVE_TASKS.containsKey(uuid)) continue;
-            NbtCompound taskData = saved.getActiveTask(uuid);
-            if (taskData == null) continue;
-            BuilderTask restored = restoreTask(world, villager, taskData);
-            if (restored != null) {
-                ACTIVE_TASKS.put(uuid, restored);
-                removeOriginalProfessionTags(villager);
-                applyBuilderProfession(villager, restored);
-            } else {
-                saved.removeActiveTask(uuid);
-            }
-        }
-
-        for (VillagerEntity villager : villagers) {
-            UUID uuid = villager.getUuid();
-            BuilderTask task = ACTIVE_TASKS.get(uuid);
-            if (task != null) {
-                if (!villager.isAlive() || villager.isRemoved() || !task.dimension.equals(world.getRegistryKey())) {
+        // Round-robin the expensive custom task state machine. Vanilla villager
+        // Brain, movement, look and navigation continue ticking every normal game
+        // tick; this controller only advances construction logic in small slices.
+        if (allowBuilderSlice && !ACTIVE_TASK_ORDER.isEmpty()
+                && now % VillageExpansionConfig.builderTaskGlobalIntervalTicks == 0L) {
+            int budget = VillageExpansionConfig.builderTaskUpdatesPerTick;
+            int examined = 0;
+            int total = ACTIVE_TASK_ORDER.size();
+            while (budget > 0 && examined < total && !ACTIVE_TASK_ORDER.isEmpty()) {
+                if (runtime.taskCursor >= ACTIVE_TASK_ORDER.size()) runtime.taskCursor = 0;
+                UUID uuid = ACTIVE_TASK_ORDER.get(runtime.taskCursor++);
+                examined++;
+                BuilderTask task = ACTIVE_TASKS.get(uuid);
+                if (task == null || !task.dimension.equals(world.getRegistryKey())
+                        || now < task.nextControllerUpdateAt) continue;
+                Entity entity = world.getEntity(uuid);
+                if (!(entity instanceof VillagerEntity villager)) continue; // unloaded chunk: retain the task
+                if (!villager.isAlive() || villager.isRemoved()) {
                     abandonTask(world, villager, task);
                     continue;
                 }
+
                 long taskTickStarted = System.nanoTime();
                 tickTask(world, villager, task);
+                task.nextControllerUpdateAt = now + Math.max(40, VillageExpansionConfig.builderTaskMinIntervalTicks);
+                budget--;
                 long taskTickMillis = (System.nanoTime() - taskTickStarted) / 1_000_000L;
-                if (taskTickMillis >= 50L) {
-                    VillageExpansionMod.LOGGER.warn("Builder task for villager {} took {} ms in one server tick (stage {})",
+                if (taskTickMillis >= 10L) {
+                    VillageExpansionMod.LOGGER.warn("Builder task slice for {} took {} ms (stage {}, warning threshold 10 ms)",
                             uuidShort(uuid), taskTickMillis, task.stage);
                 }
-                // A task may complete or be abandoned during tickTask. Never
-                // resurrect its NBT snapshot after completeProject removed it.
-                if (ACTIVE_TASKS.get(uuid) == task && world.getTime() % 20L == 0L) {
+                // Task snapshots are less frequent; initial assignment is saved
+                // immediately and active work remains recoverable after reload.
+                if (ACTIVE_TASKS.get(uuid) == task && now >= task.nextTaskSaveAt) {
                     saved.saveActiveTask(uuid, writeTask(task));
+                    task.nextTaskSaveAt = now + 100L;
                 }
-                continue;
-            }
-
-            restoreOrphanedBuilderProfession(villager);
-            if (!builderAssignedThisTick
-                    && world.getTime() % VillageExpansionConfig.assignmentScanInterval == 0L) {
-                long assignmentStarted = System.nanoTime();
-                tryAssignBuilder(world, villager);
-                long assignmentMillis = (System.nanoTime() - assignmentStarted) / 1_000_000L;
-                if (assignmentMillis >= 50L) {
-                    VillageExpansionMod.LOGGER.warn("Builder assignment for villager {} took {} ms in one server tick",
-                            uuidShort(uuid), assignmentMillis);
-                }
-                // Stagger expensive site/template planning across server ticks.
-                // Entity spawning is unaffected; this only limits simultaneous job assignment.
-                builderAssignedThisTick = ACTIVE_TASKS.containsKey(uuid);
+                total = ACTIVE_TASK_ORDER.size();
             }
         }
 
-        // One round-robin planning slice is allowed per world/controller tick.
-        // Expensive recipe evaluation is spread over time instead of running in
-        // the same tick that a material goal is first requested.
-        advanceOneLazyPlanningStep(world);
-
-        if (world.getTime() % 200L == 0L) updateFoundingCompletion(world, saved);
+        // Planning/founding are lower-priority than live construction and only run
+        // when the controller still has time left in its small per-tick budget.
+        // If a task slice is expensive, these operations simply resume next tick.
+        if (System.nanoTime() - controllerTickStarted < 2_000_000L) {
+            advanceOneLazyPlanningStep(world);
+        }
+        if (saved != null && now >= runtime.nextFoundingCheckAt
+                && System.nanoTime() - controllerTickStarted < 2_000_000L) {
+            updateFoundingCompletion(world, saved);
+            runtime.nextFoundingCheckAt = now + 200L;
+        }
         long controllerTickMillis = (System.nanoTime() - controllerTickStarted) / 1_000_000L;
-        if (controllerTickMillis >= 50L) {
-            VillageExpansionMod.LOGGER.warn("Village controller world tick took {} ms for {} loaded villagers",
-                    controllerTickMillis, villagers.size());
+        if (controllerTickMillis >= 10L) {
+            VillageExpansionMod.LOGGER.warn("Village controller slice took {} ms ({} cached villagers, {} active tasks; warning threshold 10 ms)",
+                    controllerTickMillis, runtime.loadedVillagerIds.size(), ACTIVE_TASKS.size());
         }
+    }
+
+    /** Snapshot only the villager UUID cache; never iterate every entity in the world. */
+    public static List<VillagerEntity> getLoadedVillagers(ServerWorld world) {
+        WorldRuntime runtime = WORLD_RUNTIMES.get(world.getRegistryKey());
+        if (runtime == null || runtime.loadedVillagerIds.isEmpty()) return List.of();
+        List<VillagerEntity> result = new ArrayList<>(runtime.loadedVillagerIds.size());
+        for (UUID uuid : runtime.loadedVillagerIds) {
+            Entity entity = world.getEntity(uuid);
+            if (entity instanceof VillagerEntity villager && villager.isAlive() && !villager.isRemoved()) {
+                result.add(villager);
+            }
+        }
+        return result;
+    }
+
+    /** Called by Fabric when a villager enters a ServerWorld, including spawn eggs. */
+    public static void onVillagerEntityLoad(Entity entity, ServerWorld world) {
+        if (!(entity instanceof VillagerEntity villager)) return;
+        WorldRuntime runtime = WORLD_RUNTIMES.computeIfAbsent(world.getRegistryKey(), ignored -> new WorldRuntime());
+        if (runtime.savedState == null) {
+            runtime.savedState = world.getPersistentStateManager().getOrCreate(
+                    VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
+        }
+        queueLoadedVillager(runtime, villager);
+    }
+
+    /** Chunk unloads remove only the live cache entry; active task state remains resumable. */
+    public static void onVillagerEntityUnload(Entity entity, ServerWorld world) {
+        if (!(entity instanceof VillagerEntity villager)) return;
+        UUID uuid = villager.getUuid();
+        WorldRuntime runtime = WORLD_RUNTIMES.get(world.getRegistryKey());
+        if (runtime != null) {
+            if (runtime.loadedVillagerIdSet.remove(uuid)) runtime.loadedVillagerIds.remove(uuid);
+            runtime.pendingVillagerLoadSet.remove(uuid);
+        }
+        BuilderTask task = ACTIVE_TASKS.get(uuid);
+        if (task == null) return;
+        VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
+                VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
+        if (!villager.isAlive()) {
+            saved.removeActiveTask(uuid);
+            unregisterActiveTask(uuid);
+        } else {
+            saved.saveActiveTask(uuid, writeTask(task));
+        }
+    }
+
+    private static void queueLoadedVillager(WorldRuntime runtime, VillagerEntity villager) {
+        UUID uuid = villager.getUuid();
+        if (runtime.loadedVillagerIdSet.add(uuid)) runtime.loadedVillagerIds.add(uuid);
+        if (runtime.pendingVillagerLoadSet.add(uuid)) runtime.pendingVillagerLoads.addLast(uuid);
+    }
+
+
+    /** Restore at most one saved builder per tick so loading a busy chunk cannot spike MSPT. */
+    private static void processOnePendingVillagerLoad(ServerWorld world, WorldRuntime runtime) {
+        UUID uuid = runtime.pendingVillagerLoads.pollFirst();
+        if (uuid == null) return;
+        runtime.pendingVillagerLoadSet.remove(uuid);
+        Entity entity = world.getEntity(uuid);
+        if (!(entity instanceof VillagerEntity villager) || !villager.isAlive()) return;
+        if (ACTIVE_TASKS.containsKey(uuid)) return;
+        NbtCompound taskData = runtime.savedState.getActiveTask(uuid);
+        if (taskData != null) {
+            BuilderTask restored = restoreTask(world, villager, taskData);
+            if (restored != null) {
+                registerActiveTask(uuid, restored);
+                removeOriginalProfessionTags(villager);
+                applyBuilderProfession(villager, restored);
+            } else {
+                runtime.savedState.removeActiveTask(uuid);
+            }
+        } else {
+            restoreOrphanedBuilderProfession(villager);
+        }
+    }
+
+    private static void attemptOneBuilderAssignment(ServerWorld world, WorldRuntime runtime, long now) {
+        int size = runtime.loadedVillagerIds.size();
+        if (size == 0) {
+            runtime.nextAssignmentAt = now + VillageExpansionConfig.assignmentScanInterval;
+            return;
+        }
+        for (int checked = 0; checked < size; checked++) {
+            if (runtime.assignmentCursor >= size) runtime.assignmentCursor = 0;
+            UUID uuid = runtime.loadedVillagerIds.get(runtime.assignmentCursor++);
+            if (ACTIVE_TASKS.containsKey(uuid) || runtime.pendingVillagerLoadSet.contains(uuid)
+                    || now < RETRY_AT.getOrDefault(uuid, 0L)) continue;
+            Entity entity = world.getEntity(uuid);
+            if (!(entity instanceof VillagerEntity villager) || !villager.isAlive() || villager.isBaby()
+                    || villager.isAiDisabled() || villager.hasCustomer()
+                    || !villager.getVillagerData().getProfession().equals(VillagerProfession.NONE)) continue;
+            long started = System.nanoTime();
+            tryAssignBuilder(world, villager);
+            long elapsedMillis = (System.nanoTime() - started) / 1_000_000L;
+            if (elapsedMillis >= 10L) {
+                VillageExpansionMod.LOGGER.warn("Builder assignment attempt for {} took {} ms (warning threshold 10 ms)",
+                        uuidShort(uuid), elapsedMillis);
+            }
+            // Exactly one expensive attempt, successful or not, per assignment window.
+            runtime.nextAssignmentAt = now + VillageExpansionConfig.assignmentScanInterval;
+            return;
+        }
+        runtime.nextAssignmentAt = now + VillageExpansionConfig.assignmentScanInterval;
+    }
+
+    private static void registerActiveTask(UUID uuid, BuilderTask task) {
+        if (!ACTIVE_TASKS.containsKey(uuid)) ACTIVE_TASK_ORDER.add(uuid);
+        ACTIVE_TASKS.put(uuid, task);
+    }
+
+    private static void unregisterActiveTask(UUID uuid) {
+        ACTIVE_TASKS.remove(uuid);
+        ACTIVE_TASK_ORDER.remove(uuid);
+        for (WorldRuntime runtime : WORLD_RUNTIMES.values()) {
+            if (runtime.taskCursor > ACTIVE_TASK_ORDER.size()) runtime.taskCursor = 0;
+        }
+    }
+
+    private static final class WorldRuntime {
+        private final List<UUID> loadedVillagerIds = new ArrayList<>();
+        private final Set<UUID> loadedVillagerIdSet = new HashSet<>();
+        private final ArrayDeque<UUID> pendingVillagerLoads = new ArrayDeque<>();
+        private final Set<UUID> pendingVillagerLoadSet = new HashSet<>();
+        private VillageExpansionState savedState;
+        private long nextAssignmentAt = Long.MIN_VALUE;
+        private long nextFoundingCheckAt = Long.MIN_VALUE;
+        private int assignmentCursor;
+        private int taskCursor;
+        private int siteSearchCursor;
+        private long nextSpatialSearchAt = Long.MIN_VALUE;
+    }
+
+    /**
+     * Global-per-dimension throttle for world scans. Resource scanners are still
+     * bounded/sampled, but this permit also prevents 20 builders from launching
+     * their scans on the same server tick.
+     */
+    private static boolean acquireSpatialSearchPermit(ServerWorld world) {
+        WorldRuntime runtime = WORLD_RUNTIMES.computeIfAbsent(world.getRegistryKey(), ignored -> new WorldRuntime());
+        long now = world.getTime();
+        if (now < runtime.nextSpatialSearchAt) return false;
+        runtime.nextSpatialSearchAt = now + VillageExpansionConfig.spatialSearchIntervalTicks;
+        return true;
     }
 
     /**
@@ -177,7 +341,10 @@ public final class VillageBuilderController {
         BuilderTask task = ACTIVE_TASKS.get(villager.getUuid());
         if (task == null || !(villager.getWorld() instanceof ServerWorld serverWorld)) return;
         long now = serverWorld.getTime();
-        if (nearbyDanger(serverWorld, villager) || healthEmergency(villager) || now < task.pausedUntil
+        if (now < task.nextBrainNavigationCheckAt) return;
+        task.nextBrainNavigationCheckAt = now + 20L;
+        if (task.cachedNearbyDanger || (villager.getAttacker() != null && villager.getAttacker().isAlive())
+                || healthEmergency(villager) || now < task.pausedUntil
                 || task.sleepingAtNight || nightWithAssignedHome(villager)) return;
 
         if (task.moveTarget == null) {
@@ -264,8 +431,15 @@ public final class VillageBuilderController {
         } else {
             label = task.stage.debugName;
         }
-        villager.setCustomName(Text.literal(DEBUG_LABEL_PREFIX + label));
-        villager.setCustomNameVisible(true);
+        String fullLabel = DEBUG_LABEL_PREFIX + label;
+        if (!fullLabel.equals(task.lastDebugLabel)
+                || villager.getCustomName() == null
+                || !fullLabel.equals(villager.getCustomName().getString())
+                || !villager.isCustomNameVisible()) {
+            villager.setCustomName(Text.literal(fullLabel));
+            villager.setCustomNameVisible(true);
+        }
+        task.lastDebugLabel = fullLabel;
     }
 
     private static void clearDebugLabel(VillagerEntity villager) {
@@ -277,9 +451,18 @@ public final class VillageBuilderController {
 
     private static void tickTask(ServerWorld world, VillagerEntity villager, BuilderTask task) {
         long now = world.getTime();
+        long elapsed = task.lastControllerUpdateAt == Long.MIN_VALUE ? 1L
+                : Math.max(1L, Math.min(200L, now - task.lastControllerUpdateAt));
+        task.elapsedControllerTicks = (int) elapsed;
+        task.lastControllerUpdateAt = now;
+        if (now >= task.nextDangerCheckAt) {
+            task.cachedNearbyDanger = nearbyDanger(world, villager);
+            task.nextDangerCheckAt = now + VillageExpansionConfig.dangerCheckIntervalTicks;
+        }
         updateDebugLabel(villager, task);
 
-        if (nearbyDanger(world, villager) || healthEmergency(villager)) {
+        if (task.cachedNearbyDanger || (villager.getAttacker() != null && villager.getAttacker().isAlive())
+                || healthEmergency(villager)) {
             // Stop mining/building and let vanilla panic, swimming and navigation
             // goals run while the villager is threatened, burning, drowning or
             // critically injured. The construction state remains saved.
@@ -306,19 +489,20 @@ public final class VillageBuilderController {
         }
         task.sleepingAtNight = false;
 
-        if (world.getTime() % VillageExpansionConfig.particleIntervalTicks == 0L) {
+        if (VillageExpansionConfig.builderParticlesEnabled
+                && world.getTime() % VillageExpansionConfig.particleIntervalTicks == 0L) {
             world.spawnParticles(ParticleTypes.HAPPY_VILLAGER,
                     villager.getX(), villager.getY() + 1.75D, villager.getZ(),
                     2, 0.22D, 0.12D, 0.22D, 0.0D);
         }
         // Leaves decay naturally after the trunk is removed. Periodically collect
         // only sapling item drops and replant them; leaf blocks are never harvested.
-        if (VillageExpansionConfig.replantSaplings && now % 200L == 0L) {
+        if (VillageExpansionConfig.replantSaplings && now >= task.nextSaplingCheckAt) {
             BlockPos origin = task.saplingSearchOrigin == null ? villager.getBlockPos() : task.saplingSearchOrigin;
-            replantSaplings(world, villager, task, origin);
+            task.nextSaplingCheckAt = replantSaplings(world, villager, task, origin) ? now + 1200L : now + 100L;
         }
 
-        if (task.actionTimer > 0) task.actionTimer--;
+        if (task.actionTimer > 0) task.actionTimer = Math.max(0, task.actionTimer - task.elapsedControllerTicks);
 
         switch (task.stage) {
             case CLEAR_PATH -> tickClearPath(world, villager, task);
@@ -344,6 +528,12 @@ public final class VillageBuilderController {
 
         VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
                 VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
+        // A hard dimension-wide cap prevents multiple nearby/founding villages from
+        // multiplying the configured per-village builder allowance without bound.
+        if (saved.getActiveTaskCount() >= VillageExpansionConfig.maxActiveBuildersPerDimension) {
+            RETRY_AT.put(villager.getUuid(), world.getTime() + 600L);
+            return;
+        }
         VillageExpansionState.VillageRecord foundingVillage = saved.findFoundingVillageForFounder(villager.getUuid());
         // The founder keeps the bed assigned by its first home while returning
         // to build the founding profession house. This also lets it sleep at night.
@@ -395,7 +585,9 @@ public final class VillageBuilderController {
         int sizeZ = template == null ? 5 : template.size().getZ();
         BlockPos site = findBuildSite(world, village, sizeX, sizeZ);
         if (site == null) {
-            RETRY_AT.put(villager.getUuid(), world.getTime() + VillageExpansionConfig.retryDelayTicks);
+            // findBuildSite advances a bounded rotating candidate window; retry
+            // sooner so the remaining ring candidates are examined progressively.
+            RETRY_AT.put(villager.getUuid(), world.getTime() + Math.max(40L, VillageExpansionConfig.assignmentScanInterval));
             return;
         }
 
@@ -431,9 +623,8 @@ public final class VillageBuilderController {
                 uuidShort(villager.getUuid()), materialPlan.size(), task.blueprint.size(), task.requiredWood, task.requiredStone, materialSummary);
         BlockPos pathGoal = template == null ? site.add(0, 0, 3) : template.pathGoal(site);
         task.pathBlocks.addAll(createVillagePath(world, village.center(), pathGoal));
-        task.treeTargets.addAll(findTreesAlongPath(world, task.pathBlocks, site, sizeX, sizeZ));
         task.levelOperations.addAll(createLevelOperations(world, site, sizeX, sizeZ));
-        ACTIVE_TASKS.put(villager.getUuid(), task);
+        registerActiveTask(villager.getUuid(), task);
         saved.saveActiveTask(villager.getUuid(), writeTask(task));
         applyBuilderProfession(villager, task);
         villager.getNavigation().stop();
@@ -531,6 +722,9 @@ public final class VillageBuilderController {
         nbt.putLong("pausedUntil", task.pausedUntil);
         nbt.putBoolean("sleepingAtNight", task.sleepingAtNight);
         nbt.putBoolean("plotVegetationCleared", task.plotVegetationCleared);
+        nbt.putInt("plotTreeScanCursor", task.plotTreeScanCursor);
+        nbt.putBoolean("plotTreeScanComplete", task.plotTreeScanComplete);
+        nbt.putInt("plotPlantScanCursor", task.plotPlantScanCursor);
         nbt.putInt("breakingTicks", task.breakingTicks);
         nbt.putInt("breakingDuration", task.breakingDuration);
         if (task.breakingPos != null) nbt.putLong("breakingPos", task.breakingPos.asLong());
@@ -587,6 +781,7 @@ public final class VillageBuilderController {
         nbt.put("materialGoalStack", goalStack);
         if (task.saplingSearchOrigin != null) nbt.putLong("saplingSearchOrigin", task.saplingSearchOrigin.asLong());
         if (task.currentTreeBase != null) nbt.putLong("currentTreeBase", task.currentTreeBase.asLong());
+        nbt.putBoolean("currentTreeScanComplete", task.currentTreeScanComplete);
         if (task.currentResource != null) {
             nbt.putLong("resourceBlock", task.currentResource.block().asLong());
             nbt.putLong("resourceStand", task.currentResource.stand().asLong());
@@ -661,6 +856,15 @@ public final class VillageBuilderController {
             task.pausedUntil = nbt.getLong("pausedUntil");
             task.sleepingAtNight = nbt.getBoolean("sleepingAtNight");
             task.plotVegetationCleared = nbt.getBoolean("plotVegetationCleared");
+            task.plotTreeScanCursor = Math.max(0, nbt.getInt("plotTreeScanCursor"));
+            task.plotTreeScanComplete = nbt.getBoolean("plotTreeScanComplete");
+            task.plotPlantScanCursor = Math.max(0, nbt.getInt("plotPlantScanCursor"));
+            if (!task.plotVegetationCleared && !nbt.contains("plotTreeScanCursor")) {
+                task.plotTreeScanCursor = 0;
+                task.plotTreeScanComplete = false;
+                task.plotPlantScanCursor = 0;
+                task.plotTreeTargets.clear();
+            }
             task.breakingTicks = nbt.getInt("breakingTicks");
             task.breakingDuration = nbt.getInt("breakingDuration");
             if (nbt.contains("breakingPos")) task.breakingPos = BlockPos.fromLong(nbt.getLong("breakingPos"));
@@ -751,9 +955,51 @@ public final class VillageBuilderController {
             task.treeTargets.addAll(readPositionList(nbt, "treeTargets"));
             task.pathBlocks.addAll(readPositionList(nbt, "pathBlocks"));
             task.currentTreeLogs.addAll(readPositionList(nbt, "currentTreeLogs"));
+            task.currentTreeScanComplete = nbt.contains("currentTreeScanComplete")
+                    ? nbt.getBoolean("currentTreeScanComplete") : !task.currentTreeLogs.isEmpty();
+            if (!task.currentTreeScanComplete && task.currentTreeBase != null) {
+                task.currentTreeLogs.clear();
+                task.currentTreeLogIndex = 0;
+            }
             task.plotTreeTargets.addAll(readPositionList(nbt, "plotTreeTargets"));
             task.plotTreeIndex = nbt.getInt("plotTreeIndex");
             task.levelOperations.addAll(readLevelOperations(nbt));
+
+            // In 1.4.0 CLEAR_PATH cut trees along the entire future road before
+            // the house existed. That made builders walk away from the plot and
+            // spend long periods clearing a route. The road is now the final phase;
+            // clear only the house footprint, build the house, then remove only
+            // obstacles that actually intersect the finished road.
+            if (task.stage == Stage.CLEAR_PATH) {
+                task.stage = Stage.LEVEL_SITE;
+                task.treeTargets.clear();
+                task.treeIndex = 0;
+                task.plotVegetationCleared = false;
+                task.plotTreeScanCursor = 0;
+                task.plotTreeScanComplete = false;
+                task.plotPlantScanCursor = 0;
+                task.plotTreeTargets.clear();
+                task.plotTreeIndex = 0;
+                task.currentTreeBase = null;
+                task.currentTreeLogItem = null;
+                task.currentTreeLogs.clear();
+                task.currentTreeLogIndex = 0;
+                task.currentTreeLeaves.clear();
+                task.currentTreeLeafIndex = 0;
+                task.currentTreeLeavesScanned = false;
+                task.currentTreeScanComplete = false;
+                task.currentTreeScanQueue.clear();
+                task.currentTreeScanVisited.clear();
+                task.currentTreeStandTarget = null;
+                task.currentTreeStandPosition = null;
+                task.currentTreeStandChecked = false;
+                clearBreakingProgress(world, villager, task);
+                task.moveTarget = null;
+                task.requestedMoveTarget = null;
+                VillageExpansionMod.LOGGER.info(
+                        "Migrated builder {} from route-wide clearing to local plot preparation at {}",
+                        uuidShort(villager.getUuid()), task.site);
+            }
             if (nbt.contains("resourceBlock", NbtElement.LONG_TYPE)
                     && nbt.contains("resourceStand", NbtElement.LONG_TYPE)) {
                 task.currentResource = new ResourceTarget(BlockPos.fromLong(nbt.getLong("resourceBlock")),
@@ -823,9 +1069,6 @@ public final class VillageBuilderController {
             // are regenerated, so a reload cannot silently change the route or work order.
             if (!nbt.contains("pathBlocks")) {
                 task.pathBlocks.addAll(createVillagePath(world, village.center(), pathGoal));
-            }
-            if (!nbt.contains("treeTargets")) {
-                task.treeTargets.addAll(findTreesAlongPath(world, task.pathBlocks, site, sx, sz));
             }
             if (!nbt.contains("levelOperations")) {
                 task.levelOperations.addAll(createLevelOperations(world, site, sx, sz));
@@ -979,18 +1222,16 @@ public final class VillageBuilderController {
      * A bell or an existing bed is used as a fallback for partially initialized villages.
      */
     private static BlockPos findVillageAnchor(ServerWorld world, VillagerEntity subject) {
+        // Use Minecraft's entity spatial index instead of iterating every loaded
+        // entity in the world. If no nearby villager has a HOME memory, the caller
+        // checks the mod's village registry or creates a new founding settlement.
+        Box nearby = subject.getBoundingBox().expand(64.0D);
         BlockPos best = null;
         double bestDistance = 64.0D * 64.0D;
-
-        for (Entity entity : world.iterateEntities()) {
-            if (!(entity instanceof VillagerEntity other) || other == subject || !other.isAlive()) {
-                continue;
-            }
+        for (VillagerEntity other : world.getEntitiesByClass(VillagerEntity.class, nearby,
+                candidate -> candidate != subject && candidate.isAlive())) {
             Optional<GlobalPos> home = other.getBrain().getOptionalRegisteredMemory(MemoryModuleType.HOME);
-            if (home.isEmpty() || !home.get().dimension().equals(world.getRegistryKey())) {
-                continue;
-            }
-
+            if (home.isEmpty() || !home.get().dimension().equals(world.getRegistryKey())) continue;
             BlockPos pos = home.get().pos();
             double distance = pos.getSquaredDistance(subject.getBlockPos());
             if (distance < bestDistance) {
@@ -998,56 +1239,40 @@ public final class VillageBuilderController {
                 best = pos;
             }
         }
-
-        if (best != null) {
-            return best.toImmutable();
-        }
-
-        BlockPos origin = subject.getBlockPos();
-        BlockPos nearestMarker = null;
-        double nearestMarkerDistance = 32.0D * 32.0D;
-        int minY = Math.max(world.getBottomY(), origin.getY() - 4);
-        int maxY = Math.min(world.getTopY(), origin.getY() + 4);
-
-        for (int x = origin.getX() - 24; x <= origin.getX() + 24; x++) {
-            for (int z = origin.getZ() - 24; z <= origin.getZ() + 24; z++) {
-                for (int y = minY; y <= maxY; y++) {
-                    BlockPos candidate = new BlockPos(x, y, z);
-                    if (!isLoaded(world, candidate)) {
-                        continue;
-                    }
-                    BlockState marker = world.getBlockState(candidate);
-                    if (!marker.isOf(Blocks.BELL) && !marker.isIn(BlockTags.BEDS)) {
-                        continue;
-                    }
-                    double distance = candidate.getSquaredDistance(origin);
-                    if (distance < nearestMarkerDistance) {
-                        nearestMarkerDistance = distance;
-                        nearestMarker = candidate;
-                    }
-                }
-            }
-        }
-        return nearestMarker;
+        return best == null ? null : best.toImmutable();
     }
 
     private static BlockPos findBuildSite(ServerWorld world, VillageExpansionState.VillageRecord village,
                                            int sizeX, int sizeZ) {
         BlockPos center = village.center();
-        for (int radius = VillageExpansionConfig.houseSearchMinRadius;
-             radius <= VillageExpansionConfig.houseSearchMaxRadius;
-             radius += VillageExpansionConfig.houseSearchStep) {
-            for (int angleStep = 0; angleStep < 24; angleStep++) {
-                double angle = (Math.PI * 2.0D * angleStep) / 24.0D;
-                int x = center.getX() + (int) Math.round(Math.cos(angle) * radius);
-                int z = center.getZ() + (int) Math.round(Math.sin(angle) * radius);
-                BlockPos candidate = createViableSite(world, x, z, sizeX, sizeZ);
-                if (candidate == null || village.isNearExistingHouse(candidate, VillageExpansionConfig.houseSpacing)
-                        || village.isNearMine(candidate, VillageExpansionConfig.mineExclusionRadius)
-                        || isBuildSiteReserved(world, village.id(), candidate)) continue;
-                return candidate;
-            }
+        WorldRuntime runtime = WORLD_RUNTIMES.computeIfAbsent(world.getRegistryKey(), ignored -> new WorldRuntime());
+        int minRadius = VillageExpansionConfig.houseSearchMinRadius;
+        int maxRadius = VillageExpansionConfig.houseSearchMaxRadius;
+        int radiusStep = Math.max(2, VillageExpansionConfig.houseSearchStep);
+        int radiusBands = Math.max(1, (int) Math.ceil((maxRadius - minRadius) / (double) radiusStep) + 1);
+        final int angleCount = 16;
+        int totalCandidates = radiusBands * angleCount;
+        int cursor = Math.floorMod(runtime.siteSearchCursor, totalCandidates);
+        // Keep the search local to the village and inspect only four candidate
+        // footprints per assignment slice. Uneven plots are accepted when their
+        // cut/fill work remains within the configured terraform budget.
+        int attempts = Math.min(4, totalCandidates);
+        for (int checked = 0; checked < attempts; checked++) {
+            int candidateIndex = (cursor + checked) % totalCandidates;
+            int radiusIndex = candidateIndex / angleCount;
+            int angleStep = candidateIndex % angleCount;
+            int radius = Math.min(maxRadius, minRadius + radiusIndex * radiusStep);
+            double angle = (Math.PI * 2.0D * angleStep) / angleCount;
+            int x = center.getX() + (int) Math.round(Math.cos(angle) * radius);
+            int z = center.getZ() + (int) Math.round(Math.sin(angle) * radius);
+            BlockPos candidate = createViableSite(world, x, z, sizeX, sizeZ);
+            if (candidate == null || village.isNearExistingHouse(candidate, VillageExpansionConfig.houseSpacing)
+                    || village.isNearMine(candidate, VillageExpansionConfig.mineExclusionRadius)
+                    || isBuildSiteReserved(world, village.id(), candidate)) continue;
+            runtime.siteSearchCursor = (candidateIndex + 1) % totalCandidates;
+            return candidate;
         }
+        runtime.siteSearchCursor = (cursor + attempts) % totalCandidates;
         return null;
     }
 
@@ -1062,7 +1287,7 @@ public final class VillageBuilderController {
             for (int z = centerZ - halfZ; z < centerZ - halfZ + sizeZ; z++) {
                 BlockPos sample = new BlockPos(x, world.getTopY() - 1, z);
                 if (!isLoaded(world, sample)) return null;
-                int groundY = findSurfaceY(world, x, z);
+                int groundY = findSurfaceYFast(world, x, z, 24);
                 if (groundY == Integer.MIN_VALUE) return null;
                 BlockPos above = new BlockPos(x, groundY + 1, z);
                 if (!world.getFluidState(above).isEmpty()) return null;
@@ -1071,20 +1296,44 @@ public final class VillageBuilderController {
                 maxY = Math.max(maxY, groundY);
             }
         }
-        if (maxY - minY > 1) return null;
+        // Do not require a naturally flat footprint. The median is the target
+        // floor; the configured variation and operation budgets decide whether
+        // the builder can safely adapt the surrounding terrain.
         groundHeights.sort(Integer::compareTo);
         int baseY = groundHeights.get(groundHeights.size() / 2);
+        int minAllowedY = baseY - VillageExpansionConfig.maxSiteTerrainVariation;
+        int maxAllowedY = baseY + VillageExpansionConfig.maxSiteTerrainVariation;
+        if (minY < minAllowedY || maxY > maxAllowedY) return null;
+
+        // Reject only plots that would require excessive earthwork. Small slopes,
+        // shallow dips and one/two-block rises are handled by LEVEL_SITE itself.
+        int terraformBlocks = 0;
+        for (int height : groundHeights) {
+            terraformBlocks += Math.abs(height - baseY);
+            if (terraformBlocks > VillageExpansionConfig.maxSiteTerraformBlocks) return null;
+        }
 
         for (int x = centerX - halfX; x < centerX - halfX + sizeX; x++) {
             for (int z = centerZ - halfZ; z < centerZ - halfZ + sizeZ; z++) {
-                int surfaceY = findSurfaceY(world, x, z);
-                for (int y = surfaceY + 1; y <= baseY + 10; y++) {
+                int surfaceY = findSurfaceYFast(world, x, z, 24);
+                if (surfaceY == Integer.MIN_VALUE) return null;
+                // Columns below the median are filled; columns above it are cut.
+                // Natural dirt/stone in the final headroom is also removable, and
+                // is counted against the terraform budget instead of rejecting the plot.
+                int clearanceStart = Math.max(surfaceY, baseY) + 1;
+                for (int y = clearanceStart; y <= baseY + 10; y++) {
                     BlockPos pos = new BlockPos(x, y, z);
                     BlockState state = world.getBlockState(pos);
                     if (!world.getFluidState(pos).isEmpty()) return null;
-                    if (state.isAir() || state.isIn(BlockTags.LEAVES) || isPlant(state)) continue;
+                    if (state.isAir() || state.isReplaceable() || state.isIn(BlockTags.LEAVES) || isPlant(state)) continue;
                     if (state.isIn(BlockTags.LOGS) && hasNearbyLeaves(world, pos)) continue;
-                    if (state.hasBlockEntity() || state.isSolidBlock(world, pos)) return null;
+                    if (state.hasBlockEntity()) return null;
+                    if (isTerrain(state)) {
+                        if (++terraformBlocks > VillageExpansionConfig.maxSiteTerraformBlocks) return null;
+                        continue;
+                    }
+                    // Never demolish player/modded structures to make a house plot.
+                    if (state.isSolidBlock(world, pos)) return null;
                 }
             }
         }
@@ -1136,191 +1385,139 @@ public final class VillageBuilderController {
         return new ArrayList<>(widened.values());
     }
 
+    private record RoadPathNode(BlockPos pos, double pathCost, double estimatedTotalCost) {}
+
+    /**
+     * Bounded four-way A* for the access road. This is deliberately small and uses
+     * Minecraft's heightmap-backed terrain lookup; it never searches unloaded chunks
+     * or expands beyond maxPathSearchNodes. Vanilla navigation remains responsible
+     * for moving the villager between work positions.
+     */
+    private static List<BlockPos> findPathAStar(ServerWorld world, BlockPos start, BlockPos goal) {
+        if (start.getX() == goal.getX() && start.getZ() == goal.getZ()) return List.of(start.toImmutable());
+        int maxNodes = Math.max(100, Math.min(600, VillageExpansionConfig.maxPathSearchNodes));
+        PriorityQueue<RoadPathNode> open = new PriorityQueue<>(Comparator.comparingDouble(RoadPathNode::estimatedTotalCost));
+        Map<BlockPos, Double> bestCost = new HashMap<>();
+        Map<BlockPos, BlockPos> previous = new HashMap<>();
+        Set<BlockPos> closed = new HashSet<>();
+        BlockPos startPos = start.toImmutable();
+        BlockPos goalPos = goal.toImmutable();
+        bestCost.put(startPos, 0.0D);
+        open.add(new RoadPathNode(startPos, 0.0D, roadHeuristic(startPos, goalPos)));
+        BlockPos reached = null;
+        int expanded = 0;
+        final int[][] directions = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+        while (!open.isEmpty() && expanded < maxNodes) {
+            RoadPathNode currentNode = open.poll();
+            BlockPos current = currentNode.pos();
+            if (!closed.add(current)) continue;
+            expanded++;
+            if (current.getX() == goalPos.getX() && current.getZ() == goalPos.getZ()) {
+                reached = current;
+                break;
+            }
+
+            for (int[] direction : directions) {
+                int nextX = current.getX() + direction[0];
+                int nextZ = current.getZ() + direction[1];
+                int nextY = findPathSurfaceY(world, nextX, nextZ);
+                if (nextY == Integer.MIN_VALUE || Math.abs(nextY - current.getY()) > 2) continue;
+                BlockPos next = new BlockPos(nextX, nextY, nextZ);
+                if (closed.contains(next)) continue;
+
+                BlockPos feet = next.up();
+                BlockPos head = next.up(2);
+                if (!isLoaded(world, next) || !isLoaded(world, feet) || !isLoaded(world, head)) continue;
+                BlockState feetState = world.getBlockState(feet);
+                BlockState headState = world.getBlockState(head);
+                if (feetState.hasBlockEntity() || headState.hasBlockEntity()) continue;
+                if ((!feetState.isAir() && !feetState.isReplaceable()
+                        && !feetState.isIn(BlockTags.LOGS) && !feetState.isIn(BlockTags.LEAVES) && !isPlant(feetState))
+                        || (!headState.isAir() && !headState.isReplaceable()
+                        && !headState.isIn(BlockTags.LOGS) && !headState.isIn(BlockTags.LEAVES) && !isPlant(headState))) continue;
+                if (world.getFluidState(feet).isIn(net.minecraft.registry.tag.FluidTags.LAVA)
+                        || world.getFluidState(head).isIn(net.minecraft.registry.tag.FluidTags.LAVA)) continue;
+
+                double stepCost = 1.0D + Math.abs(nextY - current.getY()) * 2.0D;
+                if (!world.getFluidState(feet).isEmpty() || !world.getFluidState(head).isEmpty()) stepCost += 6.0D;
+                if (feetState.isIn(BlockTags.LOGS) || feetState.isIn(BlockTags.LEAVES)
+                        || headState.isIn(BlockTags.LOGS) || headState.isIn(BlockTags.LEAVES)) stepCost += 2.0D;
+                double candidateCost = currentNode.pathCost() + stepCost;
+                if (candidateCost >= bestCost.getOrDefault(next, Double.MAX_VALUE)) continue;
+                bestCost.put(next, candidateCost);
+                previous.put(next, current);
+                open.add(new RoadPathNode(next, candidateCost, candidateCost + roadHeuristic(next, goalPos)));
+            }
+        }
+        if (reached == null) return List.of();
+        List<BlockPos> path = new ArrayList<>();
+        BlockPos cursor = reached;
+        path.add(cursor);
+        while (!cursor.equals(startPos)) {
+            cursor = previous.get(cursor);
+            if (cursor == null || path.size() > maxNodes + 1) return List.of();
+            path.add(cursor);
+        }
+        Collections.reverse(path);
+        return path;
+    }
+
+    private static double roadHeuristic(BlockPos from, BlockPos to) {
+        return Math.abs(from.getX() - to.getX()) + Math.abs(from.getZ() - to.getZ())
+                + Math.abs(from.getY() - to.getY()) * 1.5D;
+    }
+
+    private static int findPathSurfaceY(ServerWorld world, int x, int z) {
+        // Reuse Minecraft's maintained heightmap and inspect at most 24 blocks below it.
+        return findSurfaceYFast(world, x, z, 24);
+    }
+
     private static BlockPos findNearestVillagePath(ServerWorld world, BlockPos center, BlockPos site) {
         BlockPos best = null;
         double bestDistance = Double.MAX_VALUE;
-        int radius = 36;
-
-        for (int x = center.getX() - radius; x <= center.getX() + radius; x++) {
-            for (int z = center.getZ() - radius; z <= center.getZ() + radius; z++) {
-                if (!world.isChunkLoaded(new ChunkPos(x >> 4, z >> 4).toLong())) {
-                    continue;
+        int radius = 28;
+        int diameter = radius * 2 + 1;
+        // Bounded probes keep road connection discovery cheap even in dense modpacks.
+        for (int sample = 0; sample < 32; sample++) {
+            int x = center.getX() + world.random.nextInt(diameter) - radius;
+            int z = center.getZ() + world.random.nextInt(diameter) - radius;
+            if (!world.isChunkLoaded(new ChunkPos(x >> 4, z >> 4).toLong())) continue;
+            int topY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
+            for (int y = topY; y >= Math.max(world.getBottomY(), topY - 4); y--) {
+                BlockPos candidate = new BlockPos(x, y, z);
+                if (!world.getBlockState(candidate).isOf(Blocks.DIRT_PATH)) continue;
+                double distance = candidate.getSquaredDistance(site);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = candidate.toImmutable();
                 }
-                int topY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
-                for (int y = topY; y >= Math.max(world.getBottomY(), topY - 8); y--) {
-                    BlockPos candidate = new BlockPos(x, y, z);
-                    if (!world.getBlockState(candidate).isOf(Blocks.DIRT_PATH)) {
-                        continue;
-                    }
-                    double distance = candidate.getSquaredDistance(site);
-                    if (distance < bestDistance) {
-                        bestDistance = distance;
-                        best = candidate.toImmutable();
-                    }
-                    break;
-                }
+                break;
             }
         }
         return best;
     }
 
-    /** A* over the terrain surface. Trees are traversable at a high cost and are removed first. */
-    private static List<BlockPos> findPathAStar(ServerWorld world, BlockPos start, BlockPos goal) {
-        PriorityQueue<PathNode> open = new PriorityQueue<>(Comparator.comparingDouble(PathNode::estimate));
-        Map<BlockPos, Double> scores = new HashMap<>();
-        Map<BlockPos, BlockPos> previous = new HashMap<>();
-        Set<BlockPos> closed = new HashSet<>();
-        Map<Long, Integer> surfaceCache = new HashMap<>();
-
-        BlockPos immutableStart = start.toImmutable();
-        BlockPos immutableGoal = goal.toImmutable();
-        scores.put(immutableStart, 0.0D);
-        open.add(new PathNode(immutableStart, 0.0D, pathHeuristic(immutableStart, immutableGoal)));
-
-        int[][] neighbors = {
-                {1, 0}, {-1, 0}, {0, 1}, {0, -1}
-        };
-        int expanded = 0;
-        int maxExpanded = VillageExpansionConfig.maxPathSearchNodes;
-        int minX = Math.min(start.getX(), goal.getX()) - 12;
-        int maxX = Math.max(start.getX(), goal.getX()) + 12;
-        int minZ = Math.min(start.getZ(), goal.getZ()) - 12;
-        int maxZ = Math.max(start.getZ(), goal.getZ()) + 12;
-
-        while (!open.isEmpty() && expanded < maxExpanded) {
-            PathNode currentNode = open.poll();
-            BlockPos current = currentNode.pos();
-            if (currentNode.cost() > scores.getOrDefault(current, Double.MAX_VALUE) + 0.0001D) {
-                continue;
-            }
-            if (!closed.add(current)) {
-                continue;
-            }
-            expanded++;
-
-            if (current.equals(immutableGoal)) {
-                return reconstructPath(previous, immutableStart, immutableGoal);
-            }
-
-            for (int[] offset : neighbors) {
-                int x = current.getX() + offset[0];
-                int z = current.getZ() + offset[1];
-                if (x < minX || x > maxX || z < minZ || z > maxZ) {
-                    continue;
-                }
-                long columnKey = ((long) x << 32) | (z & 0xffffffffL);
-                Integer cachedY = surfaceCache.get(columnKey);
-                int y;
-                if (cachedY != null) {
-                    y = cachedY;
-                } else {
-                    y = findPathSurfaceY(world, x, z);
-                    surfaceCache.put(columnKey, y);
-                }
-                if (y == Integer.MIN_VALUE || Math.abs(y - current.getY()) > 1) {
-                    continue;
-                }
-
-                BlockPos next = new BlockPos(x, y, z);
-                if (closed.contains(next)) {
-                    continue;
-                }
-                double terrainPenalty = pathCellPenalty(world, next);
-                if (terrainPenalty < 0.0D) {
-                    continue;
-                }
-                double moveCost = 1.0D + Math.abs(y - current.getY()) * 1.5D + terrainPenalty;
-                double tentative = scores.get(current) + moveCost;
-
-                if (tentative < scores.getOrDefault(next, Double.MAX_VALUE)) {
-                    scores.put(next, tentative);
-                    previous.put(next, current);
-                    open.add(new PathNode(next, tentative, tentative + pathHeuristic(next, immutableGoal)));
-                }
-            }
-        }
-        return List.of();
-    }
-
-    private static double pathHeuristic(BlockPos a, BlockPos b) {
-        return Math.abs(a.getX() - b.getX()) + Math.abs(a.getZ() - b.getZ());
-    }
-
-    private static List<BlockPos> reconstructPath(Map<BlockPos, BlockPos> previous,
-                                                   BlockPos start, BlockPos goal) {
-        List<BlockPos> reversed = new ArrayList<>();
-        BlockPos cursor = goal;
-        reversed.add(cursor);
-        while (!cursor.equals(start)) {
-            cursor = previous.get(cursor);
-            if (cursor == null) {
-                return List.of();
-            }
-            reversed.add(cursor);
-        }
-        Collections.reverse(reversed);
-        return reversed;
-    }
-
-    /** Returns -1 for blocked cells; trees are allowed but expensive because they will be cleared. */
-    private static double pathCellPenalty(ServerWorld world, BlockPos ground) {
-        if (!isLoaded(world, ground)) {
-            return -1.0D;
-        }
-        BlockState floor = world.getBlockState(ground);
-        if (!floor.isOf(Blocks.DIRT_PATH) && !isTerrain(floor)) {
-            return -1.0D;
-        }
-        if (floor.hasBlockEntity()) {
-            return -1.0D;
-        }
-
-        double penalty = floor.isOf(Blocks.DIRT_PATH) ? 0.0D : 0.15D;
-        for (int dy = 1; dy <= 2; dy++) {
-            BlockPos above = ground.up(dy);
-            if (!isLoaded(world, above) || !world.getFluidState(above).isEmpty()) {
-                return -1.0D;
-            }
-            BlockState state = world.getBlockState(above);
-            if (state.isAir() || state.isIn(BlockTags.LEAVES) || isPlant(state)) {
-                continue;
-            }
-            if (state.isIn(BlockTags.LOGS) && hasNearbyLeaves(world, above)) {
-                penalty += 8.0D;
-                continue;
-            }
-            return -1.0D;
-        }
-        return penalty;
-    }
-
-    private static int findPathSurfaceY(ServerWorld world, int x, int z) {
-        if (!world.isChunkLoaded(new ChunkPos(x >> 4, z >> 4).toLong())) {
-            return Integer.MIN_VALUE;
-        }
-        int y = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z) - 1;
-        for (; y >= world.getBottomY(); y--) {
-            BlockState state = world.getBlockState(new BlockPos(x, y, z));
-            if (state.isOf(Blocks.DIRT_PATH) || isTerrain(state)) {
-                return y;
-            }
-        }
-        return Integer.MIN_VALUE;
-    }
-
     private static List<BlockPos> findTreesAlongPath(ServerWorld world, List<BlockPos> path, BlockPos site,
                                                      int sizeX, int sizeZ) {
         Set<BlockPos> unique = new HashSet<>();
-        for (BlockPos pathBlock : path) {
+        // Sample at most ~24 route positions. The widened path itself is only 3 blocks;
+        // the 3x3 neighborhood is sampled around each anchor to catch obstructing trunks.
+        int stride = Math.max(1, path.size() / 24);
+        for (int i = 0; i < path.size(); i += stride) {
+            BlockPos pathBlock = path.get(i);
             for (int dx = -1; dx <= 1; dx++) {
                 for (int dz = -1; dz <= 1; dz++) {
                     addTreeBasesAtColumn(world, pathBlock.getX() + dx, pathBlock.getZ() + dz, unique);
                 }
             }
         }
-        for (int x = site.getX() - 1; x <= site.getX() + sizeX; x++) {
-            for (int z = site.getZ() - 1; z <= site.getZ() + sizeZ; z++) {
-                addTreeBasesAtColumn(world, x, z, unique);
+        if (!path.isEmpty()) {
+            BlockPos last = path.get(path.size() - 1);
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    addTreeBasesAtColumn(world, last.getX() + dx, last.getZ() + dz, unique);
+                }
             }
         }
         List<BlockPos> result = new ArrayList<>(unique);
@@ -1333,8 +1530,8 @@ public final class VillageBuilderController {
         Set<BlockPos> unique = new HashSet<>();
         int steps = Math.max(Math.abs(to.getX() - from.getX()), Math.abs(to.getZ() - from.getZ()));
         steps = Math.max(1, steps);
-
-        for (int i = 0; i <= steps; i++) {
+        int stride = Math.max(1, steps / 24);
+        for (int i = 0; i <= steps; i += stride) {
             double alpha = i / (double) steps;
             int x = (int) Math.round(from.getX() + (to.getX() - from.getX()) * alpha);
             int z = (int) Math.round(from.getZ() + (to.getZ() - from.getZ()) * alpha);
@@ -1344,20 +1541,18 @@ public final class VillageBuilderController {
                 }
             }
         }
-
         for (int x = to.getX() - 2; x <= to.getX() + 2; x++) {
             for (int z = to.getZ() - 2; z <= to.getZ() + 2; z++) {
                 addTreeBasesAtColumn(world, x, z, unique);
             }
         }
-
         List<BlockPos> result = new ArrayList<>(unique);
         result.sort(Comparator.comparingDouble(pos -> pos.getSquaredDistance(from)));
         return result;
     }
 
     private static void addTreeBasesAtColumn(ServerWorld world, int x, int z, Set<BlockPos> output) {
-        int groundY = findSurfaceY(world, x, z);
+        int groundY = findSurfaceYFast(world, x, z, 24);
         if (groundY == Integer.MIN_VALUE) return;
         // Natural tree roots start directly above terrain. Searching arbitrary log
         // columns allowed house pillars and wooden walls to be mistaken for trees.
@@ -1378,15 +1573,16 @@ public final class VillageBuilderController {
         // posts, fences, house walls and decorative logs as harvestable trees.
         if (!world.getBlockState(root.up()).isIn(BlockTags.LOGS)
                 || !world.getBlockState(root.up(2)).isIn(BlockTags.LOGS)) return false;
-        for (int dx = -4; dx <= 4; dx++) {
-            for (int dy = 2; dy <= 14; dy++) {
-                for (int dz = -4; dz <= 4; dz++) {
+        // Sparse canopy probes: the former 9x13x9 volume caused over a thousand
+        // block reads for every possible tree root. Trees missed by this quick test
+        // can still be found by later expanded resource scans.
+        for (int dx = -4; dx <= 4; dx += 2) {
+            for (int dy = 2; dy <= 14; dy += 2) {
+                for (int dz = -4; dz <= 4; dz += 2) {
                     BlockPos canopy = root.add(dx, dy, dz);
                     if (!isLoaded(world, canopy)) continue;
                     BlockState leafState = world.getBlockState(canopy);
                     if (!leafState.isIn(BlockTags.LEAVES)) continue;
-                    // Vanilla player-placed leaves are persistent; naturally generated
-                    // tree canopies use non-persistent leaves and decay when disconnected.
                     if (leafState.contains(LeavesBlock.PERSISTENT)
                             && leafState.get(LeavesBlock.PERSISTENT)) continue;
                     return true;
@@ -1405,9 +1601,11 @@ public final class VillageBuilderController {
 
     /** Conservatively protects wood near recognizable houses, workstations and containers. */
     private static boolean isProtectedByNearbyBuilding(ServerWorld world, BlockPos root) {
-        for (int dx = -6; dx <= 6; dx++) {
-            for (int dy = -2; dy <= 8; dy++) {
-                for (int dz = -6; dz <= 6; dz++) {
+        // Check a compact 7x8x7 neighborhood rather than the old 13x11x13 volume.
+        // Beds/doors and block entities at house edges are still detected.
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dy = -1; dy <= 6; dy++) {
+                for (int dz = -3; dz <= 3; dz++) {
                     BlockPos check = root.add(dx, dy, dz);
                     if (!isLoaded(world, check)) continue;
                     BlockState state = world.getBlockState(check);
@@ -1421,9 +1619,10 @@ public final class VillageBuilderController {
     }
 
     private static boolean hasNearbyLeaves(ServerWorld world, BlockPos origin) {
-        for (int dx = -4; dx <= 4; dx++) {
-            for (int dy = -2; dy <= 12; dy++) {
-                for (int dz = -4; dz <= 4; dz++) {
+        // Sparse canopy test used only as a safety hint while preparing a site.
+        for (int dx = -3; dx <= 3; dx += 3) {
+            for (int dy = -2; dy <= 10; dy += 2) {
+                for (int dz = -3; dz <= 3; dz += 3) {
                     BlockPos check = origin.add(dx, dy, dz);
                     if (isLoaded(world, check) && world.getBlockState(check).isIn(BlockTags.LEAVES)) return true;
                 }
@@ -1434,14 +1633,13 @@ public final class VillageBuilderController {
 
     private static List<LevelOperation> createLevelOperations(ServerWorld world, BlockPos site, int sizeX, int sizeZ) {
         List<LevelOperation> cuts = new ArrayList<>();
+        List<LevelOperation> clearanceCuts = new ArrayList<>();
         List<LevelOperation> fills = new ArrayList<>();
 
         for (int x = site.getX(); x < site.getX() + sizeX; x++) {
             for (int z = site.getZ(); z < site.getZ() + sizeZ; z++) {
-                int surfaceY = findSurfaceY(world, x, z);
-                if (surfaceY == Integer.MIN_VALUE) {
-                    continue;
-                }
+                int surfaceY = findSurfaceYFast(world, x, z, 24);
+                if (surfaceY == Integer.MIN_VALUE) continue;
                 if (surfaceY > site.getY()) {
                     for (int y = surfaceY; y > site.getY(); y--) {
                         cuts.add(new LevelOperation(new BlockPos(x, y, z), false));
@@ -1451,11 +1649,27 @@ public final class VillageBuilderController {
                         fills.add(new LevelOperation(new BlockPos(x, y, z), true));
                     }
                 }
+
+                // In low columns, remove natural dirt/stone protruding into the
+                // future house volume. Tree logs/leaves and plants are handled by
+                // the separate tree/vegetation pass. Existing structures are never
+                // added here; site validation rejects block entities and solids.
+                int clearanceStart = Math.max(surfaceY, site.getY()) + 1;
+                for (int y = clearanceStart; y <= site.getY() + 10; y++) {
+                    BlockPos pos = new BlockPos(x, y, z);
+                    BlockState state = world.getBlockState(pos);
+                    if (isTerrain(state) && !state.isAir()) {
+                        clearanceCuts.add(new LevelOperation(pos, false));
+                    }
+                }
             }
         }
 
-        // Cutting first creates the dirt used to fill lower cells.
+        // Remove obstructing natural terrain first, then level high cells, then fill
+        // low cells using dirt collected from the cuts or nearby natural sources.
+        cuts.addAll(clearanceCuts);
         cuts.addAll(fills);
+        if (cuts.size() > VillageExpansionConfig.maxSiteTerraformBlocks) return new ArrayList<>();
         return cuts;
     }
 
@@ -1475,17 +1689,11 @@ public final class VillageBuilderController {
     }
 
     private static int findSurfaceY(ServerWorld world, int x, int z) {
-        if (!world.isChunkLoaded(new ChunkPos(x >> 4, z >> 4).toLong())) {
-            return Integer.MIN_VALUE;
-        }
-        int y = world.getTopY(Heightmap.Type.WORLD_SURFACE, x, z) - 1;
-        for (; y >= world.getBottomY(); y--) {
-            BlockState state = world.getBlockState(new BlockPos(x, y, z));
-            if (isTerrain(state)) {
-                return y;
-            }
-        }
-        return Integer.MIN_VALUE;
+        // Heightmaps are maintained by Minecraft during chunk updates. Searching
+        // downward from WORLD_SURFACE to bedrock for every column multiplied into
+        // tens of thousands of redundant block reads per builder. A bounded local
+        // check around MOTION_BLOCKING_NO_LEAVES is enough for our terrain tasks.
+        return findSurfaceYFast(world, x, z, 40);
     }
 
     private static boolean isTerrain(BlockState state) {
@@ -1514,27 +1722,76 @@ public final class VillageBuilderController {
     private static BlockPos findStandingPosition(ServerWorld world, BlockPos workBlock, VillagerEntity villager) {
         BlockPos best = null;
         double bestDistance = Double.MAX_VALUE;
-        int[][] offsets = {
-                {1, 0}, {-1, 0}, {0, 1}, {0, -1},
-                {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+        // First try the eight adjacent cells, then a compact radius-two ring.
+        // This prevents a dense tree/undergrowth patch from leaving CLEAR_PATH stuck
+        // forever because no immediately adjacent standing cell is free.
+        for (int radius = 1; radius <= 2; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                    int x = workBlock.getX() + dx;
+                    int z = workBlock.getZ() + dz;
+                    int groundY = findSurfaceYFast(world, x, z, 24);
+                    if (groundY == Integer.MIN_VALUE) continue;
+                    BlockPos stand = new BlockPos(x, groundY + 1, z);
+                    BlockPos head = stand.up();
+                    BlockPos floor = stand.down();
+                    if (!isLoaded(world, stand) || !isLoaded(world, head) || !isLoaded(world, floor)
+                            || !world.getBlockState(stand).isAir() || !world.getBlockState(head).isAir()
+                            || !world.getBlockState(floor).isSolidBlock(world, floor)
+                            || !world.getFluidState(stand).isEmpty()) continue;
+                    double distance = villager.squaredDistanceTo(stand.getX() + 0.5D, stand.getY(), stand.getZ() + 0.5D);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = stand;
+                    }
+                }
+            }
+            if (best != null) return best;
+        }
+        return null;
+    }
+
+    private static boolean isValidPlotWorkStand(ServerWorld world, BlockPos stand) {
+        if (!isLoaded(world, stand) || !isLoaded(world, stand.up()) || !isLoaded(world, stand.down())) return false;
+        return world.getBlockState(stand).isAir() && world.getBlockState(stand.up()).isAir()
+                && world.getBlockState(stand.down()).isSolidBlock(world, stand.down())
+                && world.getFluidState(stand).isEmpty();
+    }
+
+    /** Finds an accessible working cell just outside the selected house footprint. */
+    private static BlockPos findPlotWorkStand(ServerWorld world, BuilderTask task, VillagerEntity villager) {
+        int midX = task.site.getX() + task.footprintX / 2;
+        int midZ = task.site.getZ() + task.footprintZ / 2;
+        int[][] probes = {
+                {midX, task.site.getZ() - 1}, {midX, task.site.getZ() + task.footprintZ},
+                {task.site.getX() - 1, midZ}, {task.site.getX() + task.footprintX, midZ},
+                {task.site.getX() - 1, task.site.getZ() - 1},
+                {task.site.getX() + task.footprintX, task.site.getZ() - 1},
+                {task.site.getX() - 1, task.site.getZ() + task.footprintZ},
+                {task.site.getX() + task.footprintX, task.site.getZ() + task.footprintZ},
+                {midX, task.site.getZ() - 2}, {midX, task.site.getZ() + task.footprintZ + 1},
+                {task.site.getX() - 2, midZ}, {task.site.getX() + task.footprintX + 1, midZ},
+                {task.site.getX() - 2, task.site.getZ() - 2},
+                {task.site.getX() + task.footprintX + 1, task.site.getZ() - 2},
+                {task.site.getX() - 2, task.site.getZ() + task.footprintZ + 1},
+                {task.site.getX() + task.footprintX + 1, task.site.getZ() + task.footprintZ + 1}
         };
-
-        for (int[] offset : offsets) {
-            int x = workBlock.getX() + offset[0];
-            int z = workBlock.getZ() + offset[1];
-            int groundY = findSurfaceY(world, x, z);
-            if (groundY == Integer.MIN_VALUE) {
-                continue;
-            }
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int[] probe : probes) {
+            int x = probe[0];
+            int z = probe[1];
+            int groundY = findSurfaceYFast(world, x, z, 24);
+            if (groundY == Integer.MIN_VALUE) continue;
             BlockPos stand = new BlockPos(x, groundY + 1, z);
-            if (!world.getBlockState(stand).isAir() || !world.getBlockState(stand.up()).isAir()) {
-                continue;
-            }
-            if (!world.getBlockState(stand.down()).isSolidBlock(world, stand.down())) {
-                continue;
-            }
-
-            double distance = villager.squaredDistanceTo(stand.getX() + 0.5D, stand.getY(), stand.getZ() + 0.5D);
+            BlockPos floor = stand.down();
+            if (task.rejectedLevelWorkStands.contains(stand.asLong())
+                    || !isLoaded(world, stand) || !isLoaded(world, stand.up())
+                    || !world.getBlockState(stand).isAir() || !world.getBlockState(stand.up()).isAir()
+                    || !world.getBlockState(floor).isSolidBlock(world, floor)
+                    || !world.getFluidState(stand).isEmpty()) continue;
+            double distance = villager.squaredDistanceTo(x + 0.5D, stand.getY(), z + 0.5D);
             if (distance < bestDistance) {
                 bestDistance = distance;
                 best = stand;
@@ -1544,46 +1801,40 @@ public final class VillageBuilderController {
     }
 
     private static void tickClearPath(ServerWorld world, VillagerEntity villager, BuilderTask task) {
-        while (task.treeIndex < task.treeTargets.size()
-                && !(task.currentTreeBase != null && task.currentTreeBase.equals(task.treeTargets.get(task.treeIndex)))
-                && !isNaturalTreeRoot(world, task.treeTargets.get(task.treeIndex))) {
-            task.treeIndex++;
-        }
-        if (task.treeIndex >= task.treeTargets.size()) {
-            villager.getNavigation().stop();
-            task.stage = Stage.LEVEL_SITE;
-            task.moveTarget = null;
-            task.requestedMoveTarget = null;
-            return;
-        }
-        BlockPos treeBase = task.treeTargets.get(task.treeIndex);
-        if (tickCutTree(world, villager, task, treeBase)) {
-            task.wood = countInventoryItems(villager, ItemTags.LOGS);
-            task.treeIndex++;
-            task.moveTarget = null;
-            task.requestedMoveTarget = null;
-        }
+        // Compatibility guard for snapshots created before 1.4.1. Never clear the
+        // whole future road ahead of the house: that route can be many blocks long.
+        // The house is built first; tickBuildPath handles each actual road obstacle.
+        task.treeTargets.clear();
+        task.treeIndex = 0;
+        villager.getNavigation().stop();
+        task.stage = Stage.LEVEL_SITE;
+        task.moveTarget = null;
+        task.requestedMoveTarget = null;
     }
 
-    /** Breaks only the connected logs of one confirmed natural tree. Leaves decay naturally. */
+    /** Breaks only the connected logs of one confirmed natural tree. Leaves decay naturally.
+     * The connected-log discovery is incremental: at most 32 queue nodes are examined
+     * per controller slice, so a huge modded tree cannot monopolize the server thread. */
     private static boolean tickCutTree(ServerWorld world, VillagerEntity villager, BuilderTask task, BlockPos base) {
+        return tickCutTree(world, villager, task, base, false);
+    }
+
+    private static boolean tickCutTree(ServerWorld world, VillagerEntity villager, BuilderTask task,
+                                       BlockPos base, boolean rootPrevalidated) {
         BlockPos naturalRoot;
         if (task.currentTreeBase != null && task.currentTreeBase.equals(base)) {
-            // The root itself may already have been broken. Continue the persisted tree worklist.
             naturalRoot = task.currentTreeBase;
+        } else if (rootPrevalidated) {
+            naturalRoot = base;
         } else {
+            if (!acquireSpatialSearchPermit(world)) return false;
             naturalRoot = findNaturalTreeRoot(world, base);
-            if (naturalRoot == null || isProtectedByNearbyBuilding(world, naturalRoot)) {
+            if (naturalRoot == null) {
                 clearBreakingProgress(world, villager, task);
-                return true; // Never fell a structure or an isolated decorative log.
+                return true;
             }
         }
         base = naturalRoot;
-        // Retry pickup while processing this tree. If the inventory was temporarily full,
-        // later block drops can still be collected after space becomes available.
-        collectDrops(world, villager, base, ItemTags.LOGS);
-        collectDrops(world, villager, base, ItemTags.SAPLINGS);
-        final BlockPos treeOrigin = base;
         if (task.currentTreeBase == null || !task.currentTreeBase.equals(base)) {
             clearBreakingProgress(world, villager, task);
             task.currentTreeBase = base.toImmutable();
@@ -1593,12 +1844,26 @@ public final class VillageBuilderController {
             task.currentTreeLogIndex = 0;
             task.currentTreeLeafIndex = 0;
             task.currentTreeLeavesScanned = false;
-            ArrayDeque<BlockPos> queue = new ArrayDeque<>();
-            Set<BlockPos> visited = new HashSet<>();
-            queue.add(base);
-            visited.add(base);
-            while (!queue.isEmpty() && task.currentTreeLogs.size() < 512) {
-                BlockPos current = queue.removeFirst();
+            task.currentTreeScanComplete = false;
+            task.currentTreeScanQueue.clear();
+            task.currentTreeScanVisited.clear();
+            task.currentTreeScanQueue.add(base.toImmutable());
+            task.currentTreeScanVisited.add(base.asLong());
+        } else if (!task.currentTreeScanComplete && task.currentTreeScanQueue.isEmpty()
+                && task.currentTreeScanVisited.isEmpty()) {
+            // The BFS queue is transient. If a save/reload happened during discovery,
+            // restart this bounded scan from the remembered root instead of guessing.
+            task.currentTreeLogs.clear();
+            task.currentTreeLogIndex = 0;
+            task.currentTreeScanQueue.add(base.toImmutable());
+            task.currentTreeScanVisited.add(base.asLong());
+        }
+
+        if (!task.currentTreeScanComplete) {
+            int scanBudget = 32;
+            while (scanBudget-- > 0 && !task.currentTreeScanQueue.isEmpty()
+                    && task.currentTreeLogs.size() < 512) {
+                BlockPos current = task.currentTreeScanQueue.removeFirst();
                 if (!isLoaded(world, current) || !world.getBlockState(current).isIn(BlockTags.LOGS)) continue;
                 task.currentTreeLogs.add(current.toImmutable());
                 for (int dx = -1; dx <= 1; dx++) {
@@ -1609,41 +1874,73 @@ public final class VillageBuilderController {
                             if (Math.abs(neighbor.getX() - base.getX()) > 6
                                     || Math.abs(neighbor.getZ() - base.getZ()) > 6
                                     || neighbor.getY() < base.getY() || neighbor.getY() - base.getY() > 32) continue;
-                            // Once the root is verified as a natural tree, follow every
-                            // connected log in the bounded tree volume. Requiring leaves
-                            // next to each log truncated tall trunks before reaching the canopy.
-                            if (visited.add(neighbor) && isLoaded(world, neighbor)
-                                    && world.getBlockState(neighbor).isIn(BlockTags.LOGS)) queue.addLast(neighbor);
+                            long key = neighbor.asLong();
+                            if (task.currentTreeScanVisited.add(key) && isLoaded(world, neighbor)
+                                    && world.getBlockState(neighbor).isIn(BlockTags.LOGS)) {
+                                task.currentTreeScanQueue.addLast(neighbor);
+                            }
                         }
                     }
                 }
             }
-            task.currentTreeLogs.sort(Comparator.comparingInt(BlockPos::getY)
-                    .thenComparingDouble(pos -> pos.getSquaredDistance(treeOrigin)));
+            if (task.currentTreeScanQueue.isEmpty() || task.currentTreeLogs.size() >= 512) {
+                task.currentTreeScanComplete = true;
+                final BlockPos completedTreeOrigin = base;
+                task.currentTreeLogs.sort(Comparator.comparingInt(BlockPos::getY)
+                        .thenComparingDouble(pos -> pos.getSquaredDistance(completedTreeOrigin)));
+                task.currentTreeScanQueue.clear();
+                task.currentTreeScanVisited.clear();
+            } else {
+                return false; // Yield to vanilla AI and other builders.
+            }
         }
 
         while (task.currentTreeLogIndex < task.currentTreeLogs.size()) {
             BlockPos log = task.currentTreeLogs.get(task.currentTreeLogIndex);
             if (!world.getBlockState(log).isIn(BlockTags.LOGS)) {
                 task.currentTreeLogIndex++;
+                task.currentTreeStandTarget = null;
+                task.currentTreeStandPosition = null;
+                task.currentTreeStandChecked = false;
                 continue;
             }
-            BlockPos stand = findStandingPosition(world, log, villager);
-            if (stand == null) stand = findStandingPosition(world, base, villager);
-            if (stand == null || !moveNear(villager, task, stand, VillageExpansionConfig.navigationSpeed)) return false;
+            if (task.currentTreeStandTarget == null || !task.currentTreeStandTarget.equals(log)
+                    || task.currentTreeStandChecked && task.currentTreeStandPosition == null) {
+                task.currentTreeStandTarget = log.toImmutable();
+                task.currentTreeStandPosition = findStandingPosition(world, log, villager);
+                if (task.currentTreeStandPosition == null) {
+                    task.currentTreeStandPosition = findStandingPosition(world, base, villager);
+                }
+                task.currentTreeStandChecked = true;
+            }
+            BlockPos stand = task.currentTreeStandPosition;
+            if (stand == null || task.failedNavigationTarget != null && task.failedNavigationTarget.equals(stand)) {
+                // One inaccessible log must not strand the complete house project.
+                // Skip only this log after adjacent/radius-two standing positions fail.
+                task.currentTreeLogIndex++;
+                task.currentTreeStandTarget = null;
+                task.currentTreeStandPosition = null;
+                task.currentTreeStandChecked = false;
+                task.failedNavigationTarget = null;
+                task.requestedMoveTarget = null;
+                clearBreakingProgress(world, villager, task);
+                VillageExpansionMod.LOGGER.warn("Builder {} skipped an unreachable tree log at {} and will continue clearing the plot",
+                        uuidShort(villager.getUuid()), log);
+                return false;
+            }
+            if (!moveNear(villager, task, stand, VillageExpansionConfig.navigationSpeed, true)) return false;
             equipBestTool(villager, ToolKind.AXE);
             if (!tickBreakBlock(world, villager, task, log, ToolKind.AXE, ItemTags.LOGS)) return false;
             task.currentTreeLogIndex++;
+            task.currentTreeStandTarget = null;
+            task.currentTreeStandPosition = null;
+            task.currentTreeStandChecked = false;
             task.wood = countInventoryItems(villager, ItemTags.LOGS);
             return false;
         }
 
-        // Do not break leaves. Vanilla leaf decay will generate sapling drops
-        // naturally after the connected logs have been removed.
         task.saplingSearchOrigin = base.toImmutable();
-        collectDrops(world, villager, base, ItemTags.LOGS);
-        // Saplings may drop several seconds after the tree is felled. The
-        // periodic sapling pass in tickTask will collect and replant them.
+        task.nextSaplingCheckAt = world.getTime() + 100L;
         task.currentTreeBase = null;
         task.currentTreeLogItem = null;
         task.currentTreeLogs.clear();
@@ -1651,34 +1948,44 @@ public final class VillageBuilderController {
         task.currentTreeLogIndex = 0;
         task.currentTreeLeafIndex = 0;
         task.currentTreeLeavesScanned = false;
+        task.currentTreeScanComplete = false;
+        task.currentTreeScanQueue.clear();
+        task.currentTreeScanVisited.clear();
+        task.currentTreeStandTarget = null;
+        task.currentTreeStandPosition = null;
+        task.currentTreeStandChecked = false;
         clearBreakingProgress(world, villager, task);
         task.wood = countInventoryItems(villager, ItemTags.LOGS);
         return true;
     }
 
-    private static void replantSaplings(ServerWorld world, VillagerEntity villager, BuilderTask task, BlockPos origin) {
-        if (!VillageExpansionConfig.replantSaplings) return;
+    private static boolean replantSaplings(ServerWorld world, VillagerEntity villager, BuilderTask task, BlockPos origin) {
+        if (!VillageExpansionConfig.replantSaplings) return true;
+        if (!acquireSpatialSearchPermit(world)) return false;
 
-        // First replant saplings already collected into the worker inventory.
-        for (int slot = 0; slot < villager.getInventory().size(); slot++) {
+        // Plant at most one sapling per pass. The next sapling is handled by a later
+        // throttled pass; this prevents stacks of drops from starting dozens of searches.
+        int plantingBudget = 1;
+        for (int slot = 0; slot < villager.getInventory().size() && plantingBudget > 0; slot++) {
             ItemStack stack = villager.getInventory().getStack(slot);
             if (stack.isEmpty() || !stack.isIn(ItemTags.SAPLINGS)) continue;
             Block saplingBlock = getSaplingBlock(stack.getItem());
             if (saplingBlock == Blocks.AIR) continue;
-            while (!stack.isEmpty()) {
+            while (!stack.isEmpty() && plantingBudget > 0) {
                 BlockPos plantingSpot = findSaplingPlantingSpot(world, task, origin, saplingBlock);
                 if (plantingSpot == null || !world.setBlockState(plantingSpot,
                         saplingBlock.getDefaultState(), Block.NOTIFY_ALL)) break;
                 stack.decrement(1);
+                plantingBudget--;
                 villager.getInventory().markDirty();
                 world.playSound(null, plantingSpot, SoundEvents.BLOCK_GRASS_PLACE,
                         SoundCategory.BLOCKS, 0.35F, 1.1F);
             }
         }
+        if (plantingBudget <= 0) return true;
 
         // If the Villager's eight inventory slots were full when a leaf dropped a
-        // sapling, plant nearby sapling item entities directly instead of leaving
-        // them permanently on the ground.
+        // sapling, plant one nearby sapling item entity instead of leaving it on the ground.
         int radius = VillageExpansionConfig.saplingPlantRadius;
         Box dropArea = new Box(origin.getX() - radius, origin.getY() - 16.0D, origin.getZ() - radius,
                 origin.getX() + radius + 1.0D, origin.getY() + 18.0D, origin.getZ() + radius + 1.0D);
@@ -1688,18 +1995,21 @@ public final class VillageBuilderController {
             Block saplingBlock = getSaplingBlock(stack.getItem());
             if (saplingBlock == Blocks.AIR) continue;
             boolean plantedAny = false;
-            while (!stack.isEmpty()) {
+            while (!stack.isEmpty() && plantingBudget > 0) {
                 BlockPos plantingSpot = findSaplingPlantingSpot(world, task, origin, saplingBlock);
                 if (plantingSpot == null || !world.setBlockState(plantingSpot,
                         saplingBlock.getDefaultState(), Block.NOTIFY_ALL)) break;
                 stack.decrement(1);
+                plantingBudget--;
                 plantedAny = true;
                 world.playSound(null, plantingSpot, SoundEvents.BLOCK_GRASS_PLACE,
                         SoundCategory.BLOCKS, 0.35F, 1.1F);
             }
             if (stack.isEmpty()) entity.discard();
             else if (plantedAny) entity.setStack(stack);
+            if (plantingBudget <= 0) break;
         }
+        return true;
     }
 
     private static Block getSaplingBlock(Item saplingItem) {
@@ -1707,56 +2017,59 @@ public final class VillageBuilderController {
         return block != Blocks.AIR && block.asItem().equals(saplingItem) ? block : Blocks.AIR;
     }
 
+    /**
+     * Finds one planting position using a fixed sample budget. The previous implementation
+     * scanned a 65x65 grid twice and repeatedly searched the height of every column;
+     * 20 builders could therefore issue tens of thousands of block reads at once.
+     */
     private static BlockPos findSaplingPlantingSpot(ServerWorld world, BuilderTask task,
                                                     BlockPos origin, Block saplingBlock) {
         int radius = VillageExpansionConfig.saplingPlantRadius;
-        List<BlockPos> candidates = new ArrayList<>();
-        List<BlockPos> existingSaplings = new ArrayList<>();
-        int scanRadius = radius + VillageExpansionConfig.saplingMinimumSpacing;
-        for (int sx = -scanRadius; sx <= scanRadius; sx++) {
-            for (int sz = -scanRadius; sz <= scanRadius; sz++) {
-                int x = origin.getX() + sx;
-                int z = origin.getZ() + sz;
-                int surfaceY = findSurfaceY(world, x, z);
-                if (surfaceY == Integer.MIN_VALUE) continue;
-                for (int sy = -3; sy <= 5; sy++) {
-                    BlockPos check = new BlockPos(x, surfaceY + sy, z);
-                    if (isLoaded(world, check) && world.getBlockState(check).isIn(BlockTags.SAPLINGS)) {
-                        existingSaplings.add(check.toImmutable());
-                    }
+        int spacing = VillageExpansionConfig.saplingMinimumSpacing;
+        int attempts = 12;
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            int x = origin.getX() + world.random.nextInt(radius * 2 + 1) - radius;
+            int z = origin.getZ() + world.random.nextInt(radius * 2 + 1) - radius;
+            int groundY = findSurfaceYFast(world, x, z, 16);
+            if (groundY == Integer.MIN_VALUE) continue;
+            BlockPos ground = new BlockPos(x, groundY, z);
+            BlockPos plantPos = ground.up();
+            BlockState groundState = world.getBlockState(ground);
+            if (!(groundState.isIn(BlockTags.DIRT) || groundState.isOf(Blocks.GRASS_BLOCK)
+                    || groundState.isOf(Blocks.PODZOL) || groundState.isOf(Blocks.COARSE_DIRT))
+                    || !isLoaded(world, plantPos) || !world.getBlockState(plantPos).isAir()
+                    || world.getLightLevel(plantPos) < 8
+                    || !saplingBlock.getDefaultState().canPlaceAt(world, plantPos)) continue;
+            if (x >= task.site.getX() - 2 && x < task.site.getX() + task.footprintX + 2
+                    && z >= task.site.getZ() - 2 && z < task.site.getZ() + task.footprintZ + 2) continue;
+
+            boolean nearPath = false;
+            for (BlockPos path : task.pathBlocks) {
+                if (Math.abs(path.getX() - x) <= 1 && Math.abs(path.getZ() - z) <= 1) {
+                    nearPath = true;
+                    break;
                 }
             }
-        }
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                int x = origin.getX() + dx;
-                int z = origin.getZ() + dz;
-                int groundY = findSurfaceY(world, x, z);
-                if (groundY == Integer.MIN_VALUE) continue;
-                BlockPos ground = new BlockPos(x, groundY, z);
-                BlockPos plantPos = ground.up();
-                if (!isLoaded(world, plantPos) || !world.getBlockState(ground).isOf(Blocks.DIRT)
-                        && !world.getBlockState(ground).isOf(Blocks.GRASS_BLOCK)
-                        && !world.getBlockState(ground).isOf(Blocks.PODZOL)
-                        && !world.getBlockState(ground).isOf(Blocks.COARSE_DIRT)
-                        || !world.getBlockState(plantPos).isAir()
-                        || world.getLightLevel(plantPos) < 8
-                        || !saplingBlock.getDefaultState().canPlaceAt(world, plantPos)) continue;
-                if (x >= task.site.getX() - 2 && x < task.site.getX() + task.footprintX + 2
-                        && z >= task.site.getZ() - 2 && z < task.site.getZ() + task.footprintZ + 2) continue;
-                boolean nearPath = false;
-                for (BlockPos path : task.pathBlocks) {
-                    if (Math.abs(path.getX() - x) <= 1 && Math.abs(path.getZ() - z) <= 1) { nearPath = true; break; }
+            if (nearPath) continue;
+
+            // Check only eight perimeter samples for existing saplings. This is intentionally
+            // conservative and bounded; exact global spacing is less valuable than zero-cost scans.
+            boolean tooClose = false;
+            for (int[] offset : SAPLING_SPACING_OFFSETS) {
+                int sx = x + offset[0];
+                int sz = z + offset[1];
+                int saplingGroundY = findSurfaceYFast(world, sx, sz, 16);
+                if (saplingGroundY == Integer.MIN_VALUE) continue;
+                BlockPos possibleSapling = new BlockPos(sx, saplingGroundY + 1, sz);
+                if (isLoaded(world, possibleSapling)
+                        && world.getBlockState(possibleSapling).isIn(BlockTags.SAPLINGS)) {
+                    tooClose = true;
+                    break;
                 }
-                if (nearPath) continue;
-                boolean tooClose = false;
-                for (BlockPos other : existingSaplings) {
-                    if (other.getSquaredDistance(plantPos) < (double) VillageExpansionConfig.saplingMinimumSpacing * VillageExpansionConfig.saplingMinimumSpacing) { tooClose = true; break; }
-                }
-                if (!tooClose) candidates.add(plantPos.toImmutable());
             }
+            if (!tooClose) return plantPos.toImmutable();
         }
-        return candidates.isEmpty() ? null : candidates.get(world.random.nextInt(candidates.size()));
+        return null;
     }
 
     private enum ToolKind { AXE, PICKAXE, SHOVEL }
@@ -1854,8 +2167,9 @@ public final class VillageBuilderController {
             task.breakingDuration = Math.max(1, (int) Math.ceil(vanillaTicks * pacingScale));
             task.breakingTicks = 0;
         }
-        task.breakingTicks++;
-        if (task.breakingTicks % 5 == 0) villager.swingHand(Hand.MAIN_HAND);
+        task.breakingTicks = Math.min(task.breakingDuration,
+                task.breakingTicks + Math.max(1, task.elapsedControllerTicks));
+        if (task.breakingTicks % 5 < Math.max(1, task.elapsedControllerTicks)) villager.swingHand(Hand.MAIN_HAND);
         int progress = Math.min(9, (int) ((task.breakingTicks / (float) task.breakingDuration) * 10.0F));
         world.setBlockBreakingInfo(villager.getId(), pos, progress);
         if (task.breakingTicks < task.breakingDuration) return false;
@@ -1892,21 +2206,15 @@ public final class VillageBuilderController {
 
     private static void tickLevelSite(ServerWorld world, VillagerEntity villager, BuilderTask task) {
         if (!task.plotVegetationCleared) {
-            clearPlotVegetation(world, villager, task);
+            if (!clearPlotVegetation(world, villager, task)) return;
             task.plotVegetationCleared = true;
             task.moveTarget = null;
             task.requestedMoveTarget = null;
         }
 
-        while (task.plotTreeIndex < task.plotTreeTargets.size()
-                && !isNaturalTreeRoot(world, task.plotTreeTargets.get(task.plotTreeIndex))
-                && !(task.currentTreeBase != null
-                && task.currentTreeBase.equals(task.plotTreeTargets.get(task.plotTreeIndex)))) {
-            task.plotTreeIndex++;
-        }
         if (task.plotTreeIndex < task.plotTreeTargets.size()) {
             BlockPos treeBase = task.plotTreeTargets.get(task.plotTreeIndex);
-            if (tickCutTree(world, villager, task, treeBase)) {
+            if (tickCutTree(world, villager, task, treeBase, true)) {
                 task.plotTreeIndex++;
                 task.currentResource = null;
                 task.moveTarget = null;
@@ -1915,8 +2223,54 @@ public final class VillageBuilderController {
             return;
         }
 
-        BlockPos workStand = new BlockPos(task.site.getX(), task.site.getY() + 1, task.site.getZ());
-        if (!moveNear(villager, task, workStand, VillageExpansionConfig.navigationSpeed)) return;
+        // A naturally suitable footprint does not need a pointless trip to the
+        // northwest corner of the plot. Go directly to BUILD when no cut/fill work exists.
+        if (task.levelIndex >= task.levelOperations.size()) {
+            villager.getNavigation().stop();
+            task.moveTarget = null;
+            task.requestedMoveTarget = null;
+            task.stage = Stage.BUILD;
+            return;
+        }
+
+        if (task.levelWorkStand == null || !isValidPlotWorkStand(world, task.levelWorkStand)) {
+            task.levelWorkStand = findPlotWorkStand(world, task, villager);
+        }
+        if (task.levelWorkStand == null && task.levelIndex < task.levelOperations.size()) {
+            // If every perimeter point is obstructed, work from a safe cell beside
+            // the exact next cut/fill operation rather than abandoning a workable plot.
+            task.levelWorkStand = findStandingPosition(
+                    world, task.levelOperations.get(task.levelIndex).pos(), villager);
+        }
+        if (task.levelWorkStand == null) {
+            // Last local fallback: search around the footprint centre, not along the
+            // village road or in an expanding world-wide radius.
+            BlockPos plotCenter = new BlockPos(task.site.getX() + task.footprintX / 2,
+                    task.site.getY(), task.site.getZ() + task.footprintZ / 2);
+            task.levelWorkStand = findStandingPosition(world, plotCenter, villager);
+        }
+        if (task.levelWorkStand == null) {
+            task.levelStandSearchFailures++;
+            if (task.levelStandSearchFailures >= 3) {
+                // Last-resort graceful degradation: do not immobilize the builder.
+                // The placement stage still performs per-block obstruction checks.
+                VillageExpansionMod.LOGGER.warn("Builder {} could not find a safe leveling stand near {}; skipping remaining optional terrain adjustment",
+                        uuidShort(villager.getUuid()), task.site);
+                task.levelIndex = task.levelOperations.size();
+                task.stage = Stage.BUILD;
+            }
+            return;
+        }
+        if (!moveNear(villager, task, task.levelWorkStand, VillageExpansionConfig.navigationSpeed, true)) {
+            if (task.failedNavigationTarget != null && task.failedNavigationTarget.equals(task.levelWorkStand)) {
+                task.rejectedLevelWorkStands.add(task.levelWorkStand.asLong());
+                task.levelWorkStand = null;
+                task.failedNavigationTarget = null;
+                task.requestedMoveTarget = null;
+            }
+            return;
+        }
+        task.levelStandSearchFailures = 0;
 
         if (task.levelIndex < task.levelOperations.size()) {
             if (task.actionTimer > 0) {
@@ -1948,6 +2302,12 @@ public final class VillageBuilderController {
                 task.dirt = countInventoryItems(villager, ItemTags.DIRT);
                 task.stone = countInventoryItems(villager, ItemTags.STONE_TOOL_MATERIALS);
             } else if (!current.isAir()) {
+                // A player/modded block may have appeared after site selection. Never
+                // turn a terrain-preparation operation into permission to demolish it.
+                if (current.hasBlockEntity() || !isTerrain(current)) {
+                    task.actionTimer = VillageExpansionConfig.buildBlockDelayTicks;
+                    return;
+                }
                 ToolKind kind = current.isIn(BlockTags.BASE_STONE_OVERWORLD) ? ToolKind.PICKAXE : ToolKind.SHOVEL;
                 equipBestTool(villager, kind);
                 TagKey<Item> drops = current.isIn(BlockTags.BASE_STONE_OVERWORLD) ? ItemTags.STONE_TOOL_MATERIALS : ItemTags.DIRT;
@@ -2027,7 +2387,24 @@ public final class VillageBuilderController {
                 BlockPos treeBase = findNaturalTreeRoot(world, above);
                 if (treeBase != null) {
                     BlockPos treeStand = findStandingPosition(world, treeBase, villager);
-                    if (treeStand == null || !moveNear(villager, task, treeStand, VillageExpansionConfig.navigationSpeed)) return;
+                    if (treeStand == null) {
+                        // Keep the road task moving when a natural tree cannot be
+                        // approached safely; do not wander away from the house forever.
+                        task.pathIndex++;
+                        task.moveTarget = null;
+                        task.requestedMoveTarget = null;
+                        task.failedNavigationTarget = null;
+                        return;
+                    }
+                    if (!moveNear(villager, task, treeStand, VillageExpansionConfig.navigationSpeed, true)) {
+                        if (treeStand.equals(task.failedNavigationTarget)) {
+                            task.pathIndex++;
+                            task.failedNavigationTarget = null;
+                            task.moveTarget = null;
+                            task.requestedMoveTarget = null;
+                        }
+                        return;
+                    }
                     if (tickCutTree(world, villager, task, treeBase)) {
                         task.wood = countInventoryItems(villager, ItemTags.LOGS);
                         task.moveTarget = null;
@@ -2089,43 +2466,60 @@ public final class VillageBuilderController {
         return false;
     }
 
-    private static void clearPlotVegetation(ServerWorld world, VillagerEntity villager, BuilderTask task) {
+    /**
+     * Incrementally discovers trees and clears only plants inside the actual footprint.
+     * Four X/Z columns or 32 plant cells are processed per task slice, and cursors are
+     * persisted so saving/reloading does not restart the scan.
+     */
+    private static boolean clearPlotVegetation(ServerWorld world, VillagerEntity villager, BuilderTask task) {
         BlockPos site = task.site;
-        Set<BlockPos> roots = new HashSet<>();
-        // Include trees rooted just outside the footprint whose leaves extend over the house.
-        for (int x = site.getX() - 4; x < site.getX() + task.footprintX + 4; x++) {
-            for (int z = site.getZ() - 4; z < site.getZ() + task.footprintZ + 4; z++) {
-                int groundY = findSurfaceY(world, x, z);
-                if (groundY == Integer.MIN_VALUE) continue;
-                BlockPos root = new BlockPos(x, groundY + 1, z);
-                if (isNaturalTreeRoot(world, root) && !isProtectedByNearbyBuilding(world, root)
-                        && treeCanopyOverlapsPlot(world, root, task)) roots.add(root.toImmutable());
-            }
-        }
-        task.plotTreeTargets.clear();
-        task.plotTreeTargets.addAll(roots);
-        task.plotTreeTargets.sort(Comparator.comparingDouble(pos -> pos.getSquaredDistance(site)));
-        task.plotTreeIndex = 0;
+        int treeWidth = task.footprintX + 8;
+        int treeDepth = task.footprintZ + 8;
+        int treeColumns = treeWidth * treeDepth;
 
-        for (int x = site.getX(); x < site.getX() + task.footprintX; x++) {
-            for (int z = site.getZ(); z < site.getZ() + task.footprintZ; z++) {
-                for (int y = site.getY() + 1; y <= site.getY() + 10; y++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    BlockState state = world.getBlockState(pos);
-                    // Never destroy wood here. Confirmed trees are queued above and harvested
-                    // one block at a time by tickCutTree, including their connected trunk logs.
-                    if (state.isIn(BlockTags.LOGS)) continue;
-                    if (state.isIn(BlockTags.LEAVES)) {
-                        // Never harvest leaves. They are left in place to decay naturally
-                        // after the trunk is felled; sapling drops are collected later.
-                        continue;
-                    } else if (isPlant(state)) {
-                        if (world.breakBlock(pos, true, villager)) collectDrops(world, villager, pos, null);
-                    }
+        if (!task.plotTreeScanComplete) {
+            if (task.plotTreeScanCursor == 0) task.plotTreeTargets.clear();
+            int budget = 16;
+            while (budget-- > 0 && task.plotTreeScanCursor < treeColumns) {
+                int index = task.plotTreeScanCursor++;
+                int x = site.getX() - 4 + index / treeDepth;
+                int z = site.getZ() - 4 + index % treeDepth;
+                int groundY = findSurfaceYFast(world, x, z, 24);
+                if (groundY == Integer.MIN_VALUE) continue;
+                BlockPos possibleRoot = new BlockPos(x, groundY + 1, z);
+                if (!world.getBlockState(possibleRoot).isIn(BlockTags.LOGS)) continue;
+                BlockPos root = findNaturalTreeRoot(world, possibleRoot);
+                if (root != null && treeCanopyOverlapsPlot(world, root, task)
+                        && !task.plotTreeTargets.contains(root)) {
+                    task.plotTreeTargets.add(root.toImmutable());
                 }
             }
+            if (task.plotTreeScanCursor < treeColumns) return false;
+            task.plotTreeTargets.sort(Comparator.comparingDouble(pos -> pos.getSquaredDistance(site)));
+            task.plotTreeIndex = 0;
+            task.plotTreeScanComplete = true;
+            return false; // Separate tree-discovery and plant-clear phases.
         }
-        if (task.saplingSearchOrigin != null) replantSaplings(world, villager, task, task.saplingSearchOrigin);
+
+        int plantColumns = task.footprintX * task.footprintZ;
+        int totalPlantCells = plantColumns * 10;
+        int plantBudget = 32;
+        while (plantBudget-- > 0 && task.plotPlantScanCursor < totalPlantCells) {
+            int index = task.plotPlantScanCursor++;
+            int column = index / 10;
+            int yOffset = index % 10;
+            int x = site.getX() + column / task.footprintZ;
+            int z = site.getZ() + column % task.footprintZ;
+            BlockPos pos = new BlockPos(x, site.getY() + 1 + yOffset, z);
+            BlockState state = world.getBlockState(pos);
+            if (state.isIn(BlockTags.LOGS) || state.isIn(BlockTags.LEAVES)) continue;
+            if (isPlant(state)) {
+                // These are optional weeds/flowers in a house footprint, not resources
+                // reserved for crafting. Remove without loot to avoid item-entity spam.
+                world.breakBlock(pos, false, villager);
+            }
+        }
+        return task.plotPlantScanCursor >= totalPlantCells;
     }
 
     private static void tickGatherDirt(ServerWorld world, VillagerEntity villager, BuilderTask task) {
@@ -2143,6 +2537,7 @@ public final class VillageBuilderController {
         int dirtSearchRadius = expandedSearchRadius(Math.max(16, VillageExpansionConfig.woodSearchRadius / 2),
                 task.resourceSearchFailures);
         if (target == null || !world.getBlockState(target.block()).isIn(BlockTags.DIRT)) {
+            if (!acquireSpatialSearchPermit(world)) return;
             target = findDirtTarget(world, task.site, villager, dirtSearchRadius);
             task.currentResource = target;
             task.moveTarget = null;
@@ -2197,20 +2592,25 @@ public final class VillageBuilderController {
                                                  int radius) {
         ResourceTarget best = null;
         double bestDistance = Double.MAX_VALUE;
-        for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
-            for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
-                int surfaceY = findSurfaceY(world, x, z);
-                if (surfaceY == Integer.MIN_VALUE) continue;
-                BlockPos block = new BlockPos(x, surfaceY, z);
-                if (!isLoaded(world, block) || !world.getBlockState(block).isIn(BlockTags.DIRT)
-                        || world.getBlockState(block).hasBlockEntity()) continue;
-                BlockPos stand = findStandingPosition(world, block, villager);
-                if (stand == null) continue;
-                double distance = block.getSquaredDistance(villager.getBlockPos());
-                if (distance < bestDistance) {
-                    bestDistance = distance;
-                    best = new ResourceTarget(block.toImmutable(), stand);
-                }
+        // Bounded random sampling: at most 48 columns, instead of scanning the full square.
+        // Repeated searches expand the radius, so sparse biomes remain discoverable over time.
+        int samples = 48;
+        int diameter = radius * 2 + 1;
+        for (int i = 0; i < samples; i++) {
+            int x = around.getX() + world.random.nextInt(diameter) - radius;
+            int z = around.getZ() + world.random.nextInt(diameter) - radius;
+            int surfaceY = findSurfaceYFast(world, x, z, 16);
+            if (surfaceY == Integer.MIN_VALUE) continue;
+            BlockPos block = new BlockPos(x, surfaceY, z);
+            if (!isLoaded(world, block)) continue;
+            BlockState state = world.getBlockState(block);
+            if (!state.isIn(BlockTags.DIRT) || state.hasBlockEntity()) continue;
+            BlockPos stand = findStandingPosition(world, block, villager);
+            if (stand == null) continue;
+            double distance = block.getSquaredDistance(villager.getBlockPos());
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = new ResourceTarget(block.toImmutable(), stand);
             }
         }
         return best;
@@ -2231,6 +2631,7 @@ public final class VillageBuilderController {
             if (world.getTime() < task.nextResourceSearch) {
                 return;
             }
+            if (!acquireSpatialSearchPermit(world)) return;
             ResourceTarget target = findWoodTarget(world, task.site, villager,
                     expandedSearchRadius(VillageExpansionConfig.woodSearchRadius, task.resourceSearchFailures));
             if (target == null) {
@@ -2298,21 +2699,27 @@ public final class VillageBuilderController {
                                                  Item requiredLog, int radius) {
         ResourceTarget best = null;
         double bestDistance = Double.MAX_VALUE;
-        for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
-            for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
-                int groundY = findSurfaceY(world, x, z);
-                if (groundY == Integer.MIN_VALUE) continue;
-                BlockPos root = new BlockPos(x, groundY + 1, z);
-                if (!isNaturalTreeRoot(world, root) || isProtectedByNearbyBuilding(world, root)) continue;
-                if (requiredLog != null && !world.getBlockState(root).getBlock().asItem().equals(requiredLog)) continue;
-                if (isWoodTargetReserved(world, root, villager.getUuid())) continue;
-                BlockPos stand = findStandingPosition(world, root, villager);
-                if (stand == null) continue;
-                double distance = root.getSquaredDistance(villager.getBlockPos());
-                if (distance < bestDistance) {
-                    bestDistance = distance;
-                    best = new ResourceTarget(root.toImmutable(), stand);
-                }
+        // Natural-tree detection is relatively expensive. Cap root candidates and let
+        // later, radius-expanded searches discover sparse forests without one huge scan.
+        int samples = 24;
+        int diameter = radius * 2 + 1;
+        for (int i = 0; i < samples; i++) {
+            int x = around.getX() + world.random.nextInt(diameter) - radius;
+            int z = around.getZ() + world.random.nextInt(diameter) - radius;
+            int groundY = findSurfaceYFast(world, x, z, 24);
+            if (groundY == Integer.MIN_VALUE) continue;
+            BlockPos possibleRoot = new BlockPos(x, groundY + 1, z);
+            if (!isLoaded(world, possibleRoot)) continue;
+            BlockPos root = findNaturalTreeRoot(world, possibleRoot);
+            if (root == null) continue; // Includes protected-building validation.
+            if (requiredLog != null && !world.getBlockState(root).getBlock().asItem().equals(requiredLog)) continue;
+            if (isWoodTargetReserved(world, root, villager.getUuid())) continue;
+            BlockPos stand = findStandingPosition(world, root, villager);
+            if (stand == null) continue;
+            double distance = root.getSquaredDistance(villager.getBlockPos());
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = new ResourceTarget(root.toImmutable(), stand);
             }
         }
         return best;
@@ -2350,6 +2757,7 @@ public final class VillageBuilderController {
             BlockPos searchFrom = task.quarryCenter != null ? task.quarryCenter
                     : (task.mineFace == null ? task.site : task.mineFace);
             int caveRadius = task.quarryCenter != null ? 5 : expandedStoneSearchRadius(task.stoneSearchFailures);
+            if (!acquireSpatialSearchPermit(world)) return;
             MiningTarget exposed = exactStoneRequest
                     ? findExposedCaveStone(world, searchFrom, villager, task.pendingMaterialItem, caveRadius)
                     : findExposedCaveStone(world, searchFrom, villager, caveRadius);
@@ -2438,18 +2846,20 @@ public final class VillageBuilderController {
 
     private static MiningTarget findExposedCaveStone(ServerWorld world, BlockPos around, VillagerEntity villager,
                                                      Item wantedDrop, int radius) {
-        int verticalDepth = wantedDrop == Items.COAL
-                ? Math.max(64, VillageExpansionConfig.caveSearchDepth)
-                : VillageExpansionConfig.caveSearchDepth;
+        // Broad cave discovery is a fallback, not a reason to scan a huge 3D
+        // volume synchronously. Only a small grid is sampled; if no source is found,
+        // the worker continues its structured mine and checks newly exposed faces.
+        int effectiveRadius = Math.min(radius, 6);
+        int verticalDepth = Math.min(VillageExpansionConfig.caveSearchDepth,
+                wantedDrop == Items.COAL ? 12 : 8);
         int minY = Math.max(world.getBottomY() + 2, around.getY() - verticalDepth);
-        // Coal can be exposed on mountain faces well above the villager's Y level.
-        // Search upward as well as downward for coal-specific requests.
-        int upwardRange = wantedDrop == Items.COAL ? Math.max(48, verticalDepth) : 4;
+        int upwardRange = wantedDrop == Items.COAL ? 6 : 2;
         int maxY = Math.min(world.getTopY() - 3, around.getY() + upwardRange);
+        int sampleStep = 6;
         MiningTarget best = null;
         double bestDistance = Double.MAX_VALUE;
-        for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
-            for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
+        for (int x = around.getX() - effectiveRadius; x <= around.getX() + effectiveRadius; x += sampleStep) {
+            for (int z = around.getZ() - effectiveRadius; z <= around.getZ() + effectiveRadius; z += sampleStep) {
                 if (!world.isChunkLoaded(new ChunkPos(x >> 4, z >> 4).toLong())) continue;
                 for (int y = minY; y <= maxY; y++) {
                     BlockPos stand = new BlockPos(x, y, z);
@@ -2483,7 +2893,8 @@ public final class VillageBuilderController {
     /** Filters open-air cliffs and surface ledges: a candidate must have a rock ceiling and at least one side wall. */
     private static boolean isCaveLikeAirCell(ServerWorld world, BlockPos stand) {
         boolean hasCeiling = false;
-        for (int dy = 2; dy <= 10; dy++) {
+        // Four fixed probes are enough to distinguish covered cave cells from open cliffs.
+        for (int dy : CAVE_ROOF_PROBES) {
             BlockPos above = stand.up(dy);
             if (!isLoaded(world, above)) return false;
             BlockState state = world.getBlockState(above);
@@ -2543,6 +2954,7 @@ public final class VillageBuilderController {
                     .min(Comparator.comparingDouble(pos -> pos.getSquaredDistance(villager.getBlockPos())))
                     .orElse(null);
             if (entrance == null) {
+                if (!acquireSpatialSearchPermit(world)) return;
                 entrance = findMineEntrance(world, task.site, villageCenter,
                         village == null ? List.of() : village.mines(),
                         expandedSearchRadius(Math.max(36, VillageExpansionConfig.caveSearchRadius),
@@ -2630,7 +3042,7 @@ public final class VillageBuilderController {
         boolean exactRequest = task.resumeStage == Stage.GATHER_MATERIAL && task.pendingMaterialItem != null;
         if (exactRequest) {
             MiningTarget vein = findRequestedMaterialAlongMine(world, task.mineFace,
-                    villager, task.pendingMaterialItem, 3);
+                    villager, task.pendingMaterialItem, 2);
             if (vein != null) {
                 task.currentMine = vein;
                 task.stage = Stage.GATHER_STONE;
@@ -2734,16 +3146,15 @@ public final class VillageBuilderController {
         int minimumDistance = VillageExpansionConfig.mineMinimumDistanceFromVillage;
         int searchLimit = Math.max(minimumDistance, maxRadius);
         long minimumDistanceSquared = (long) minimumDistance * minimumDistance;
-        for (int radius = minimumDistance; radius <= searchLimit; radius += 4) {
-            for (int i = 0; i < 32; i++) {
-                double angle = i * (Math.PI * 2.0D / 32.0D);
+        // Keep the spiral sparse: 8 directions per ring, each surface check bounded.
+        for (int radius = minimumDistance; radius <= searchLimit; radius += 12) {
+            for (int i = 0; i < 8; i++) {
+                double angle = i * (Math.PI * 2.0D / 8.0D);
                 int x = villageCenter.getX() + (int) Math.round(Math.cos(angle) * radius);
                 int z = villageCenter.getZ() + (int) Math.round(Math.sin(angle) * radius);
-                int y = findSurfaceY(world, x, z);
+                int y = findSurfaceYFast(world, x, z, 16);
                 if (y == Integer.MIN_VALUE) continue;
                 BlockPos ground = new BlockPos(x, y, z);
-                // Enforce the real horizontal distance, not merely the ring index
-                // (the trig samples are rounded to integer block coordinates).
                 if (horizontalDistanceSquared(ground, villageCenter) < minimumDistanceSquared) continue;
                 BlockPos feet = ground.up();
                 BlockPos head = feet.up();
@@ -2753,7 +3164,14 @@ public final class VillageBuilderController {
                         || !world.getFluidState(feet).isEmpty() || !world.getFluidState(head).isEmpty()) continue;
                 if (hasLivingEntityInBlock(world, feet, null) || hasLivingEntityInBlock(world, head, null)) continue;
                 if (Math.abs(y - site.getY()) > 6) continue;
-                if (knownMines.stream().anyMatch(mine -> mine.getSquaredDistance(ground) < 16.0D * 16.0D)) continue;
+                boolean tooCloseToKnownMine = false;
+                for (BlockPos mine : knownMines) {
+                    if (mine.getSquaredDistance(ground) < 16.0D * 16.0D) {
+                        tooCloseToKnownMine = true;
+                        break;
+                    }
+                }
+                if (tooCloseToKnownMine) continue;
                 if (requester != null && isMineReserved(world, ground, requester)) continue;
                 return ground.toImmutable();
             }
@@ -2794,6 +3212,7 @@ public final class VillageBuilderController {
                                               VillageExpansionState.VillageRecord village,
                                               BlockPos villageCenter) {
         List<BlockPos> known = village == null ? List.of() : village.mines();
+        if (!acquireSpatialSearchPermit(world)) return true; // Defer; keep the current tunnel state intact.
         BlockPos entrance = findMineEntrance(world, task.site, villageCenter, known,
                 expandedSearchRadius(Math.max(36, VillageExpansionConfig.caveSearchRadius),
                         task.resourceSearchFailures), villager.getUuid());
@@ -2979,22 +3398,47 @@ public final class VillageBuilderController {
         return result;
     }
 
-    /** Counts all still-placeable instances of one item in the unfinished part of the blueprint. */
+    /** Builds the remaining material quota in 32-placement slices, then answers in O(1). */
     private static int countRemainingBlueprintItem(ServerWorld world, BuilderTask task, Item wanted) {
-        int count = 0;
-        for (int index = task.buildIndex; index < task.blueprint.size(); index++) {
-            BlockPlacement placement = task.blueprint.get(index);
-            BlockState existing = world.getBlockState(placement.pos());
-            if (!existing.isAir() && !existing.isReplaceable()) continue;
-
-            BlockState planned = placement.state();
-            if (planned.getBlock() instanceof DoorBlock && planned.contains(DoorBlock.HALF)
-                    && planned.get(DoorBlock.HALF) == DoubleBlockHalf.UPPER) continue;
-            if (planned.getBlock() instanceof net.minecraft.block.BedBlock && planned.contains(BedBlock.PART)
-                    && planned.get(BedBlock.PART) == BedPart.HEAD) continue;
-            if (requiredItemForBlock(planned) == wanted) count++;
+        if (!task.remainingBlueprintCountsReady) {
+            if (task.remainingBlueprintCounts == null) {
+                task.remainingBlueprintCounts = new HashMap<>();
+                task.remainingBlueprintCountsCursor = task.buildIndex;
+            }
+            int budget = 32;
+            while (budget-- > 0 && task.remainingBlueprintCountsCursor < task.blueprint.size()) {
+                BlockPlacement placement = task.blueprint.get(task.remainingBlueprintCountsCursor++);
+                BlockState existing = world.getBlockState(placement.pos());
+                if (!existing.isAir() && !existing.isReplaceable()) continue;
+                BlockState planned = placement.state();
+                if (isPlant(planned) || planned.isIn(BlockTags.LEAVES)
+                        || !blueprintPlacementConsumesItem(planned)) continue;
+                Item item = requiredItemForBlock(planned);
+                if (item != Items.AIR) task.remainingBlueprintCounts.merge(item, 1, Integer::sum);
+            }
+            if (task.remainingBlueprintCountsCursor >= task.blueprint.size()) {
+                task.remainingBlueprintCountsReady = true;
+            } else {
+                return -1; // Yield and resume quota indexing next scheduled task slice.
+            }
         }
-        return count;
+        return task.remainingBlueprintCounts.getOrDefault(wanted, 0);
+    }
+
+    private static boolean blueprintPlacementConsumesItem(BlockState state) {
+        if (state.getBlock() instanceof DoorBlock && state.contains(DoorBlock.HALF)
+                && state.get(DoorBlock.HALF) == DoubleBlockHalf.UPPER) return false;
+        return !(state.getBlock() instanceof net.minecraft.block.BedBlock
+                && state.contains(BedBlock.PART) && state.get(BedBlock.PART) == BedPart.HEAD);
+    }
+
+    private static void decrementRemainingBlueprintItem(BuilderTask task, BlockState planned) {
+        if (task.remainingBlueprintCounts == null || !blueprintPlacementConsumesItem(planned)) return;
+        Item item = requiredItemForBlock(planned);
+        if (item == Items.AIR) return;
+        int count = task.remainingBlueprintCounts.getOrDefault(item, 0);
+        if (count <= 1) task.remainingBlueprintCounts.remove(item);
+        else task.remainingBlueprintCounts.put(item, count - 1);
     }
 
     /**
@@ -3251,112 +3695,81 @@ public final class VillageBuilderController {
 
     private static void advanceOneLazyPlanningStep(ServerWorld world) {
         long now = world.getTime();
-        if (world.getRegistryKey().equals(lastLazyPlanningDimension) && lastLazyPlanningTick == now) return;
+        RegistryKey<World> dimension = world.getRegistryKey();
+        if (dimension.equals(lastLazyPlanningDimension) && lastLazyPlanningTick == now) return;
 
-        List<UUID> owners = new ArrayList<>();
-        for (Map.Entry<UUID, BuilderTask> entry : ACTIVE_TASKS.entrySet()) {
-            BuilderTask task = entry.getValue();
-            if (!task.dimension.equals(world.getRegistryKey()) || task.pendingMaterialItem == null) continue;
-            if (!(world.getEntity(entry.getKey()) instanceof VillagerEntity candidate) || !candidate.isAlive()) continue;
+        int total = ACTIVE_TASK_ORDER.size();
+        for (int checked = 0; checked < total; checked++) {
+            if (lazyPlanningCursor >= ACTIVE_TASK_ORDER.size()) lazyPlanningCursor = 0;
+            if (ACTIVE_TASK_ORDER.isEmpty()) return;
+            UUID selected = ACTIVE_TASK_ORDER.get(lazyPlanningCursor++);
+            BuilderTask task = ACTIVE_TASKS.get(selected);
+            if (task == null || !task.dimension.equals(dimension) || task.pendingMaterialItem == null) continue;
             MaterialPlanningJob job = task.lazyMaterialPlans.get(task.pendingMaterialItem);
-            if (job != null && !job.complete && now >= job.nextStepAt) owners.add(entry.getKey());
-        }
-        if (owners.isEmpty()) return;
-        owners.sort(Comparator.comparing(UUID::toString));
+            if (job == null || job.complete || now < job.nextStepAt) continue;
+            Entity entity = world.getEntity(selected);
+            if (!(entity instanceof VillagerEntity villager) || !villager.isAlive()) continue;
 
-        UUID selected = null;
-        if (lastLazyPlanningDimension != null && lastLazyPlanningDimension.equals(world.getRegistryKey())
-                && lastLazyPlanningOwner != null) {
-            for (UUID owner : owners) {
-                if (owner.toString().compareTo(lastLazyPlanningOwner.toString()) > 0) {
-                    selected = owner;
-                    break;
+            lastLazyPlanningDimension = dimension;
+            lastLazyPlanningOwner = selected;
+            lastLazyPlanningTick = now;
+
+            // One supplier lookup is a complete planning slice. If it finds no
+            // provider, recipe indexing/choice starts on a later tick.
+            if (!job.providerChecked) {
+                job.providerChecked = true;
+                UUID excludedProvider = task.rejectedProfessionalItem == job.item
+                        && now < task.rejectedProfessionalUntil ? task.rejectedProfessionalProviderUuid : null;
+                if (!acquireSpatialSearchPermit(world)) {
+                    job.providerChecked = false;
+                    return;
                 }
-            }
-        }
-        if (selected == null) selected = owners.get(0);
-
-        BuilderTask task = ACTIVE_TASKS.get(selected);
-        Entity entity = world.getEntity(selected);
-        if (task == null || !(entity instanceof VillagerEntity villager) || !villager.isAlive()) return;
-        MaterialPlanningJob job = task.lazyMaterialPlans.get(task.pendingMaterialItem);
-        if (job == null || job.complete) return;
-
-        lastLazyPlanningDimension = world.getRegistryKey();
-        lastLazyPlanningOwner = selected;
-        lastLazyPlanningTick = now;
-
-        // Check professional suppliers as the first lazy phase. This potentially
-        // expensive nearby-entity/offers scan is globally throttled just like recipe
-        // planning, and happens only once for this material goal.
-        if (!job.providerChecked) {
-            long supplierScanStarted = System.nanoTime();
-            job.providerChecked = true;
-            UUID excludedProvider = task.rejectedProfessionalItem == job.item
-                    && now < task.rejectedProfessionalUntil ? task.rejectedProfessionalProviderUuid : null;
-            VillagerEntity provider = ProfessionalResourceExchange.findNearestProvider(
-                    world, villager, job.item, excludedProvider);
-            long supplierScanMillis = (System.nanoTime() - supplierScanStarted) / 1_000_000L;
-            if (supplierScanMillis >= 25L) {
-                VillageExpansionMod.LOGGER.warn("Lazy professional-supplier scan for {} took {} ms",
-                        Registries.ITEM.getId(job.item), supplierScanMillis);
-            }
-            if (provider != null) {
-                task.professionalProviderUuid = provider.getUuid();
-                task.professionalVisitStartedAt = Math.max(1L, now);
-                task.stage = Stage.GATHER_FROM_PROFESSIONAL;
-                task.moveTarget = provider.getBlockPos().toImmutable();
-                task.requestedMoveTarget = null;
-                task.nextMaterialSearch = now;
-                task.lazyMaterialPlans.remove(job.item);
+                VillagerEntity provider = ProfessionalResourceExchange.findNearestProvider(
+                        world, villager, job.item, excludedProvider);
+                if (provider != null) {
+                    task.professionalProviderUuid = provider.getUuid();
+                    task.professionalVisitStartedAt = Math.max(1L, now);
+                    task.stage = Stage.GATHER_FROM_PROFESSIONAL;
+                    task.moveTarget = provider.getBlockPos().toImmutable();
+                    task.requestedMoveTarget = null;
+                    task.nextMaterialSearch = now;
+                    task.lazyMaterialPlans.remove(job.item);
+                    return;
+                }
+                job.nextStepAt = now + VillageExpansionConfig.lazyPlanningStepIntervalTicks;
+                task.nextMaterialSearch = job.nextStepAt;
                 return;
             }
-            job.nextStepAt = now + 1L;
-            task.nextMaterialSearch = job.nextStepAt;
-            return;
-        }
 
-        // The first recipe index build can be large in modpacks. Build only a
-        // small fixed batch per tick, before evaluating any individual goal.
-        long sliceStarted = System.nanoTime();
-        if (VillageExpansionConfig.useRecipeBookForCrafting
-                && !MaterialAcquisitionPlanner.isRecipeIndexReady(world)) {
-            MaterialAcquisitionPlanner.advanceRecipeIndex(world,
-                    VillageExpansionConfig.lazyPlanningRecipeEntriesPerTick);
-            // Indexing is already bounded to a small batch, so continue on the
-            // next server tick rather than waiting the normal decision interval.
-            job.nextStepAt = now + 1L;
-            task.nextMaterialSearch = job.nextStepAt;
-            long elapsedMillis = (System.nanoTime() - sliceStarted) / 1_000_000L;
-            if (elapsedMillis >= 25L) {
-                VillageExpansionMod.LOGGER.warn("Lazy recipe-index slice took {} ms ({} entries budget)",
-                        elapsedMillis, VillageExpansionConfig.lazyPlanningRecipeEntriesPerTick);
+            if (VillageExpansionConfig.useRecipeBookForCrafting
+                    && !MaterialAcquisitionPlanner.isRecipeIndexReady(world)) {
+                MaterialAcquisitionPlanner.advanceRecipeIndex(world,
+                        VillageExpansionConfig.lazyPlanningRecipeEntriesPerTick);
+                job.nextStepAt = now + 1L;
+                task.nextMaterialSearch = job.nextStepAt;
+                return;
+            }
+
+            if (job.phase == 0 && !acquireSpatialSearchPermit(world)) return;
+            job.advance(world, villager);
+            job.nextStepAt = job.complete ? now : now + VillageExpansionConfig.lazyPlanningStepIntervalTicks;
+            if (job.complete && !job.viable) {
+                task.nextMaterialSearch = now + 200L;
+                if (task.planBlockedItem != job.item) {
+                    task.planBlockedItem = job.item;
+                    VillageExpansionMod.LOGGER.warn(
+                            "Lazy planner found no supported acquisition route for {} x{} (villager {}); retrying later",
+                            Registries.ITEM.getId(job.item), job.amount, uuidShort(selected));
+                }
+            } else {
+                task.nextMaterialSearch = job.nextStepAt;
+            }
+            if (job.complete) {
+                if (job.viable && task.planBlockedItem == job.item) task.planBlockedItem = null;
+                VillageExpansionMod.LOGGER.debug("Lazy plan for villager {} resolved {} x{} via {}",
+                        uuidShort(selected), Registries.ITEM.getId(job.item), job.amount, job.route);
             }
             return;
-        }
-
-        job.advance(world, villager);
-        job.nextStepAt = job.complete ? now : now + VillageExpansionConfig.lazyPlanningStepIntervalTicks;
-        long elapsedMillis = (System.nanoTime() - sliceStarted) / 1_000_000L;
-        if (elapsedMillis >= 25L) {
-            VillageExpansionMod.LOGGER.warn("Lazy material-planning slice for {} took {} ms (phase {})",
-                    Registries.ITEM.getId(job.item), elapsedMillis, job.phaseLabel());
-        }
-        if (job.complete && !job.viable) {
-            task.nextMaterialSearch = now + 200L;
-            if (task.planBlockedItem != job.item) {
-                task.planBlockedItem = job.item;
-                VillageExpansionMod.LOGGER.warn(
-                        "Lazy planner found no supported acquisition route for {} x{} (villager {}); the goal will be retried after 200 ticks",
-                        Registries.ITEM.getId(job.item), job.amount, uuidShort(selected));
-            }
-        } else {
-            task.nextMaterialSearch = job.nextStepAt;
-        }
-        if (job.complete) {
-            if (job.viable && task.planBlockedItem == job.item) task.planBlockedItem = null;
-            VillageExpansionMod.LOGGER.debug("Lazy material plan for villager {} resolved {} x{} via {}",
-                    uuidShort(selected), Registries.ITEM.getId(job.item), job.amount, job.route);
         }
     }
 
@@ -3484,7 +3897,7 @@ public final class VillageBuilderController {
             task.resumeStage = null;
             return;
         }
-        task.smeltTicksRemaining--;
+        task.smeltTicksRemaining = Math.max(0, task.smeltTicksRemaining - task.elapsedControllerTicks);
         if (world.getTime() % 10L == 0L) {
             world.spawnParticles(ParticleTypes.SMOKE, villager.getX(), villager.getY() + 0.4D,
                     villager.getZ(), 1, 0.12D, 0.08D, 0.12D, 0.005D);
@@ -3531,16 +3944,22 @@ public final class VillageBuilderController {
                                                           VillagerEntity villager, Item rawLog, int radius) {
         ResourceTarget best = null;
         double bestDistance = Double.MAX_VALUE;
-        for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
-            for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
-                int surface = findSurfaceY(world, x, z);
-                if (surface == Integer.MIN_VALUE) continue;
-                BlockPos root = new BlockPos(x, surface + 1, z);
-                if (!isNaturalTreeRoot(world, root) || !world.getBlockState(root).getBlock().asItem().equals(rawLog)) continue;
-                BlockPos stand = findStandingPosition(world, root, villager);
-                if (stand == null) continue;
-                double distance = root.getSquaredDistance(villager.getBlockPos());
-                if (distance < bestDistance) { bestDistance = distance; best = new ResourceTarget(root, stand); }
+        int samples = 40;
+        int diameter = radius * 2 + 1;
+        for (int i = 0; i < samples; i++) {
+            int x = around.getX() + world.random.nextInt(diameter) - radius;
+            int z = around.getZ() + world.random.nextInt(diameter) - radius;
+            int surface = findSurfaceYFast(world, x, z, 24);
+            if (surface == Integer.MIN_VALUE) continue;
+            BlockPos possibleRoot = new BlockPos(x, surface + 1, z);
+            BlockPos root = findNaturalTreeRoot(world, possibleRoot);
+            if (root == null || !world.getBlockState(root).getBlock().asItem().equals(rawLog)) continue;
+            BlockPos stand = findStandingPosition(world, root, villager);
+            if (stand == null) continue;
+            double distance = root.getSquaredDistance(villager.getBlockPos());
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = new ResourceTarget(root.toImmutable(), stand);
             }
         }
         return best;
@@ -3569,6 +3988,7 @@ public final class VillageBuilderController {
             UUID excluded = task.rejectedProfessionalItem == wanted
                     && world.getTime() < task.rejectedProfessionalUntil
                     ? task.rejectedProfessionalProviderUuid : null;
+            if (!acquireSpatialSearchPermit(world)) return;
             provider = ProfessionalResourceExchange.findNearestProvider(world, villager, wanted, excluded);
             if (provider == null) {
                 VillageExpansionMod.LOGGER.info("Builder {} could not reach an available professional source for {}; returning to normal acquisition planning",
@@ -3728,6 +4148,7 @@ public final class VillageBuilderController {
             ResourceTarget stripTarget = task.currentResource;
             if (stripTarget == null || !isLoaded(world, stripTarget.block())
                     || !world.getBlockState(stripTarget.block()).getBlock().asItem().equals(rawLogForStripping)) {
+                if (!acquireSpatialSearchPermit(world)) return;
                 stripTarget = findRawLogForStripping(world, task.site, villager, rawLogForStripping,
                         expandedSearchRadius(VillageExpansionConfig.woodSearchRadius, task.resourceSearchFailures));
                 task.currentResource = stripTarget;
@@ -3766,6 +4187,7 @@ public final class VillageBuilderController {
                 }
             } else if (target == null || !isNaturalTreeRoot(world, target.block())
                     || !world.getBlockState(target.block()).getBlock().asItem().equals(wanted)) {
+                if (!acquireSpatialSearchPermit(world)) return;
                 target = findWoodTarget(world, task.site, villager, wanted,
                         expandedSearchRadius(VillageExpansionConfig.woodSearchRadius, task.resourceSearchFailures));
                 task.currentResource = target;
@@ -3821,6 +4243,7 @@ public final class VillageBuilderController {
                     task.site.getX() + sheepRadius, task.site.getY() + 12.0D, task.site.getZ() + sheepRadius);
             String woolName = Registries.ITEM.getId(wanted).getPath();
             String colorName = woolName.endsWith("_wool") ? woolName.substring(0, woolName.length() - 5) : "white";
+            if (!acquireSpatialSearchPermit(world)) return;
             SheepEntity sheep = world.getEntitiesByClass(SheepEntity.class, sheepArea,
                     candidate -> candidate.isAlive() && candidate.isShearable()
                             && candidate.getColor().getName().equals(colorName)).stream()
@@ -3879,6 +4302,7 @@ public final class VillageBuilderController {
             task.currentResource = null;
             task.moveTarget = null;
             task.requestedMoveTarget = null;
+            if (!acquireSpatialSearchPermit(world)) return;
             raw = findDirectMaterialTarget(world, task.site, villager, wanted, searchRadius);
             task.currentResource = raw;
         }
@@ -3917,20 +4341,28 @@ public final class VillageBuilderController {
         }
         ResourceTarget best = null;
         double bestDistance = Double.MAX_VALUE;
-        for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
-            for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
-                int surfaceY = findSurfaceYFast(world, x, z, 32);
-                if (surfaceY == Integer.MIN_VALUE) continue;
-                for (int y = Math.max(world.getBottomY() + 1, surfaceY - 12); y <= surfaceY + 2; y++) {
-                    BlockPos block = new BlockPos(x, y, z);
-                    if (!isLoaded(world, block)) continue;
-                    BlockState state = world.getBlockState(block);
-                    if (state.isAir() || state.hasBlockEntity() || state.isIn(BlockTags.LOGS)
-                            || state.isIn(BlockTags.LEAVES) || !isWantedMaterialBlock(state, wanted)) continue;
-                    BlockPos stand = findStandingPosition(world, block, villager);
-                    if (stand == null) continue;
-                    double distance = block.getSquaredDistance(villager.getBlockPos());
-                    if (distance < bestDistance) { bestDistance = distance; best = new ResourceTarget(block.toImmutable(), stand); }
+        // A hard cap prevents a 96-block radius from turning into a thousands-of-columns scan.
+        // The radius grows on later attempts, while each individual attempt stays cheap.
+        int samples = 48;
+        int diameter = radius * 2 + 1;
+        for (int i = 0; i < samples; i++) {
+            int x = around.getX() + world.random.nextInt(diameter) - radius;
+            int z = around.getZ() + world.random.nextInt(diameter) - radius;
+            int surfaceY = findSurfaceYFast(world, x, z, 16);
+            if (surfaceY == Integer.MIN_VALUE) continue;
+            int minY = Math.max(world.getBottomY() + 1, surfaceY - 8);
+            for (int y = minY; y <= surfaceY + 1; y++) {
+                BlockPos block = new BlockPos(x, y, z);
+                if (!isLoaded(world, block)) continue;
+                BlockState state = world.getBlockState(block);
+                if (state.isAir() || state.hasBlockEntity() || state.isIn(BlockTags.LOGS)
+                        || state.isIn(BlockTags.LEAVES) || !isWantedMaterialBlock(state, wanted)) continue;
+                BlockPos stand = findStandingPosition(world, block, villager);
+                if (stand == null) continue;
+                double distance = block.getSquaredDistance(villager.getBlockPos());
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = new ResourceTarget(block.toImmutable(), stand);
                 }
             }
         }
@@ -3938,30 +4370,31 @@ public final class VillageBuilderController {
     }
 
     /**
-     * Clay commonly generates beneath rivers and lakes. A normal surface-stand
-     * lookup rejects every underwater column, so find a dry bank position within
-     * mining reach and let the builder dig the clay block from the shoreline.
+     * Clay may be submerged. Sample a bounded number of columns and then find a dry bank
+     * from which the villager can reach the clay without pathing into the water.
      */
     private static ResourceTarget findClayTarget(ServerWorld world, BlockPos around,
                                                   VillagerEntity villager, int radius) {
         ResourceTarget best = null;
         double bestDistance = Double.MAX_VALUE;
-        for (int x = around.getX() - radius; x <= around.getX() + radius; x++) {
-            for (int z = around.getZ() - radius; z <= around.getZ() + radius; z++) {
-                int surfaceY = findSurfaceYFast(world, x, z, 32);
-                if (surfaceY == Integer.MIN_VALUE) continue;
-                int minY = Math.max(world.getBottomY() + 1, surfaceY - 10);
-                int maxY = Math.min(world.getTopY() - 2, surfaceY + 2);
-                for (int y = minY; y <= maxY; y++) {
-                    BlockPos clay = new BlockPos(x, y, z);
-                    if (!isLoaded(world, clay) || !world.getBlockState(clay).isOf(Blocks.CLAY)) continue;
-                    BlockPos stand = findDryClayWorkStand(world, clay, villager);
-                    if (stand == null) continue;
-                    double distance = clay.getSquaredDistance(villager.getBlockPos());
-                    if (distance < bestDistance) {
-                        bestDistance = distance;
-                        best = new ResourceTarget(clay.toImmutable(), stand.toImmutable());
-                    }
+        int samples = 48;
+        int diameter = radius * 2 + 1;
+        for (int i = 0; i < samples; i++) {
+            int x = around.getX() + world.random.nextInt(diameter) - radius;
+            int z = around.getZ() + world.random.nextInt(diameter) - radius;
+            int surfaceY = findSurfaceYFast(world, x, z, 16);
+            if (surfaceY == Integer.MIN_VALUE) continue;
+            int minY = Math.max(world.getBottomY() + 1, surfaceY - 8);
+            for (int y = minY; y <= surfaceY + 1; y++) {
+                BlockPos clay = new BlockPos(x, y, z);
+                if (!isLoaded(world, clay) || !world.getBlockState(clay).isOf(Blocks.CLAY)) continue;
+                BlockPos stand = findDryClayWorkStand(world, clay, villager);
+                if (stand == null) continue;
+                double distance = clay.getSquaredDistance(villager.getBlockPos());
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = new ResourceTarget(clay.toImmutable(), stand.toImmutable());
+                    break; // One reachable clay block is enough for this sampled column.
                 }
             }
         }
@@ -3971,34 +4404,30 @@ public final class VillageBuilderController {
     private static BlockPos findDryClayWorkStand(ServerWorld world, BlockPos clay, VillagerEntity villager) {
         BlockPos best = null;
         double bestVillagerDistance = Double.MAX_VALUE;
-        // Search a wider ring than the generic adjacent-block finder so a villager
-        // can work from the nearest dry river/lake bank rather than stand in water.
-        for (int radius = 1; radius <= 6; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
-                    int x = clay.getX() + dx;
-                    int z = clay.getZ() + dz;
-                    int groundY = findSurfaceY(world, x, z);
-                    if (groundY == Integer.MIN_VALUE) continue;
-                    BlockPos stand = new BlockPos(x, groundY + 1, z);
-                    BlockPos head = stand.up();
-                    BlockPos floor = stand.down();
-                    if (!isLoaded(world, stand) || !isLoaded(world, head)
-                            || !world.getBlockState(stand).isAir()
-                            || !world.getBlockState(head).isAir()
-                            || !world.getFluidState(stand).isEmpty()
-                            || !world.getFluidState(head).isEmpty()
-                            || !world.getBlockState(floor).isSolidBlock(world, floor)
-                            || hasLivingEntityInBlock(world, stand, villager)
-                            || hasLivingEntityInBlock(world, head, villager)) continue;
-                    // Keep work positions within a practical shoreline reach.
-                    if (stand.getSquaredDistance(clay) > 64.0D) continue;
-                    double villagerDistance = stand.getSquaredDistance(villager.getBlockPos());
-                    if (villagerDistance < bestVillagerDistance) {
-                        bestVillagerDistance = villagerDistance;
-                        best = stand.toImmutable();
-                    }
+        // 24 deterministic shoreline samples (8 directions at radii 2, 4 and 6).
+        for (int radius : new int[]{2, 4, 6}) {
+            for (int direction = 0; direction < 8; direction++) {
+                double angle = direction * (Math.PI * 2.0D / 8.0D);
+                int x = clay.getX() + (int) Math.round(Math.cos(angle) * radius);
+                int z = clay.getZ() + (int) Math.round(Math.sin(angle) * radius);
+                int groundY = findSurfaceYFast(world, x, z, 16);
+                if (groundY == Integer.MIN_VALUE) continue;
+                BlockPos stand = new BlockPos(x, groundY + 1, z);
+                BlockPos head = stand.up();
+                BlockPos floor = stand.down();
+                if (!isLoaded(world, stand) || !isLoaded(world, head)
+                        || !world.getBlockState(stand).isAir()
+                        || !world.getBlockState(head).isAir()
+                        || !world.getFluidState(stand).isEmpty()
+                        || !world.getFluidState(head).isEmpty()
+                        || !world.getBlockState(floor).isSolidBlock(world, floor)
+                        || hasLivingEntityInBlock(world, stand, villager)
+                        || hasLivingEntityInBlock(world, head, villager)) continue;
+                if (stand.getSquaredDistance(clay) > 64.0D) continue;
+                double villagerDistance = stand.getSquaredDistance(villager.getBlockPos());
+                if (villagerDistance < bestVillagerDistance) {
+                    bestVillagerDistance = villagerDistance;
+                    best = stand.toImmutable();
                 }
             }
             if (best != null) break;
@@ -4082,13 +4511,19 @@ public final class VillageBuilderController {
         // Skip terrain decoration and leaves found in vanilla template palettes.
         // These are not structural materials and most require Silk Touch to collect.
         if (isPlant(placement.state) || placement.state.isIn(BlockTags.LEAVES)) {
+            task.constructionStandTarget = null;
+            task.cachedConstructionStand = null;
             task.buildIndex++;
             task.actionTimer = 1;
             return;
         }
         BlockState existing = world.getBlockState(placement.pos);
         if (!existing.isAir() && !existing.isReplaceable()) {
-            // Do not overwrite blocks placed by players or another task.
+            // Do not overwrite blocks placed by players or another task. Keep the
+            // cached material quota in sync with the skipped blueprint placement.
+            decrementRemainingBlueprintItem(task, placement.state());
+            task.constructionStandTarget = null;
+            task.cachedConstructionStand = null;
             task.buildIndex++;
             task.actionTimer = 1;
             return;
@@ -4097,7 +4532,12 @@ public final class VillageBuilderController {
         // Work from a clear position beside the current block instead of standing
         // in the middle of the footprint. This prevents the builder from placing
         // blocks through its own hitbox or through another villager/mob.
-        BlockPos workStand = findConstructionStand(world, placement.pos, villager);
+        if (task.constructionStandTarget == null || !task.constructionStandTarget.equals(placement.pos)
+                || task.cachedConstructionStand == null) {
+            task.constructionStandTarget = placement.pos.toImmutable();
+            task.cachedConstructionStand = findConstructionStand(world, placement.pos, villager);
+        }
+        BlockPos workStand = task.cachedConstructionStand;
         if (workStand == null) {
             task.actionTimer = 10;
             villager.getNavigation().stop();
@@ -4120,6 +4560,10 @@ public final class VillageBuilderController {
         Item requiredItem = requiredItemForBlock(state);
         int remainingRequiredCount = consumesBlockItem && requiredItem != Items.AIR
                 ? countRemainingBlueprintItem(world, task, requiredItem) : 0;
+        if (remainingRequiredCount < 0) {
+            task.actionTimer = 1;
+            return;
+        }
         if (consumesBlockItem && requiredItem != Items.AIR
                 && !ensureItemCountAvailable(world, villager, task, requiredItem,
                 Math.max(1, remainingRequiredCount), 0, new HashSet<>())) {
@@ -4147,7 +4591,17 @@ public final class VillageBuilderController {
             return;
         }
 
-        world.setBlockState(placement.pos, state, Block.NOTIFY_ALL);
+        if (!world.setBlockState(placement.pos, state, Block.NOTIFY_ALL)) {
+            if (consumesBlockItem && requiredItem != Items.AIR) {
+                villager.getInventory().addStack(new ItemStack(requiredItem));
+                villager.getInventory().markDirty();
+            }
+            task.actionTimer = 10;
+            return;
+        }
+        decrementRemainingBlueprintItem(task, state);
+        task.constructionStandTarget = null;
+        task.cachedConstructionStand = null;
         villager.swingHand(Hand.MAIN_HAND);
         task.buildIndex++;
         task.actionTimer = VillageExpansionConfig.buildBlockDelayTicks;
@@ -4155,12 +4609,12 @@ public final class VillageBuilderController {
 
     private static BlockPos findConstructionStand(ServerWorld world, BlockPos target, VillagerEntity builder) {
         Box targetBox = new Box(target);
-        List<BlockPos> candidates = new ArrayList<>();
-        // Include the natural ground level for roof/eaves placements several
-        // blocks above the floor, while also finding elevated house floors.
         int minStandY = Math.max(world.getBottomY() + 1, target.getY() - 12);
         int maxStandY = Math.min(world.getTopY() - 2, target.getY() + 2);
+        BlockPos builderPos = builder.getBlockPos();
         for (int radius = 1; radius <= 3; radius++) {
+            BlockPos best = null;
+            double bestDistance = Double.MAX_VALUE;
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     if (Math.abs(dx) != radius && Math.abs(dz) != radius) continue;
@@ -4175,22 +4629,30 @@ public final class VillageBuilderController {
                                 || !world.getBlockState(support).isSolidBlock(world, support)
                                 || !world.getFluidState(stand).isEmpty()
                                 || !world.getFluidState(stand.up()).isEmpty()) continue;
-
-                        Box entityBox = new Box(x + 0.2D, y, z + 0.2D,
-                                x + 0.8D, y + 1.95D, z + 0.8D);
+                        Box entityBox = new Box(x + 0.2D, y, z + 0.2D, x + 0.8D, y + 1.95D, z + 0.8D);
                         if (entityBox.intersects(targetBox)) continue;
-                        boolean occupied = world.getOtherEntities(builder, entityBox).stream()
-                                .anyMatch(entity -> entity.isAlive()
-                                        && entity instanceof net.minecraft.entity.LivingEntity);
-                        if (!occupied) candidates.add(stand.toImmutable());
+                        double distance = stand.getSquaredDistance(builderPos);
+                        if (distance < bestDistance) {
+                            bestDistance = distance;
+                            best = stand.toImmutable();
+                        }
                     }
                 }
             }
-            if (!candidates.isEmpty()) break;
+            if (best != null) {
+                Box entityBox = new Box(best.getX() + 0.2D, best.getY(), best.getZ() + 0.2D,
+                        best.getX() + 0.8D, best.getY() + 1.95D, best.getZ() + 0.8D);
+                boolean occupied = false;
+                for (Entity entity : world.getOtherEntities(builder, entityBox)) {
+                    if (entity.isAlive() && entity instanceof net.minecraft.entity.LivingEntity) {
+                        occupied = true;
+                        break;
+                    }
+                }
+                if (!occupied) return best;
+            }
         }
-        return candidates.stream()
-                .min(Comparator.comparingDouble(pos -> pos.getSquaredDistance(builder.getBlockPos())))
-                .orElse(null);
+        return null;
     }
 
     private static boolean hasLivingEntityInBlock(ServerWorld world, BlockPos target, Entity builder) {
@@ -4340,10 +4802,25 @@ public final class VillageBuilderController {
     }
 
     private static boolean moveNear(VillagerEntity villager, BuilderTask task, BlockPos target, double speed) {
+        return moveNear(villager, task, target, speed, false);
+    }
+
+    /**
+     * @param abandonIfUnreachable when true, a permanently unreachable work stand
+     *                             is reported to the caller so it can choose another
+     *                             local position instead of wandering forever.
+     */
+    private static boolean moveNear(VillagerEntity villager, BuilderTask task, BlockPos target,
+                                    double speed, boolean abandonIfUnreachable) {
         long now = villager.getWorld().getTime();
         double distanceSquared = villager.squaredDistanceTo(target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D);
+        if (abandonIfUnreachable && task.failedNavigationTarget != null
+                && task.failedNavigationTarget.equals(target)) return false;
         if (task.requestedMoveTarget == null || !task.requestedMoveTarget.equals(target)) {
             task.requestedMoveTarget = target.toImmutable();
+            if (task.failedNavigationTarget != null && !task.failedNavigationTarget.equals(target)) {
+                task.failedNavigationTarget = null;
+            }
             task.moveTarget = target.toImmutable();
             task.lastNavigationDistance = Math.sqrt(distanceSquared);
             task.lastNavigationProgressAt = now;
@@ -4386,6 +4863,14 @@ public final class VillageBuilderController {
                 task.moveTarget = target.toImmutable();
                 task.navigationRepathCount = 0;
                 task.navigationFallbackIndex = 0;
+                if (abandonIfUnreachable) {
+                    task.failedNavigationTarget = target.toImmutable();
+                    task.moveTarget = null;
+                    villager.getNavigation().stop();
+                    VillageExpansionMod.LOGGER.warn("Builder {} could not reach {} during {}; caller will select a nearby fallback",
+                            uuidShort(villager.getUuid()), target, task.stage);
+                    return false;
+                }
                 VillageExpansionMod.LOGGER.warn("Builder {} is stuck navigating to {} during {}; resetting its route",
                         uuidShort(villager.getUuid()), target, task.stage);
             }
@@ -4531,7 +5016,7 @@ public final class VillageBuilderController {
         world.playSound(null, task.site, SoundEvents.BLOCK_WOOD_PLACE, SoundCategory.BLOCKS, 0.9F, 1.0F);
 
         clearDebugLabel(villager);
-        ACTIVE_TASKS.remove(villager.getUuid());
+        unregisterActiveTask(villager.getUuid());
         saved.removeActiveTask(villager.getUuid());
         RETRY_AT.put(villager.getUuid(), world.getTime() + (founderNeedsJobHouse ? 100L : 24_000L));
         if (founderNeedsJobHouse) {
@@ -4553,7 +5038,7 @@ public final class VillageBuilderController {
         restoreBuilderProfession(villager, task);
         villager.equipStack(EquipmentSlot.MAINHAND, task.originalMainHand.copy());
         clearDebugLabel(villager);
-        ACTIVE_TASKS.remove(villager.getUuid());
+        unregisterActiveTask(villager.getUuid());
         VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
                 VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
         saved.removeActiveTask(villager.getUuid());
@@ -4604,8 +5089,8 @@ public final class VillageBuilderController {
     }
 
     private enum Stage {
-        CLEAR_PATH("Limpando terreno"),
-        LEVEL_SITE("Nivelando terreno"),
+        CLEAR_PATH("Migrando limpeza antiga"),
+        LEVEL_SITE("Limpando e nivelando lote"),
         BUILD_PATH("Construindo caminho"),
         GATHER_WOOD("Coletando madeira"),
         GATHER_DIRT("Coletando terra"),
@@ -4638,7 +5123,7 @@ public final class VillageBuilderController {
         private int footprintX = 5;
         private int footprintZ = 5;
 
-        private Stage stage = Stage.CLEAR_PATH;
+        private Stage stage = Stage.LEVEL_SITE;
         private int treeIndex;
         private int levelIndex;
         private int pathIndex;
@@ -4660,6 +5145,7 @@ public final class VillageBuilderController {
         private long lastNavigationProgressAt;
         private long lastNavigationCommandAt;
         private long lastBrainNavigationOverride;
+        private long nextBrainNavigationCheckAt;
         private int navigationRepathCount;
         private int navigationFallbackIndex;
         private int resourceSearchFailures;
@@ -4671,6 +5157,9 @@ public final class VillageBuilderController {
         private ResourceTarget currentResource;
         private MiningTarget currentMine;
         private boolean plotVegetationCleared;
+        private int plotTreeScanCursor;
+        private boolean plotTreeScanComplete;
+        private int plotPlantScanCursor;
         private long pausedUntil;
         private boolean sleepingAtNight;
         private BlockPos breakingPos;
@@ -4681,6 +5170,12 @@ public final class VillageBuilderController {
         private int currentTreeLogIndex;
         private Item currentTreeLogItem;
         private final List<BlockPos> currentTreeLeaves = new ArrayList<>();
+        private final ArrayDeque<BlockPos> currentTreeScanQueue = new ArrayDeque<>();
+        private final Set<Long> currentTreeScanVisited = new HashSet<>();
+        private boolean currentTreeScanComplete;
+        private BlockPos currentTreeStandTarget;
+        private BlockPos currentTreeStandPosition;
+        private boolean currentTreeStandChecked;
         private int currentTreeLeafIndex;
         private boolean currentTreeLeavesScanned;
         private int smeltTicksRemaining;
@@ -4699,6 +5194,24 @@ public final class VillageBuilderController {
         private final Map<Item, MaterialPlanningJob> lazyMaterialPlans = new HashMap<>();
         private BlockPos saplingSearchOrigin;
         private long nextMaterialSearch;
+        // Runtime-only scheduling fields. Vanilla Brain/navigation still ticks every tick.
+        private long nextControllerUpdateAt;
+        private long lastControllerUpdateAt = Long.MIN_VALUE;
+        private long nextTaskSaveAt;
+        private long nextDangerCheckAt;
+        private long nextSaplingCheckAt;
+        private int elapsedControllerTicks = 1;
+        private boolean cachedNearbyDanger;
+        private String lastDebugLabel;
+        private Map<Item, Integer> remainingBlueprintCounts;
+        private int remainingBlueprintCountsCursor = -1;
+        private boolean remainingBlueprintCountsReady;
+        private BlockPos constructionStandTarget;
+        private BlockPos cachedConstructionStand;
+        private BlockPos levelWorkStand;
+        private final Set<Long> rejectedLevelWorkStands = new HashSet<>();
+        private int levelStandSearchFailures;
+        private BlockPos failedNavigationTarget;
 
         // Persistent state for visits to employed Villager suppliers. These fields
         // are serialized in writeTask()/restoreTask(); keeping them on BuilderTask

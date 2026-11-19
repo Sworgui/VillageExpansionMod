@@ -1,4 +1,4 @@
-# Village Expansion 1.3.7
+# Village Expansion 1.4.1
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -45,7 +45,9 @@ The template loader uses one palette per structure, since a structure's palettes
 - The builder recognizes natural trees conservatively: a candidate needs a natural-soil root, a three-block vertical trunk and a canopy of non-persistent leaves. Logs near beds, doors, workstations or block entities are protected to avoid harvesting house structures.
 - A selected tree is felled by breaking every connected trunk/branch log individually with visible block damage. Leaves are left intact for vanilla decay; sapling drops are collected later. Saplings are replanted on valid soil with sufficient light, away from the active house footprint and village road. Nearby sapling item drops are planted directly if the Villager inventory is full.
 - Saplings that cannot be planted immediately remain in the worker's inventory or as nearby item drops for a later planting attempt.
-- Terrain preparation executes a saved sequence of leveling operations. Dirt and stone from the builder's inventory are used for simple fill work.
+- Terrain preparation uses a compact 4–12 block site search around the village by default. It accepts controlled slopes (up to 6 blocks from the median floor), clears natural dirt/stone protrusions from the future house volume, cuts high columns and fills low columns with dirt/cobblestone. Total earthwork is capped at 160 block operations by default; water, block entities and existing solid/player-built structures are protected.
+- New projects clear only the house footprint, level it, and build the house first. They no longer cut trees along the entire future road before construction. The access road is the final phase and removes only trees/plants that actually obstruct its blocks.
+- A builder works from a validated standing position outside the plot, with fallbacks beside the next terrain operation. If the selected plot is already level, it skips the leveling trip and begins construction immediately. Unreachable tree logs or road obstacles are skipped after bounded local recovery rather than causing world-wide wandering.
 - The resulting road uses vanilla `dirt_path` blocks and avoids overwriting non-replaceable structures.
 
 ### Caves and mines
@@ -90,10 +92,17 @@ On a dedicated server, the file is in the server's `config` directory. Example s
 ```json
 {
   "enabled": true,
-  "maxBuildersPerVillage": 3,
+  "maxBuildersPerVillage": 20,
+  "maxActiveBuildersPerDimension": 20,
   "navigationSpeed": 0.65,
-  "taskTickInterval": 1,
-  "assignmentScanInterval": 100,
+  "taskTickInterval": 2,
+  "builderTaskUpdatesPerTick": 1,
+  "builderTaskGlobalIntervalTicks": 2,
+  "builderTaskMinIntervalTicks": 40,
+  "assignmentScanInterval": 40,
+  "spatialSearchIntervalTicks": 20,
+  "lazyPlanningStepIntervalTicks": 40,
+  "lazyPlanningRecipeEntriesPerTick": 2,
   "retryDelayTicks": 600,
   "dangerRadius": 12,
   "dangerPauseTicks": 120,
@@ -123,15 +132,17 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "materialSearchRadius": 28,
   "materialSearchIntervalTicks": 100,
   "useRecipeBookForCrafting": true,
-  "maxPathSearchNodes": 8000,
+  "maxPathSearchNodes": 300,
   "buildBlockDelayTicks": 2,
   "navigationStallTimeoutTicks": 100,
-  "navigationReassertIntervalTicks": 10,
+  "navigationReassertIntervalTicks": 40,
   "navigationMaxRepaths": 4,
   "noResourceSearchLimit": 6,
-  "houseSearchMinRadius": 12,
-  "houseSearchMaxRadius": 44,
-  "houseSearchStep": 4,
+  "houseSearchMinRadius": 4,
+  "houseSearchMaxRadius": 12,
+  "houseSearchStep": 2,
+  "maxSiteTerrainVariation": 6,
+  "maxSiteTerraformBlocks": 160,
   "breedingScanIntervalTicks": 200,
   "breedingPartnerRange": 8.0,
   "breedingParentCooldownTicks": 6000,
@@ -144,6 +155,11 @@ All values are clamped to safe ranges when loaded. The most useful controls are:
 | Setting | Purpose |
 |---|---|
 | `maxBuildersPerVillage` | Maximum simultaneous workers in one settlement |
+| `maxActiveBuildersPerDimension` | Hard dimension-wide limit, including tasks saved in unloaded chunks (default: 20) |
+| `taskTickInterval` | How often the mod controller runs (default: every 2 game ticks) |
+| `builderTaskMinIntervalTicks` | Minimum delay between custom task updates for the same builder (default: 40 ticks) |
+| `builderTaskGlobalIntervalTicks` | Minimum delay between globally scheduled builder task slices (default: 2 ticks) |
+| `spatialSearchIntervalTicks` | Minimum delay between expensive world-resource scans in one dimension (default: 20 ticks) |
 | `navigationSpeed` | Villager navigation speed while moving between work positions |
 | `dangerRadius` | Distance at which hostile mobs interrupt work |
 | `dangerPauseTicks` | Delay before a builder resumes after danger |
@@ -337,7 +353,59 @@ Material planning is time-sliced. The controller does not evaluate the full reci
 
 New configuration values are written automatically to `config/village_expansion.json`:
 
-- `lazyPlanningStepIntervalTicks` (default `4`): minimum ticks between phases of a material plan. Increasing it lowers planning load but increases acquisition delay.
-- `lazyPlanningRecipeEntriesPerTick` (default `32`): maximum recipe entries inspected in one controller tick while the shared index is being built. Lower values smooth indexing further but delay the first recipe-based plan.
+- The original 1.3.7 defaults were `lazyPlanningStepIntervalTicks = 4` and `lazyPlanningRecipeEntriesPerTick = 32`.
+- Since 1.3.9, the ultra-low-CPU profile uses `lazyPlanningStepIntervalTicks = 40` and `lazyPlanningRecipeEntriesPerTick = 2`.
+- The first value controls the minimum ticks between phases of a material plan. Increasing it lowers planning load but delays acquisition decisions.
+- The second value caps recipe registry entries inspected while the shared index is being built. Lower values smooth indexing further but delay the first recipe-based plan.
 
-Only one builder planning phase is advanced per world/controller tick. Completed recipe choices are cached for the current task; child dependencies can be acquired without recalculating the parent choice. Transient recipe references are rebuilt after world reload from the persisted material goal.
+Only one builder planning phase is advanced per world/controller tick. Completed recipe choices are cached for the current task; child dependencies can be acquired without recalculating the parent choice. Supplier lookup and recipe-index batches continue gradually, and expensive material-comparison phases remain separated by the configured 40-tick default interval in the low-CPU profile.
+
+## Ultra-low-CPU controller (1.3.9)
+
+- The controller itself runs every 2 game ticks by default. It advances at most one expensive construction task slice every 2 ticks, in round-robin order.
+- Each builder has a 40-tick minimum interval between custom task slices. With 20 active builders, each receives roughly one custom action every 2 seconds; construction is slower, but one builder cannot monopolize the main thread.
+- `maxActiveBuildersPerDimension` is a hard limit of 20 active projects for the whole dimension, including saved tasks whose entity chunks are unloaded. `maxBuildersPerVillage` remains an additional per-settlement limit.
+- Vanilla villager Brain, navigation, looking, and movement continue to tick at the normal game rate. The mod only throttles its own construction state machine and destination reassertion.
+- The controller uses Fabric `ServerEntityEvents.ENTITY_LOAD` / `ENTITY_UNLOAD` to maintain a loaded-villager cache. It and the breeding fallback no longer run full-world entity polling.
+- Resource search permits are spaced 20 ticks apart per dimension. Material scans use bounded samples; tree canopy/protection checks use sparse probes; exposed-cave searches use a smaller sample grid.
+- Tree discovery, tree cutting, plot vegetation clearing and blueprint-material counting remain incremental. Search targets and material quotas are cached.
+- Lazy recipe planning is advanced every 40 ticks and indexes at most 2 recipe entries per tick. Assignment runs no more frequently than every 40 ticks; navigation destination reassertion is reduced to every 40 ticks.
+- A* road discovery is capped at 300 expanded nodes. Task, assignment and controller slices log warnings at 10 ms.
+
+This profile intentionally trades construction speed for lower main-thread overhead. For 20 active builders it targets approximately 10 custom task slices per second in one dimension, distributed across workers. It does not remove the cost of Minecraft's own entity ticking, vanilla pathfinding, chunk simulation, other mods, or networking; zero total server cost is not achievable.
+
+
+## 1.4.1 — House-first clearing and bounded local terraforming
+
+- New builders start at `LEVEL_SITE`, not `CLEAR_PATH`. They only clear trees and vegetation whose trunks/canopy intersect the house footprint, then level the lot and build the house.
+- The future access road is processed after the house. Trees are cut only when their trunks physically obstruct a road block; unreachable road trees are skipped locally rather than sending the builder away from the house.
+- Existing 1.4.0 tasks saved in `CLEAR_PATH` migrate to `LEVEL_SITE`, discard the old route-wide tree list and resume local plot preparation.
+- Default house search is reduced to a 4–12 block radius with 2-block bands. The footprint accepts up to 6 blocks of terrain variation and up to 160 cut/fill/clear operations, using dirt or cobblestone collected from the cuts before requesting more dirt.
+- If the perimeter work position is blocked, the builder tries a standing cell beside the next terrain operation and then a compact fallback around the plot; it never expands into a world-wide search for a work position.
+- Assignment retry after an unsuccessful local candidate slice follows the assignment interval instead of a fixed 100-tick delay.
+
+## 1.4.0 — Compact site selection and adaptive terrain clearing
+
+- House plots are searched close to the village (default radius 4–18 blocks) instead of making workers roam while trying to find a naturally perfect clearing.
+- The site selector now accepts controlled slopes and prepares cut/fill operations, with a default limit of 4 blocks of height variation and 96 earthwork block operations.
+- Builders use an accessible work position outside the footprint; a flat plot with no leveling operations skips the leveling trip and proceeds directly to construction.
+- Tree clearing searches adjacent and radius-two standing positions. An unreachable individual log is skipped after bounded recovery attempts so one obstructed tree cannot keep the entire project in CLEAR_PATH forever.
+- If a work position becomes unreachable, the builder rejects it and selects another nearby stand instead of repeatedly restarting the same navigation route.
+- Existing construction task saves remain compatible; new work-stand caches are runtime-only and are safely rebuilt after reload.
+
+
+## Compact site selection and adaptive clearing (1.4.1)
+
+New configuration keys:
+
+```json
+{
+  "houseSearchMinRadius": 4,
+  "houseSearchMaxRadius": 12,
+  "houseSearchStep": 2,
+  "maxSiteTerrainVariation": 6,
+  "maxSiteTerraformBlocks": 160
+}
+```
+
+The site selector no longer requires a naturally flat, completely clear footprint. It evaluates a small local radius, allows bounded natural terrain changes, and creates incremental cut/fill operations. If no leveling is necessary, the worker moves directly to construction.

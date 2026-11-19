@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.4.1
+
+- Fixed route-wide pre-clearing: new builders no longer walk away from the plot to fell trees along the future road before constructing the house.
+- Reordered the project to clear/level only the house footprint, build the house, then build the access road. Trees on the road are handled only when an actual road block is obstructed.
+- Migrated saved `CLEAR_PATH` tasks from 1.4.0 to local `LEVEL_SITE` preparation and discarded their old route-wide tree targets.
+- Reduced default house-site search to a 4–12 block radius with 2-block bands.
+- Increased adaptive terrain allowance to 6 blocks from the median floor and 160 operations by default; natural dirt/stone is cut and reused as fill where possible.
+- Added a local work-position fallback beside the next cut/fill operation when perimeter positions are blocked.
+- Road tree handling now abandons an unreachable local obstruction instead of repeatedly pursuing a distant work position.
+- Added config migration version 7 for the compact site radius and expanded bounded terraforming defaults.
+
+## 1.4.0
+
+- Reduced default house-site search to a compact 4–18 block radius around the village.
+- Replaced the strict naturally-flat-site requirement with bounded adaptive terrain preparation: default maximum 4-block height variation and 96 cut/fill operations.
+- Kept protection for water, lava, block entities and existing solid/player-built structures; only the footprint's natural terrain and vegetation are eligible for clearing/terraforming.
+- Added perimeter work-stand selection for leveling. Builders no longer navigate to a fixed northwest-corner coordinate that may be floating, underground or blocked on uneven plots.
+- Flat/ready plots skip LEVEL_SITE navigation and proceed directly to BUILD.
+- Expanded tree-cutting stand search to radius two and made inaccessible individual logs non-fatal to the house project.
+- Added a terminal navigation-failure marker so callers can reject an unreachable target and select another local fallback instead of issuing the same route indefinitely.
+- Added config migration version 6 for compact site search and terraform limits.
+
+## 1.3.9
+
+- Added an ultra-low-CPU profile with a 2-tick controller cadence, one global custom builder task slice every 2 ticks, and a 40-tick minimum interval per builder. With 20 active builders, each worker receives roughly one custom work slice every 2 seconds while vanilla Brain/navigation continues at normal tick rate.
+- Added a hard dimension-wide cap of 20 active builder projects, including saved tasks in unloaded chunks; the existing per-village cap remains in effect.
+- Reduced assignment cadence to once per 40 ticks, spatial-search permits to once per 20 ticks, lazy recipe-plan advancement to once per 40 ticks, and recipe-index batches to 2 entries per tick.
+- Reduced navigation destination reassertion to once per 40 ticks and capped road A* expansion at 300 nodes.
+- Cut tree-canopy checks from 1,053 block probes to 175 sparse probes, protected-building scans from 1,859 to 392 positions, and route-tree sampling from about 48 to 24 anchors.
+- Reduced exposed-cave samples and exact ore vein checks; repeated local checks occur as the miner advances rather than scanning a large 3D volume in one task slice.
+- Added a bounded A* road path implementation using the vanilla heightmap and loaded-chunk checks.
+- Added performance migration version 5 so existing configs receive the new conservative defaults automatically.
+
+## 1.3.8
+
+- Added a strict round-robin work budget: at most one expensive custom builder task slice is advanced per world tick, with each individual builder updated no more often than every 20 ticks by default. Vanilla Brain, navigation and movement remain enabled every game tick.
+- Added Fabric `ServerEntityEvents` load/unload callbacks to maintain the loaded-villager cache and restore at most one saved builder task per tick. Removed the builder controller's periodic full-world entity scan.
+- Changed the breeding fallback to use the controller's cached villager list rather than iterating every entity in the world.
+- Added an adaptive low-priority budget: recipe-planning and founding-completion work is deferred when the current controller tick has already consumed its 2 ms soft budget.
+- Bounded direct resource scans to small random samples with heightmap-assisted surface lookup; future retries expand the search radius, rather than scanning the entire square at once.
+- Bounded wood, stripped-log, dirt, clay, direct-material and mine-entrance searches; reduced repeated terrain and standing-position queries.
+- Reduced path-tree discovery to capped route samples and bounded path-surface lookups.
+- Kept plot clearing, tree-log discovery, tree cutting, blueprint material counting and sapling planting incremental/cached.
+- Reduced house-site candidate evaluation to two candidate footprints per assignment attempt and moved assignment attempts to a 10-tick interval.
+- Added 10 ms diagnostics for builder task, assignment and controller slices.
+- Added a version-4 config migration for the event-driven loaded-villager cache and low-CPU assignment cadence.
+
 ## 1.3.7
 
 - Introduced resumable Lazy Planning: material objectives are evaluated in separate direct-source, crafting, stonecutting and smelting phases spread across controller ticks.

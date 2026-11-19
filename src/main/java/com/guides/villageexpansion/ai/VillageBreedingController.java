@@ -3,7 +3,6 @@ package com.guides.villageexpansion.ai;
 import com.guides.villageexpansion.BuilderProfession;
 import com.guides.villageexpansion.config.VillageExpansionConfig;
 import net.minecraft.entity.ai.brain.MemoryModuleType;
-import net.minecraft.entity.Entity;
 import net.minecraft.entity.passive.VillagerEntity;
 import net.minecraft.particle.ParticleTypes;
 import net.minecraft.server.world.ServerWorld;
@@ -30,10 +29,8 @@ public final class VillageBreedingController {
 
         Set<UUID> paired = new HashSet<>();
         List<VillagerEntity> loadedVillagers = new ArrayList<>();
-        for (Entity entity : world.iterateEntities()) {
-            if (entity instanceof VillagerEntity villager && !villager.isBaby()) {
-                loadedVillagers.add(villager);
-            }
+        for (VillagerEntity villager : VillageBuilderController.getLoadedVillagers(world)) {
+            if (!villager.isBaby()) loadedVillagers.add(villager);
         }
 
         for (VillagerEntity villager : loadedVillagers) {

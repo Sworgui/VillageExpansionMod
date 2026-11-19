@@ -192,6 +192,11 @@ public final class VillageExpansionState extends PersistentState {
         if (activeTasks.remove(villagerId) != null) markDirty();
     }
 
+    /** Counts all persisted projects in this dimension, including unloaded workers. */
+    public int getActiveTaskCount() {
+        return activeTasks.size();
+    }
+
     /** Counts persisted projects, including workers whose entity chunks are currently unloaded. */
     public int getActiveTaskCountForVillage(long villageId) {
         int count = 0;
