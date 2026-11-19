@@ -1,4 +1,4 @@
-# Village Expansion 1.2.8
+# Village Expansion 1.3.3
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -65,7 +65,7 @@ The template loader uses one palette per structure, since a structure's palettes
 - Registered smelting recipes (including sand-to-glass and ore processing) are simulated over time and consume coal/charcoal fuel. Coal/charcoal are reserved as processing fuel; the mod does not burn the house's planks, logs or sticks.
 - Crafting and smelting are recipe-driven controller actions with particles, time and ingredient consumption. They do not yet operate a visible crafting-table or furnace block with a physical GUI.
 
-The builder checks its inventory for an appropriate axe, pickaxe or shovel and equips the strongest available one. If a blacksmith-type villager is nearby and the builder already carries at least three iron ingots, the mod can replace the working tool with an iron tool. Ore smelting is available for recipe ingredients, but the blacksmith does not run a barter/trading interaction.
+The builder checks its inventory for an appropriate axe, pickaxe or shovel and equips the strongest available one. Before extracting or crafting a missing item, it searches for an employed villager with a matching, currently available trade output within 40 blocks (configurable). The builder walks to that professional and receives the offered item for free: no emeralds, barter ingredients or merchant XP are exchanged. One offer use is reserved per transfer so stock remains finite and can return through normal villager restocking. This applies to all professional villagers and any matching output in their current offers, including tools, food, crops, wool and other recipe inputs. If no suitable offer exists or the provider cannot be reached, the recursive planner falls back to natural collection, crafting, stonecutting or smelting. Legacy `blacksmithToolUpgrades` config is retained for compatibility but the old iron-ingot-consuming upgrade behavior has been replaced by this system.
 
 ### Builder appearance
 
@@ -108,6 +108,8 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "mineMinimumDistanceFromVillage": 20,
   "houseSpacing": 12,
   "blacksmithToolUpgrades": true,
+  "professionalResourceSharing": true,
+  "professionalResourceSearchRadius": 40,
   "woodRequired": 0,
   "stoneRequired": 0,
   "woodUnitsPerLog": 4,
@@ -158,6 +160,8 @@ All values are clamped to safe ranges when loaded. The most useful controls are:
 | `navigationMaxRepaths` | Alternate route attempts before a warning/reset |
 | `noResourceSearchLimit` | Failed searches before the worker expands its search radius or switches to an alternative resource route |
 | `mineExclusionRadius` / `houseSpacing` | Prevents houses from crowding mines or other houses |
+| `professionalResourceSharing` | Allows builders to request matching offer outputs from employed villagers for free |
+| `professionalResourceSearchRadius` | Maximum distance to search for professional suppliers (default: 40 blocks) |
 | `breedingPartnerRange` / `breedingScanIntervalTicks` | Bedless breeding search settings |
 
 Restart the world/server after changing the config so all settings are reloaded cleanly.
@@ -167,27 +171,27 @@ Restart the world/server after changing the config so all settings are reloaded 
 1. Create a repository at [github.com/new](https://github.com/new).
 2. Extract this ZIP and upload **all files and folders**, including the hidden `.github` directory, to the repository root.
 3. Commit and push to `main` or `master`, or open **Actions → Build Fabric mod → Run workflow**.
-4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.2.8` from **Artifacts**.
-5. Inside the artifact, use `village-expansion-1.2.8.jar` (not the `-sources.jar`).
+4. Wait for the workflow to finish. If it succeeds, open the run and download the artifact named `village-expansion-1.3.3` from **Artifacts**.
+5. Inside the artifact, use `village-expansion-1.3.3.jar` (not the `-sources.jar`).
 
 The workflow runs Java 21, Gradle 8.12 and `gradle clean build` on GitHub's runner.
 
 ## Install
 
 - Install Fabric Loader and Fabric API for Minecraft 1.21.1.
-- Put `village-expansion-1.2.8.jar` in the `mods` folder.
+- Put `village-expansion-1.3.3.jar` in the `mods` folder.
 - For multiplayer, install the mod on the server and on each client that needs to see the custom builder texture.
 - Start a new test world or back up an existing world before enabling a new major version.
 
 ## Save compatibility and known limitations
 
-- Active worker task snapshots are stored in the dimension's `PersistentState`. The project stage, progress counters, dedicated stone-search failure count, road positions, plot-tree targets, partial tree-cut list and indexes, terrain operations, current resource target, pending recipe item and exact pending quantity, smelting timer/fuel, active mining target, mine entrance and mine direction are serialized. Task snapshots are refreshed every 20 world ticks and restored when the villager is loaded again.
+- Active worker task snapshots are stored in the dimension's `PersistentState`. The project stage, progress counters, dedicated stone-search failure count, road positions, plot-tree targets, partial tree-cut list and indexes, terrain operations, current resource target, pending recipe item and exact pending quantity, supplier UUID/visit timing/rejected supplier cooldown, smelting timer/fuel, active mining target, mine entrance and mine direction are serialized. Task snapshots are refreshed every 20 world ticks and restored when the villager is loaded again.
 - The save loader can read the older task format and rebuilds missing work lists for those older snapshots.
 - If the server crashes between snapshots, up to roughly one second of task bookkeeping can roll back. Already placed blocks remain in the world and are not overwritten if they are no longer replaceable.
 - A mine is a functional generated-by-the-mod stair tunnel with periodic log supports, not a full copy of naturally generated mineshafts.
 - Recipe batch sizes can leave a small surplus (for example, crafting one door produces the recipe's full batch). Leftovers are retained for later placements/jobs rather than discarded.
 - Smelting is simulated by the task controller using registered vanilla smelting recipes and timed fuel consumption; the Villager does not walk to and operate a physical furnace block. Crafting similarly uses recipe data rather than a visible crafting-table interface.
-- Blacksmith tool upgrades require the ingots already in the builder inventory; the mod does not run barter interactions.
+- Professional resource sharing is described in the 1.3.2 and 1.3.3 sections below; the legacy `blacksmithToolUpgrades` config option is retained only for compatibility.
 - Tree recognition is intentionally conservative. It filters persistent leaves and protects nearby beds, doors, workstations and block entities. Minecraft does not store a universal “player placed” flag for every block; a player-built log structure deliberately shaped like a natural tree and using non-persistent leaves can still resemble a tree to a block-based heuristic.
 - Cave searches only inspect loaded chunks, and professional structures fall back to a compact blueprint when a matching biome template is missing.
 - The founding completion check sees villagers currently loaded in its scan area. A villager in an unloaded chunk is evaluated once it becomes loaded in that area.
@@ -204,7 +208,7 @@ MIT. See `LICENSE`.
 Third-party profession houses can be configured through JSON. See [docs/MOD_COMPATIBILITY.md](docs/MOD_COMPATIBILITY.md) and `examples/compat/examplemod.json`. Compatible entries require the target mod, a registered Villager profession, a workstation block and an NBT structure template containing both a bed and that workstation. Compatibility files are optional; no hard dependency on the third-party mod is added.
 
 
-## Resource acquisition fixes (1.2.8)
+## Resource acquisition fixes (1.3.0)
 
 - Clay-ball requests now search clay deposits under rivers and lakes and select a nearby dry shoreline work position. The builder no longer relies on a dry stand position directly adjacent to underwater clay.
 - Flower items used as recipe ingredients are now collectible by matching the requested item to its corresponding flower block. This supports dandelions and other dye flowers without making decorative flower placements mandatory in house templates.
@@ -213,7 +217,28 @@ Third-party profession houses can be configured through JSON. See [docs/MOD_COMP
 - Direct resource collection now picks up only the requested item, preventing unrelated block drops from filling the villager inventory during clay/flower collection.
 
 ### Validation
-- Source checks, metadata/JSON checks and ZIP integrity are included in this package. A real Fabric compile and Minecraft simulation still require GitHub Actions and an in-game test world. Use [docs/TEST_SCENARIOS_1.2.8.md](docs/TEST_SCENARIOS_1.2.8.md) for the new regression cases.
+- Source checks, metadata/JSON checks and ZIP integrity are included in this package. A real Fabric compile and Minecraft simulation still require GitHub Actions and an in-game test world. Use [docs/TEST_SCENARIOS_1.3.0.md](docs/TEST_SCENARIOS_1.3.0.md) for the new regression cases.
+
+
+## General material objective planner (1.3.1)
+
+- Every requested blueprint item is evaluated through the active world's registered crafting, standard smelting and stonecutting recipes, not through a per-item crafting list. Recipe outputs are indexed once per RecipeManager; alternative recipes and ingredient variants are scored by estimated acquisition cost.
+- Ingredient alternatives prefer a currently accessible peaceful/natural source, but an item with no nearby hit may remain a candidate because the executor can widen its search radius. When direct acquisition is estimated cheaper than processing, the builder tries it first; after repeated failed source searches it can fall back to a recipe route. The planner rejects dependency cycles and chains deeper than 12 levels.
+- Dependency goals are ordered deepest-first and kept in the saved `materialGoalStack`. A prerequisite can consume intermediate materials (for example, planks for sticks) before the parent recipe is resumed; the planner accounts for selected duplicate ingredients and rechecks inventory before crafting.
+- Tool requirements are resolved as normal goals. Pickaxe tier is checked before mining, axes are crafted before stripping logs, and shears are crafted before sheep wool is collected. The recipe graph can therefore expand from a requested block into tools, planks, sticks, crafting tables, furnaces, ore, fuel and natural resources.
+- Stonecutting recipes plan a retained stonecutter item and the selected input. Standard smelting recipes plan a retained furnace item, their input and coal/charcoal fuel. Stonecutting and crafting are immediate recipe-driven simulations; smelting remains timed. None of these actions places or opens a physical workstation GUI.
+- Safe source adapters cover natural trees/logs, stripped logs, supported stone and ore drops, clay deposits, flowers, mature common crops, sheep wool and selected terrain blocks. Hostile-mob drops are not chosen as fallbacks.
+- If no registered recipe or supported peaceful/natural source exists, the planner logs the missing item and keeps the project state instead of inventing a drop. Decorative vegetation remains optional.
+
+### Scope and limitations
+
+This is generic planning across registered vanilla/datapack **crafting**, standard **smelting** and **stonecutting** recipes, combined with the mod's supported world-source adapters. It is not an oracle for every possible loot table or every recipe category: smithing, brewing, blasting, smoking, campfire cooking, player trades and arbitrary third-party gathering mechanics are not yet executable acquisition routes. A modded item that has only a custom loot-table drop needs a source adapter. Mature crops are harvested when present; the builder does not yet create/maintain farms as a universal crop provider.
+
+See [docs/MATERIAL_ACQUISITION_PLANNER_1.3.1.md](docs/MATERIAL_ACQUISITION_PLANNER_1.3.1.md) for the resolution rules and [docs/TEST_SCENARIOS_1.3.1.md](docs/TEST_SCENARIOS_1.3.1.md) for regression cases.
+
+### Verification status
+
+The package includes source-level checks, JSON/workflow consistency checks and ZIP integrity checks. A Fabric compile and gameplay simulation still need to be run by GitHub Actions and in a Minecraft test world.
 
 ## Decorative vegetation is optional (1.2.7)
 
@@ -255,3 +280,42 @@ Third-party profession houses can be configured through JSON. See [docs/MOD_COMP
 - Builders no longer break leaf blocks. Leaves decay naturally after logs are removed; sapling item drops are collected opportunistically and re-planted.
 - Sapling planting spots are randomized across suitable dirt/grass ground within `saplingPlantRadius`, with `saplingMinimumSpacing` blocks between saplings (default: 8).
 - Sapling planting is opportunistic and does not block house construction if no saplings drop or no valid planting spot is available.
+## Objective planning and recovery (1.3.0)
+
+- Blueprint materials are treated as goals and resolved through registered crafting/smelting recipes. Missing ingredients are requested recursively; parent item and quantity are retained while prerequisite ingredients are gathered.
+- Tool prerequisites are now explicit. A crafting table is retained before tool crafting; coal/stone collection uses at least a wooden pickaxe, iron/copper/gold/lapis/redstone uses a stone pickaxe, and diamond/emerald uses an iron pickaxe.
+- Stripped-log requests resolve to the matching natural log species. The builder obtains an axe, strips the trunk block, then collects the stripped log.
+- Wool requests prefer shearable sheep and crafted shears. Hostile mob drops are not used as a fallback for bed materials.
+- Stone collection remembers a bounded quarry centre and works locally before choosing a new source, reducing scattered holes. Quarry state survives save/reload.
+- A limited navigation rescue can place one dirt/cobblestone step when a higher target is unreachable, after checking support, clearance and nearby entities.
+- The house is now built before its access road. The road follows the template's entrance-side goal and is widened to three blocks.
+- Existing 1.2.x tasks saved during `BUILD_PATH` return to unfinished house construction before the road resumes.
+
+See [docs/OBJECTIVE_PLANNER_1.3.0.md](docs/OBJECTIVE_PLANNER_1.3.0.md) for the objective/source policy and [docs/TEST_SCENARIOS_1.3.0.md](docs/TEST_SCENARIOS_1.3.0.md) for manual regression tests.
+
+### Verification status
+
+The source package has been checked for Java syntax-level errors, JSON validity, workflow/version consistency and ZIP integrity. A full Fabric compile and Minecraft simulation were not run in the creation environment; use GitHub Actions and the in-game scenarios before treating this release as gameplay-verified.
+
+
+## Professional resource sharing (1.3.2)
+
+- Before gathering or crafting a missing material, the recursive planner checks employed, adult villagers with a profession inside the configured radius (40 blocks by default). It matches the output of their currently available offers to the requested item; equal-or-better tools of the same family also satisfy tool prerequisites.
+- The builder navigates to the nearest matching professional and receives the output without paying emeralds, barter ingredients or granting merchant XP. One offer use is reserved per output stack so stock remains finite and can become available again through vanilla restocking.
+- The provider can be a blacksmith, farmer, shepherd or any other non-nitwit profession; profession name is not hard-coded to the requested item. The offer output must match the goal. If no provider has suitable stock, is reachable or has room for the delivery, the planner resumes self-acquisition.
+- `professionalResourceSharing` toggles the feature and `professionalResourceSearchRadius` configures the search radius (default 40, clamped to 8–128).
+- This is a free, mod-defined transfer based on the villager's offer output. It does not execute the vanilla merchant transaction and therefore does not consume the offer's input items or grant trade XP. The offer's use counter is advanced to avoid unlimited duplication before restocking.
+
+### Validation
+- Static source, JSON, workflow and ZIP checks are included. GitHub Actions must still confirm the Fabric build; in-game scenarios are documented in [docs/TEST_SCENARIOS_1.3.2.md](docs/TEST_SCENARIOS_1.3.2.md).
+
+
+## Professional supply acquisition hardening (1.3.3)
+
+- Free supply sharing remains available from any adult, employed, non-nitwit villager whose active offer output matches the builder's current material goal. The scan radius defaults to 40 blocks and remains configurable.
+- A matching offer can be used multiple times in one visit while stock remains; each output stack reserves exactly one offer use. This avoids unnecessary repeat trips when the requested quantity exceeds one trade output stack.
+- Tool matching accepts equal-or-better tools only from the same family (pickaxe for pickaxe, axe for axe, shovel for shovel). An unrelated tool can never satisfy the prerequisite.
+- Providers without a matching active offer, with exhausted offers, outside the radius, inaccessible for too long or unable to transfer because of inventory capacity are skipped; the builder falls back to its own acquisition plan.
+
+### Regression checks
+See [docs/TEST_SCENARIOS_1.3.3.md](docs/TEST_SCENARIOS_1.3.3.md). These are manual in-game scenarios and have not been simulated in this environment.

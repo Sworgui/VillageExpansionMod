@@ -37,7 +37,10 @@ public final class VillageExpansionConfig {
     /** Minimum horizontal distance between a village centre and a registered mine entrance. */
     public static int mineMinimumDistanceFromVillage = 20;
     public static int houseSpacing = 12;
-    public static boolean blacksmithToolUpgrades = true;
+    /** Legacy option retained for existing config files; superseded by free professional supply sharing. */
+    @Deprecated public static boolean blacksmithToolUpgrades = true;
+    public static boolean professionalResourceSharing = true;
+    public static int professionalResourceSearchRadius = 40;
     /** Legacy values retained for config migration; construction now derives exact blueprint requirements. */
     public static int woodRequired = 0;
     public static int stoneRequired = 0;
@@ -99,7 +102,9 @@ public final class VillageExpansionConfig {
             // Keep the requested 20-block safety offset as a hard minimum.
             mineMinimumDistanceFromVillage = clamp(integer(json, "mineMinimumDistanceFromVillage", 20), 20, 96);
             houseSpacing = clamp(integer(json, "houseSpacing", 12), 6, 32);
-            blacksmithToolUpgrades = bool(json, "blacksmithToolUpgrades", true);
+            blacksmithToolUpgrades = bool(json, "blacksmithToolUpgrades", true); // Legacy, no longer consumes builder ingots.
+            professionalResourceSharing = bool(json, "professionalResourceSharing", true);
+            professionalResourceSearchRadius = clamp(integer(json, "professionalResourceSearchRadius", 40), 8, 128);
             woodRequired = 0; // Deprecated: exact requirements are derived from the selected structure.
             stoneRequired = 0; // Deprecated: exact requirements are derived from the selected structure.
             woodUnitsPerLog = clamp(integer(json, "woodUnitsPerLog", 4), 1, 8);
@@ -155,6 +160,8 @@ public final class VillageExpansionConfig {
         json.addProperty("mineMinimumDistanceFromVillage", mineMinimumDistanceFromVillage);
         json.addProperty("houseSpacing", houseSpacing);
         json.addProperty("blacksmithToolUpgrades", blacksmithToolUpgrades);
+        json.addProperty("professionalResourceSharing", professionalResourceSharing);
+        json.addProperty("professionalResourceSearchRadius", professionalResourceSearchRadius);
         json.addProperty("woodRequired", woodRequired);
         json.addProperty("stoneRequired", stoneRequired);
         json.addProperty("woodUnitsPerLog", woodUnitsPerLog);
