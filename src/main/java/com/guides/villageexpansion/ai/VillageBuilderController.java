@@ -357,7 +357,7 @@ public final class VillageBuilderController {
         if (task.cachedNearbyDanger || (villager.getAttacker() != null && villager.getAttacker().isAlive())
                 || healthEmergency(villager) || now < task.pausedUntil
                 || task.sleepingAtNight || nightWithAssignedHome(villager)) {
-            hideBreakingProgress(world, villager, task);
+            hideBreakingProgress(serverWorld, villager, task);
             return;
         }
 
@@ -6212,6 +6212,8 @@ public final class VillageBuilderController {
         private int currentTreeLeafIndex;
         private boolean currentTreeLeavesScanned;
         private int smeltTicksRemaining;
+        /** Furnace selected for the active smelting operation, whether pre-existing or temporary. */
+        private BlockPos smeltWorkstationPos;
         /** A furnace placed by this builder for the active smelting operation; removed and reclaimed on completion. */
         private BlockPos temporaryFurnacePos;
         /** Temporary table remains in the world during the crafting-use window, then is reclaimed. */

@@ -1,3 +1,9 @@
+## 1.4.10
+
+- Fixed the server-world variable passed to `hideBreakingProgress()` after the vanilla Brain tick.
+- Added the missing `BuilderTask.smeltWorkstationPos` field; the existing NBT serialization/restoration and smelting workflow now refer to a declared task property.
+- Updated the CI artifact name for 1.4.10.
+
 ## 1.4.9
 
 - Fixed the Fabric compilation error in `MaterialAcquisitionPlanner`: imported `net.minecraft.block.Block`, which is used by the nearby-workstation lookup helper. This is a compile-only fix; runtime behavior is unchanged from 1.4.8.

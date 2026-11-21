@@ -1,8 +1,8 @@
-# Village Expansion 1.4.9
+# Village Expansion 1.4.10
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
-## 1.4.9 build fix
+## 1.4.10 build fix
 
 - Added the missing `net.minecraft.block.Block` import in `MaterialAcquisitionPlanner`, resolving the reported `cannot find symbol: class Block` compiler error. No gameplay logic changed.
 - The previous 1.4.8 behavior and acceptance scenarios remain unchanged; see `docs/TEST_SCENARIOS_1.4.8.md`.
@@ -481,3 +481,9 @@ New configuration keys:
 ```
 
 The site selector no longer requires a naturally flat, completely clear footprint. It evaluates a small local radius, allows bounded natural terrain changes, and creates incremental cut/fill operations. If no leveling is necessary, the worker moves directly to construction.
+
+
+## 1.4.10 compile fixes
+
+- Use the `ServerWorld` local in `afterVanillaBrainTick` when hiding active block-breaking progress.
+- Declare the persisted `smeltWorkstationPos` field on `BuilderTask`, matching its existing NBT save/load and furnace-lease usage.
