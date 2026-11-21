@@ -1,4 +1,13 @@
-# Village Expansion 1.4.11
+# Village Expansion 1.4.14
+
+
+## Version 1.4.14 — material dependency recovery and planning responsiveness
+
+Version 1.4.14 corrects the order in which deferred crafting dependencies resume. If a wooden shovel needs planks and the plank recipe needs logs, the log dependency is completed first, then the plank output is made, and only then is the shovel retried. Existing saved tasks are migrated from the old root-first queue order automatically.
+
+For vanilla outputs, a viable vanilla recipe now wins over modded alternatives. A modded recipe remains usable when no executable vanilla recipe exists. Material planning also receives an independent eight-slice round-robin budget per tick; each worker can advance at most two phases in a tick, and recipe registry indexing is shared rather than repeated by each worker. Unavailable-plan retries default to 40 ticks. The config migration advances `performanceTuningVersion` to 10 once and updates the planning-related timing keys; subsequent manual edits are preserved.
+
+New configuration keys: `lazyPlanningSlicesPerTick` (1–32, default 8) and `materialPlanFailureRetryTicks` (10–600, default 40). `lazyPlanningRecipeEntriesPerTick` now defaults to 256.
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
 
@@ -174,13 +183,13 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "maxActiveBuildersPerDimension": 20,
   "navigationSpeed": 0.65,
   "taskTickInterval": 1,
-  "builderTaskUpdatesPerTick": 1,
+  "builderTaskUpdatesPerTick": 2,
   "builderTaskGlobalIntervalTicks": 1,
-  "builderTaskMinIntervalTicks": 10,
+  "builderTaskMinIntervalTicks": 2,
   "assignmentScanInterval": 40,
-  "spatialSearchIntervalTicks": 20,
-  "lazyPlanningStepIntervalTicks": 40,
-  "lazyPlanningRecipeEntriesPerTick": 2,
+  "spatialSearchIntervalTicks": 8,
+  "lazyPlanningStepIntervalTicks": 1,
+  "lazyPlanningRecipeEntriesPerTick": 128,
   "retryDelayTicks": 600,
   "dangerRadius": 12,
   "dangerPauseTicks": 120,
@@ -208,7 +217,7 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "saplingMinimumSpacing": 8,
   "showBuilderTaskLabel": true,
   "materialSearchRadius": 28,
-  "materialSearchIntervalTicks": 100,
+  "materialSearchIntervalTicks": 20,
   "useRecipeBookForCrafting": true,
   "maxPathSearchNodes": 300,
   "buildBlockDelayTicks": 2,
@@ -230,14 +239,16 @@ On a dedicated server, the file is in the server's `config` directory. Example s
 
 All values are clamped to safe ranges when loaded. The most useful controls are:
 
+Version 1.4.13 automatically migrates older performance profiles (`performanceTuningVersion` below 9) to responsive defaults: two construction updates per world tick, a two-tick per-worker minimum, one-tick material-planning phases, 128 recipe index entries per tick and a 20-tick natural-resource retry. The planner also prefers a supported direct source (tree, mine, crop, clay, wool, etc.) over modded recipe alternatives, and a recursive-budget timeout can no longer mark an unverified recipe as usable.
+
 | Setting | Purpose |
 |---|---|
 | `maxBuildersPerVillage` | Maximum simultaneous workers in one settlement |
 | `maxActiveBuildersPerDimension` | Hard dimension-wide limit, including tasks saved in unloaded chunks (default: 20) |
 | `taskTickInterval` | How often the mod controller runs (default: every game tick) |
-| `builderTaskMinIntervalTicks` | Minimum delay between custom task updates for the same builder (default: 10 ticks; round-robin still limits total work) |
+| `builderTaskMinIntervalTicks` | Minimum delay between custom task updates for the same builder (default: 2 ticks; round-robin still limits total work) |
 | `builderTaskGlobalIntervalTicks` | Minimum delay between globally scheduled builder task slices (default: 1 tick) |
-| `spatialSearchIntervalTicks` | Minimum delay between expensive world-resource scans in one dimension (default: 20 ticks) |
+| `spatialSearchIntervalTicks` | Minimum delay between expensive world-resource scans in one dimension (default: 8 ticks) |
 | `navigationSpeed` | Villager navigation speed while moving between work positions |
 | `dangerRadius` | Distance at which hostile mobs interrupt work |
 | `dangerPauseTicks` | Delay before a builder resumes after danger |
@@ -432,13 +443,13 @@ Material planning is time-sliced. The controller does not evaluate the full reci
 New configuration values are written automatically to `config/village_expansion.json`:
 
 - The original 1.3.7 defaults were `lazyPlanningStepIntervalTicks = 4` and `lazyPlanningRecipeEntriesPerTick = 32`.
-- Since 1.3.9, the ultra-low-CPU profile uses `lazyPlanningStepIntervalTicks = 40` and `lazyPlanningRecipeEntriesPerTick = 2`.
+- The historical 1.3.9 ultra-low-CPU profile used `lazyPlanningStepIntervalTicks = 40` and `lazyPlanningRecipeEntriesPerTick = 2`. Version 1.4.13 replaces that profile with bounded two-worker scheduling, one-tick planning phases and 128 recipe entries per tick so pending material decisions cannot be starved by construction updates.
 - The first value controls the minimum ticks between phases of a material plan. Increasing it lowers planning load but delays acquisition decisions.
 - The second value caps recipe registry entries inspected while the shared index is being built. Lower values smooth indexing further but delay the first recipe-based plan.
 
-Only one builder planning phase is advanced per world/controller tick. Completed recipe choices are cached for the current task; child dependencies can be acquired without recalculating the parent choice. Supplier lookup and recipe-index batches continue gradually, and expensive material-comparison phases remain separated by the configured 40-tick default interval in the low-CPU profile.
+The historical 1.3.9 controller advanced one material-planning phase per world/controller tick, separated recipe comparisons by 40 ticks and indexed two recipes per tick. Version 1.4.13 replaces those timings with one-tick planning phases, two fair planning slices per tick, and 128 recipe index entries per tick.
 
-## Ultra-low-CPU controller (1.3.9)
+## Historical ultra-low-CPU controller (1.3.9)
 
 - The controller itself runs every 2 game ticks by default. It advances at most one expensive construction task slice every 2 ticks, in round-robin order.
 - Each builder has a 40-tick minimum interval between custom task slices. With 20 active builders, each receives roughly one custom action every 2 seconds; construction is slower, but one builder cannot monopolize the main thread.
@@ -447,10 +458,10 @@ Only one builder planning phase is advanced per world/controller tick. Completed
 - The controller uses Fabric `ServerEntityEvents.ENTITY_LOAD` / `ENTITY_UNLOAD` to maintain a loaded-villager cache. It and the breeding fallback no longer run full-world entity polling.
 - Resource search permits are spaced 20 ticks apart per dimension. Material scans use bounded samples; tree canopy/protection checks use sparse probes; exposed-cave searches use a smaller sample grid.
 - Tree discovery, tree cutting, plot vegetation clearing and blueprint-material counting remain incremental. Search targets and material quotas are cached.
-- Lazy recipe planning is advanced every 40 ticks and indexes at most 2 recipe entries per tick. Assignment runs no more frequently than every 40 ticks; navigation destination reassertion is reduced to every 40 ticks.
+- The historical profile advanced lazy recipe planning every 40 ticks and indexed at most 2 recipe entries per tick. This is no longer the default after version 1.4.13.
 - A* road discovery is capped at 300 expanded nodes. Task, assignment and controller slices log warnings at 10 ms.
 
-This profile intentionally trades construction speed for lower main-thread overhead. For 20 active builders it targets approximately 10 custom task slices per second in one dimension, distributed across workers. It does not remove the cost of Minecraft's own entity ticking, vanilla pathfinding, chunk simulation, other mods, or networking; zero total server cost is not achievable.
+This historical profile intentionally traded construction speed for lower main-thread overhead. Its settings are retained here for context only; 1.4.13 uses a responsive bounded scheduler. It does not remove the cost of Minecraft's own entity ticking, vanilla pathfinding, chunk simulation, other mods, or networking; zero total server cost is not achievable.
 
 
 ## 1.4.1 — House-first clearing and bounded local terraforming

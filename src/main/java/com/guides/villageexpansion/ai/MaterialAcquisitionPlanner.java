@@ -13,6 +13,7 @@ import net.minecraft.recipe.CraftingRecipe;
 import net.minecraft.recipe.Ingredient;
 import net.minecraft.recipe.RecipeEntry;
 import net.minecraft.recipe.RecipeManager;
+import net.minecraft.recipe.Recipe;
 import net.minecraft.recipe.RecipeType;
 import net.minecraft.recipe.SmeltingRecipe;
 import net.minecraft.recipe.StonecuttingRecipe;
@@ -49,10 +50,10 @@ final class MaterialAcquisitionPlanner {
     private static final int MAX_DEPTH = 12;
     // A planner decision must never consume an unbounded part of a server tick.
     // Modpacks can register hundreds of alternatives for common item tags.
-    private static final int MAX_PLANNER_STEPS = 24;
+    private static final int MAX_PLANNER_STEPS = 96;
     private static final int MAX_SOURCE_SCANS = 1;
-    private static final int MAX_INGREDIENT_CANDIDATES = 12;
-    private static final int MAX_RECIPES_PER_OUTPUT = 12;
+    private static final int MAX_INGREDIENT_CANDIDATES = 16;
+    private static final int MAX_RECIPES_PER_OUTPUT = 24;
     private static final ThreadLocal<PlanningBudget> ACTIVE_BUDGET = new ThreadLocal<>();
     private static final double IMPOSSIBLE = 1.0e12D;
     private static long sourceCacheWindow = Long.MIN_VALUE;
@@ -129,17 +130,12 @@ final class MaterialAcquisitionPlanner {
         int held = countInventory(villager, item);
         int missing = Math.max(0, count - held);
         if (missing == 0) return 0.0D;
-        if (sourceFor(item) != SourceKind.NONE) return 24.0D * missing;
-        // Do not recursively inspect recipes after the budget is exhausted.
-        // A registered recipe is enough to keep the goal eligible for a later,
-        // smaller execution-time query.
-        ensureRecipeIndex(world);
-        if (!CRAFTING_BY_OUTPUT.getOrDefault(item, List.of()).isEmpty()
-                || !STONECUTTING_BY_OUTPUT.getOrDefault(item, List.of()).isEmpty()
-                || !SMELTING_BY_OUTPUT.getOrDefault(item, List.of()).isEmpty()) {
-            return 40.0D * missing;
-        }
-        return IMPOSSIBLE;
+        // Never claim that a recipe is viable merely because an output recipe
+        // exists. Its ingredients may be unobtainable (or may form a dependency
+        // cycle). Budget exhaustion is conservative: direct sources remain eligible,
+        // while recipe routes must be fully evaluated before the executor commits.
+        return MaterialPlanDecisionPolicy.budgetFallbackCost(
+                sourceFor(item) != SourceKind.NONE, missing, 24.0D, IMPOSSIBLE);
     }
 
     private MaterialAcquisitionPlanner() { }
@@ -198,6 +194,9 @@ final class MaterialAcquisitionPlanner {
         }
 
         if (!build.recipeIds.hasNext()) {
+            sortRecipeIndex(build.craftingByOutput);
+            sortRecipeIndex(build.smeltingByOutput);
+            sortRecipeIndex(build.stonecuttingByOutput);
             CRAFTING_BY_OUTPUT = freezeIndex(build.craftingByOutput);
             SMELTING_BY_OUTPUT = freezeIndex(build.smeltingByOutput);
             STONECUTTING_BY_OUTPUT = freezeIndex(build.stonecuttingByOutput);
@@ -207,6 +206,15 @@ final class MaterialAcquisitionPlanner {
             return true;
         }
         return false;
+    }
+
+    private static <T extends Recipe<?>> void sortRecipeIndex(Map<Item, List<RecipeEntry<T>>> index) {
+        for (List<RecipeEntry<T>> entries : index.values()) {
+            entries.sort(Comparator
+                    .comparingInt((RecipeEntry<T> entry) ->
+                            "minecraft".equals(entry.id().getNamespace()) ? 0 : 1)
+                    .thenComparing(entry -> entry.id().toString()));
+        }
     }
 
     private static void beginRecipeIndexIfNeeded(RecipeManager manager) {
@@ -352,9 +360,10 @@ final class MaterialAcquisitionPlanner {
                     entry.value().getIngredients(), batches, depth + 1, visiting);
             if (dependencies == null) continue;
 
-            double recipeCost = requiresCraftingTable(entry.value(), item)
+            double recipeCost = MaterialPlanDecisionPolicy.recipeOriginPenalty(entry.id().getNamespace())
+                    + (requiresCraftingTable(entry.value(), item)
                     && !hasWorkstation(world, villager, Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE)
-                    ? estimateItemCost(world, villager, Items.CRAFTING_TABLE, 1, depth + 1, visiting) : 0.0D;
+                    ? estimateItemCost(world, villager, Items.CRAFTING_TABLE, 1, depth + 1, visiting) : 0.0D);
             if (recipeCost >= IMPOSSIBLE) continue;
             boolean viable = true;
             for (Map.Entry<Item, Integer> dependency : dependencies.entrySet()) {
@@ -381,7 +390,8 @@ final class MaterialAcquisitionPlanner {
             double cutterCost = countInventory(villager, Items.STONECUTTER) > 0 ? 0.0D
                     : estimateItemCost(world, villager, Items.STONECUTTER, 1, depth + 1, visiting);
             if (inputCost < IMPOSSIBLE && cutterCost < IMPOSSIBLE) {
-                best = Math.min(best, inputCost + cutterCost + 1.5D);
+                best = Math.min(best, inputCost + cutterCost + 1.5D
+                        + MaterialPlanDecisionPolicy.recipeOriginPenalty(entry.id().getNamespace()));
             }
         }
 
@@ -406,7 +416,8 @@ final class MaterialAcquisitionPlanner {
             int fuelMissing = Math.max(0, fuelNeeded - fuelHeld);
             double fuelCost = fuelMissing == 0 ? 0.0D
                     : estimateItemCost(world, villager, Items.COAL, fuelMissing, depth + 1, visiting);
-            if (fuelCost < IMPOSSIBLE) best = Math.min(best, inputCost + furnaceCost + fuelCost + 3.0D);
+            if (fuelCost < IMPOSSIBLE) best = Math.min(best, inputCost + furnaceCost + fuelCost + 3.0D
+                    + MaterialPlanDecisionPolicy.recipeOriginPenalty(entry.id().getNamespace()));
         }
 
         visiting.remove(item);
@@ -420,7 +431,8 @@ final class MaterialAcquisitionPlanner {
 
     private static CraftingChoice chooseBestCraftingRecipeInternal(ServerWorld world, VillagerEntity villager,
                                                                     Item desired, int amount) {
-        CraftingChoice best = null;
+        CraftingChoice bestVanilla = null;
+        CraftingChoice bestAlternative = null;
         int held = countInventory(villager, desired);
         if (isTool(desired) && hasToolOrBetter(villager, desired)) held = Math.max(1, held);
         int missing = Math.max(0, amount - held);
@@ -433,9 +445,10 @@ final class MaterialAcquisitionPlanner {
                     entry.value().getIngredients(), batches, 0, new HashSet<>());
             if (ingredients == null) continue;
 
-            double score = requiresCraftingTable(entry.value(), desired)
+            double score = MaterialPlanDecisionPolicy.recipeOriginPenalty(entry.id().getNamespace())
+                    + (requiresCraftingTable(entry.value(), desired)
                     && !hasWorkstation(world, villager, Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE)
-                    ? estimateItemCost(world, villager, Items.CRAFTING_TABLE, 1, 0, new HashSet<>()) : 0.0D;
+                    ? estimateItemCost(world, villager, Items.CRAFTING_TABLE, 1, 0, new HashSet<>()) : 0.0D);
             if (score >= IMPOSSIBLE) continue;
             boolean viable = true;
             for (Map.Entry<Item, Integer> ingredient : ingredients.entrySet()) {
@@ -444,11 +457,22 @@ final class MaterialAcquisitionPlanner {
                 if (cost >= IMPOSSIBLE) { viable = false; break; }
                 score += cost;
             }
-            if (viable && (best == null || score < best.score())) {
-                best = new CraftingChoice(entry, Collections.unmodifiableMap(new java.util.LinkedHashMap<>(ingredients)), score);
+            if (viable) {
+                CraftingChoice candidate = new CraftingChoice(entry,
+                        Collections.unmodifiableMap(new java.util.LinkedHashMap<>(ingredients)), score);
+                boolean vanilla = "minecraft".equals(entry.id().getNamespace());
+                if (vanilla) {
+                    if (bestVanilla == null || MaterialPlanDecisionPolicy.preferRecipeCandidate(
+                            true, score, true, bestVanilla.score())) bestVanilla = candidate;
+                } else if (bestAlternative == null || MaterialPlanDecisionPolicy.preferRecipeCandidate(
+                        false, score, false, bestAlternative.score())) {
+                    bestAlternative = candidate;
+                }
             }
         }
-        return best;
+        // Never let a cheaper modded datapack recipe replace the canonical vanilla
+        // recipe for vanilla items (for example logs -> planks or planks -> tools).
+        return bestVanilla != null ? bestVanilla : bestAlternative;
     }
 
     static StonecuttingChoice chooseBestStonecuttingRecipe(ServerWorld world, VillagerEntity villager,
@@ -458,7 +482,8 @@ final class MaterialAcquisitionPlanner {
 
     private static StonecuttingChoice chooseBestStonecuttingRecipeInternal(ServerWorld world, VillagerEntity villager,
                                                                             Item desired, int amount) {
-        StonecuttingChoice best = null;
+        StonecuttingChoice bestVanilla = null;
+        StonecuttingChoice bestAlternative = null;
         int held = countInventory(villager, desired);
         int missing = Math.max(0, amount - held);
         if (missing <= 0) return null;
@@ -472,16 +497,25 @@ final class MaterialAcquisitionPlanner {
             ItemStack input = cheapestIngredient(world, villager, inputIngredient, batches,
                     0, new HashSet<>(), null, Map.of());
             if (input.isEmpty()) continue;
-            double score = estimateItemCost(world, villager, input.getItem(), batches, 0, new HashSet<>());
+            double score = estimateItemCost(world, villager, input.getItem(), batches, 0, new HashSet<>())
+                    + MaterialPlanDecisionPolicy.recipeOriginPenalty(entry.id().getNamespace());
             if (countInventory(villager, Items.STONECUTTER) == 0) {
                 score += estimateItemCost(world, villager, Items.STONECUTTER, 1, 0, new HashSet<>());
             }
             score += 1.5D;
-            if (score < IMPOSSIBLE && (best == null || score < best.score())) {
-                best = new StonecuttingChoice(entry, input.getItem(), score);
+            if (score < IMPOSSIBLE) {
+                StonecuttingChoice candidate = new StonecuttingChoice(entry, input.getItem(), score);
+                boolean vanilla = "minecraft".equals(entry.id().getNamespace());
+                if (vanilla) {
+                    if (bestVanilla == null || MaterialPlanDecisionPolicy.preferRecipeCandidate(
+                            true, score, true, bestVanilla.score())) bestVanilla = candidate;
+                } else if (bestAlternative == null || MaterialPlanDecisionPolicy.preferRecipeCandidate(
+                        false, score, false, bestAlternative.score())) {
+                    bestAlternative = candidate;
+                }
             }
         }
-        return best;
+        return bestVanilla != null ? bestVanilla : bestAlternative;
     }
 
     static SmeltingChoice chooseBestSmeltingRecipe(ServerWorld world, VillagerEntity villager,
@@ -491,7 +525,8 @@ final class MaterialAcquisitionPlanner {
 
     private static SmeltingChoice chooseBestSmeltingRecipeInternal(ServerWorld world, VillagerEntity villager,
                                                                     Item desired, int amount) {
-        SmeltingChoice best = null;
+        SmeltingChoice bestVanilla = null;
+        SmeltingChoice bestAlternative = null;
         int held = countInventory(villager, desired);
         if (isTool(desired) && hasToolOrBetter(villager, desired)) held = Math.max(1, held);
         int missing = Math.max(0, amount - held);
@@ -506,7 +541,8 @@ final class MaterialAcquisitionPlanner {
             ItemStack input = cheapestIngredient(world, villager, inputIngredient, batches,
                     0, new HashSet<>(), null, Map.of());
             if (input.isEmpty()) continue;
-            double score = estimateItemCost(world, villager, input.getItem(), batches, 0, new HashSet<>());
+            double score = estimateItemCost(world, villager, input.getItem(), batches, 0, new HashSet<>())
+                    + MaterialPlanDecisionPolicy.recipeOriginPenalty(entry.id().getNamespace());
             double furnaceCost = hasWorkstation(world, villager, Blocks.FURNACE, Items.FURNACE) ? 0.0D
                     : estimateItemCost(world, villager, Items.FURNACE, 1, 0, new HashSet<>());
             int fuelCount = Math.max(1, (entry.value().getCookingTime() * batches + 1599) / 1600);
@@ -514,11 +550,19 @@ final class MaterialAcquisitionPlanner {
             double fuelCost = fuelCount <= fuelHeld ? 0.0D
                     : estimateItemCost(world, villager, Items.COAL, fuelCount - fuelHeld, 0, new HashSet<>());
             score += furnaceCost + fuelCost + 3.0D;
-            if (score < IMPOSSIBLE && (best == null || score < best.score())) {
-                best = new SmeltingChoice(entry, input.getItem(), score);
+            if (score < IMPOSSIBLE) {
+                SmeltingChoice candidate = new SmeltingChoice(entry, input.getItem(), score);
+                boolean vanilla = "minecraft".equals(entry.id().getNamespace());
+                if (vanilla) {
+                    if (bestVanilla == null || MaterialPlanDecisionPolicy.preferRecipeCandidate(
+                            true, score, true, bestVanilla.score())) bestVanilla = candidate;
+                } else if (bestAlternative == null || MaterialPlanDecisionPolicy.preferRecipeCandidate(
+                        false, score, false, bestAlternative.score())) {
+                    bestAlternative = candidate;
+                }
             }
         }
-        return best;
+        return bestVanilla != null ? bestVanilla : bestAlternative;
     }
 
     static boolean requiresCraftingTable(CraftingRecipe recipe, Item output) {
@@ -696,20 +740,13 @@ final class MaterialAcquisitionPlanner {
         };
         if (workCost >= IMPOSSIBLE) return IMPOSSIBLE;
 
-        // Tool and workstation prerequisites are paid once for the whole batch,
-        // not once per block. They are still resolved as regular item goals.
-        double prerequisiteCost = 0.0D;
-        Item prerequisiteTool = requiredTool(item);
-        if (prerequisiteTool != null && !hasItemOrEquipped(villager, prerequisiteTool)) {
-            prerequisiteCost = estimateItemCost(world, villager, prerequisiteTool, 1, depth + 1, visiting);
-            if (prerequisiteCost >= IMPOSSIBLE) return IMPOSSIBLE;
-        }
-        if (source == SourceKind.SHEEP && !hasToolOrBetter(villager, Items.SHEARS)) {
-            double shearsCost = estimateItemCost(world, villager, Items.SHEARS, 1, depth + 1, visiting);
-            if (shearsCost >= IMPOSSIBLE) return IMPOSSIBLE;
-            prerequisiteCost += shearsCost;
-        }
-        return workCost * amount + prerequisiteCost;
+        // Tool prerequisites are deliberately not part of the source-route
+        // viability decision. The executor has dedicated, tested paths that obtain
+        // the required pickaxe/shears before starting the corresponding collection.
+        // Including recursive tool costs here caused a direct mine route to look
+        // impossible before the recipe index was even ready, then diverted the
+        // builder into unrelated recipe alternatives.
+        return workCost * amount;
     }
 
     private static boolean hasNearbyNaturalBlock(ServerWorld world, VillagerEntity villager, Item wanted, int radius) {

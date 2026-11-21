@@ -1,3 +1,25 @@
+## 1.4.14
+
+- Fixed an infinite material-goal loop caused by suspended recipe dependencies being resumed FIFO. Nested dependencies now resume nearest-parent-first (LIFO): logs complete the plank goal before the outer wooden-shovel goal is retried. Duplicate deferred parents are merged without changing dependency order.
+- Added a save migration for existing builder tasks: legacy goal stacks written root-first are reversed once and tagged with stack format version 2, so already-stuck Oak Planks / Wooden Shovel chains recover after updating.
+- Added regression tests for two- and three-level dependency order, duplicate parent goals, and migration of legacy saved order.
+- Vanilla recipes now take precedence over modded alternatives whenever a viable vanilla recipe exists for the output. Modded recipes remain a fallback when no executable vanilla recipe is available; this prevents datapack/mod recipes from unexpectedly replacing basic wood and tool recipes.
+- Material planning now has a separate round-robin budget (8 decision slices/tick) rather than sharing the two construction-action slots. A job can advance up to two bounded phases per tick, while fairness limits prevent one builder from monopolizing planning.
+- Shared recipe indexing advances once per world tick instead of being redundantly advanced once per waiting builder. The default indexing budget increases to 256 entries/tick.
+- Reduced failed material-plan retry delay from 200 to 40 ticks by default, and migrated existing performance profiles to one-tick controller spacing, eight planning slices/tick and the shorter retry interval.
+- Updated the CI test-report and artifact names to 1.4.14.
+
+## 1.4.13
+
+- Replaced the old 40-tick material-planning phase delay with one-tick phases. Each world tick now advances up to two fair, bounded planning slices, using the existing two-worker update budget.
+- Moved material-planning slices ahead of potentially expensive assignment/build slices so recipe decisions are not starved whenever construction work consumes the previous 2 ms end-of-tick budget.
+- Increased incremental recipe indexing from 2 to 128 entries per tick, raised the bounded recursive planning budget from 24 to 96 steps, and expanded consideration to 24 recipes / 16 ingredient candidates per output. Recipe indexes are ordered vanilla-first; modded alternatives remain available but receive a modest score penalty so a custom recipe does not unexpectedly displace a standard route.
+- Fixed optimistic planning fallback: exhausting the recursive budget no longer treats any registered recipe as a viable acquisition route. Only a supported direct source receives a finite fallback score; unverified recipe dependencies are rejected rather than trapping the builder in a recipe it cannot execute.
+- Directly collectable goals (logs, crops, clay, wool, mineable resources and natural blocks) now resolve to their supported natural/mining route before recipe alternatives are evaluated. Tool prerequisites are resolved by the collection executor after the route is selected, so a missing pickaxe/shears cannot incorrectly make a direct source look impossible before the recipe index is ready. This prevents modded recipes from diverting builders away from resources they can actually gather.
+- Version 9 config migration sets responsive defaults: 2 builder task updates per tick, 2-tick per-worker spacing, 1-tick planner spacing, 128 recipe entries per tick, 8-tick spatial-search spacing and 20-tick material retry interval. Existing users receive the migration once; explicit newer configs are retained afterwards.
+- Added registry-independent tests for direct-source priority and conservative planner-budget fallback.
+- Updated the GitHub Actions artifact and test-report names to 1.4.13.
+
 ## 1.4.12
 
 - Removed the JUnit test's direct `Bootstrap.initialize()` call, which raised `IllegalAccessError` under the Fabric Loom remapped test runtime.

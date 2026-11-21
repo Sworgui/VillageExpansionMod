@@ -22,11 +22,11 @@ public final class VillageExpansionConfig {
     public static double navigationSpeed = 0.65D;
     public static int taskTickInterval = 1;
     /** Maximum expensive construction task updates performed per world tick. */
-    public static int builderTaskUpdatesPerTick = 1;
+    public static int builderTaskUpdatesPerTick = 2;
     /** Global spacing between expensive custom builder updates; vanilla movement still ticks every tick. */
     public static int builderTaskGlobalIntervalTicks = 1;
     /** Minimum spacing between updates of the same builder; vanilla Brain/navigation still ticks normally. */
-    public static int builderTaskMinIntervalTicks = 10;
+    public static int builderTaskMinIntervalTicks = 2;
     /** Hostile-entity queries are cached; direct attacker/health checks remain immediate. */
     public static int dangerCheckIntervalTicks = 100;
     public static int assignmentScanInterval = 40;
@@ -44,7 +44,7 @@ public final class VillageExpansionConfig {
     /** Optional builder particle feedback; disabled by default for low-end servers. */
     public static boolean builderParticlesEnabled = false;
     /** Minimum number of game ticks between expensive world-resource searches in one dimension. */
-    public static int spatialSearchIntervalTicks = 20;
+    public static int spatialSearchIntervalTicks = 8;
     public static int mineExclusionRadius = 24;
     /** Failed stone/cobblestone scans before a builder starts a dedicated stair mine. */
     public static int stoneSearchFailuresBeforeMine = 5;
@@ -65,10 +65,14 @@ public final class VillageExpansionConfig {
     public static int saplingPlantRadius = 32;
     public static int saplingMinimumSpacing = 8;
     public static int materialSearchRadius = 28;
-    public static int materialSearchIntervalTicks = 100;
-    // Lazy planner advances only one bounded planning slice globally per controller tick.
-    public static int lazyPlanningStepIntervalTicks = 40;
-    public static int lazyPlanningRecipeEntriesPerTick = 2;
+    public static int materialSearchIntervalTicks = 20;
+    // Lazy planner has a separate bounded round-robin budget from construction actions.
+    public static int lazyPlanningStepIntervalTicks = 1;
+    /** Independent round-robin budget for material decisions; does not consume builder action slots. */
+    public static int lazyPlanningSlicesPerTick = 8;
+    /** Retry interval for goals with no currently executable acquisition route. */
+    public static int materialPlanFailureRetryTicks = 40;
+    public static int lazyPlanningRecipeEntriesPerTick = 256;
     public static boolean useRecipeBookForCrafting = true;
     public static int maxPathSearchNodes = 300;
     public static int buildBlockDelayTicks = 2;
@@ -204,6 +208,37 @@ public final class VillageExpansionConfig {
                 performanceTuningVersion = 8;
                 json.addProperty("performanceTuningVersion", performanceTuningVersion);
             }
+            if (performanceTuningVersion < 9) {
+                // Material plans used to advance only every 40 ticks and index two
+                // recipes per tick. In modpacks this made one decision take minutes.
+                // Keep the work bounded, but remove the artificial idle time between
+                // planning phases and let the round-robin scheduler update two workers.
+                json.addProperty("taskTickInterval", 1);
+                json.addProperty("builderTaskUpdatesPerTick", 2);
+                json.addProperty("builderTaskGlobalIntervalTicks", 1);
+                json.addProperty("builderTaskMinIntervalTicks", 2);
+                json.addProperty("lazyPlanningStepIntervalTicks", 1);
+                json.addProperty("lazyPlanningRecipeEntriesPerTick", 128);
+                json.addProperty("materialSearchIntervalTicks", 20);
+                json.addProperty("spatialSearchIntervalTicks", 8);
+                performanceTuningVersion = 9;
+                json.addProperty("performanceTuningVersion", performanceTuningVersion);
+            }
+            if (performanceTuningVersion < 10) {
+                // Planning decisions have their own fair budget instead of sharing
+                // the construction-action quota. Reduce waits between retries and
+                // speed the per-builder state machine up to one action slice/tick.
+                json.addProperty("taskTickInterval", 1);
+                json.addProperty("builderTaskGlobalIntervalTicks", 1);
+                json.addProperty("builderTaskMinIntervalTicks", 1);
+                json.addProperty("lazyPlanningStepIntervalTicks", 1);
+                json.addProperty("lazyPlanningSlicesPerTick", 8);
+                json.addProperty("lazyPlanningRecipeEntriesPerTick", 256);
+                json.addProperty("materialPlanFailureRetryTicks", 40);
+                json.addProperty("materialSearchIntervalTicks", 10);
+                performanceTuningVersion = 10;
+                json.addProperty("performanceTuningVersion", performanceTuningVersion);
+            }
 
             enabled = bool(json, "enabled", true);
             maxBuildersPerVillage = clamp(integer(json, "maxBuildersPerVillage", 20), 1, 20);
@@ -211,9 +246,9 @@ public final class VillageExpansionConfig {
             navigationSpeed = clamp(decimal(json, "navigationSpeed", 0.65D), 0.1D, 1.5D);
             taskTickInterval = clamp(integer(json, "taskTickInterval", 1), 1, 20);
             assignmentScanInterval = clamp(integer(json, "assignmentScanInterval", 40), 20, 1200);
-            builderTaskUpdatesPerTick = clamp(integer(json, "builderTaskUpdatesPerTick", 1), 1, 2);
+            builderTaskUpdatesPerTick = clamp(integer(json, "builderTaskUpdatesPerTick", 2), 1, 2);
             builderTaskGlobalIntervalTicks = clamp(integer(json, "builderTaskGlobalIntervalTicks", 1), 1, 20);
-            builderTaskMinIntervalTicks = clamp(integer(json, "builderTaskMinIntervalTicks", 10), 10, 200);
+            builderTaskMinIntervalTicks = clamp(integer(json, "builderTaskMinIntervalTicks", 2), 1, 200);
             dangerCheckIntervalTicks = clamp(integer(json, "dangerCheckIntervalTicks", 100), 20, 400);
             retryDelayTicks = clamp(integer(json, "retryDelayTicks", 600), 20, 12000);
             dangerRadius = clamp(integer(json, "dangerRadius", 12), 4, 48);
@@ -227,7 +262,7 @@ public final class VillageExpansionConfig {
             blockBreakBaseTicks = clamp(integer(json, "blockBreakBaseTicks", 28), 4, 200);
             particleIntervalTicks = clamp(integer(json, "particleIntervalTicks", 100), 20, 1200);
             builderParticlesEnabled = bool(json, "builderParticlesEnabled", false);
-            spatialSearchIntervalTicks = clamp(integer(json, "spatialSearchIntervalTicks", 20), 4, 200);
+            spatialSearchIntervalTicks = clamp(integer(json, "spatialSearchIntervalTicks", 8), 4, 200);
             mineExclusionRadius = clamp(integer(json, "mineExclusionRadius", 24), 8, 64);
             stoneSearchFailuresBeforeMine = clamp(integer(json, "stoneSearchFailuresBeforeMine", 5), 1, 20);
             // Keep the requested 20-block safety offset as a hard minimum.
@@ -245,9 +280,11 @@ public final class VillageExpansionConfig {
             saplingPlantRadius = clamp(integer(json, "saplingPlantRadius", 32), 8, 64);
             saplingMinimumSpacing = clamp(integer(json, "saplingMinimumSpacing", 8), 4, 16);
             materialSearchRadius = clamp(integer(json, "materialSearchRadius", 28), 8, 96);
-            materialSearchIntervalTicks = clamp(integer(json, "materialSearchIntervalTicks", 100), 20, 1200);
-            lazyPlanningStepIntervalTicks = clamp(integer(json, "lazyPlanningStepIntervalTicks", 40), 10, 200);
-            lazyPlanningRecipeEntriesPerTick = clamp(integer(json, "lazyPlanningRecipeEntriesPerTick", 2), 1, 32);
+            materialSearchIntervalTicks = clamp(integer(json, "materialSearchIntervalTicks", 20), 5, 1200);
+            lazyPlanningStepIntervalTicks = clamp(integer(json, "lazyPlanningStepIntervalTicks", 1), 1, 200);
+            lazyPlanningSlicesPerTick = clamp(integer(json, "lazyPlanningSlicesPerTick", 8), 1, 32);
+            materialPlanFailureRetryTicks = clamp(integer(json, "materialPlanFailureRetryTicks", 40), 10, 600);
+            lazyPlanningRecipeEntriesPerTick = clamp(integer(json, "lazyPlanningRecipeEntriesPerTick", 256), 1, 1024);
             useRecipeBookForCrafting = bool(json, "useRecipeBookForCrafting", true);
             maxPathSearchNodes = clamp(integer(json, "maxPathSearchNodes", 300), 100, 600);
             buildBlockDelayTicks = clamp(integer(json, "buildBlockDelayTicks", 2), 1, 40);
@@ -297,7 +334,7 @@ public final class VillageExpansionConfig {
         json.addProperty("particleIntervalTicks", particleIntervalTicks);
         json.addProperty("builderParticlesEnabled", builderParticlesEnabled);
         json.addProperty("spatialSearchIntervalTicks", spatialSearchIntervalTicks);
-        json.addProperty("performanceTuningVersion", 8);
+        json.addProperty("performanceTuningVersion", 10);
         json.addProperty("mineExclusionRadius", mineExclusionRadius);
         json.addProperty("stoneSearchFailuresBeforeMine", stoneSearchFailuresBeforeMine);
         json.addProperty("mineMinimumDistanceFromVillage", mineMinimumDistanceFromVillage);
@@ -316,6 +353,8 @@ public final class VillageExpansionConfig {
         json.addProperty("materialSearchRadius", materialSearchRadius);
         json.addProperty("materialSearchIntervalTicks", materialSearchIntervalTicks);
         json.addProperty("lazyPlanningStepIntervalTicks", lazyPlanningStepIntervalTicks);
+        json.addProperty("lazyPlanningSlicesPerTick", lazyPlanningSlicesPerTick);
+        json.addProperty("materialPlanFailureRetryTicks", materialPlanFailureRetryTicks);
         json.addProperty("lazyPlanningRecipeEntriesPerTick", lazyPlanningRecipeEntriesPerTick);
         json.addProperty("useRecipeBookForCrafting", useRecipeBookForCrafting);
         json.addProperty("maxPathSearchNodes", maxPathSearchNodes);
