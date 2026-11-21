@@ -1,3 +1,12 @@
+## 1.4.3
+
+- Fixed a movement regression in 1.4.2: the Brain hook no longer stops navigation whenever the custom task has a transient null `moveTarget` during planning or stage transitions.
+- Throttled navigation arbitration to once every 20 ticks. Reissuing `startMovingTo()` every entity tick could continuously rebuild a valid path and prevent the villager from visibly moving.
+- Kept profession enforcement and active block-breaking progress on every entity tick; only route arbitration is throttled.
+- Added `BuilderNavigationPolicy` and JUnit regression coverage for arbitration cadence and timed route reassertion.
+- Expanded the in-game acceptance matrix to 42 scenarios, including navigation continuity through planner transitions.
+- Bumped the mod version to 1.4.3 and updated the GitHub Actions artifact name.
+
 # Changelog
 
 ## 1.4.2

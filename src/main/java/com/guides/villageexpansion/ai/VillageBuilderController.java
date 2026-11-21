@@ -343,9 +343,10 @@ public final class VillageBuilderController {
                 || !task.dimension.equals(serverWorld.getRegistryKey())) return;
         long now = serverWorld.getTime();
 
-        // Vanilla may try to claim a workstation or assign a workplace walk target
-        // after its Brain tick. A live construction task owns the profession and,
-        // while it has a destination, the navigation command as well.
+        // Profession enforcement and mining progress are cheap and must run every
+        // entity tick. Navigation arbitration is deliberately throttled: repeatedly
+        // calling startMovingTo() can rebuild a valid path before Navigation has had
+        // time to advance it, leaving the villager apparently frozen.
         enforceBuilderRole(villager);
         tickActiveBlockBreak(serverWorld, villager, task);
 
@@ -353,27 +354,31 @@ public final class VillageBuilderController {
                 || healthEmergency(villager) || now < task.pausedUntil
                 || task.sleepingAtNight || nightWithAssignedHome(villager)) return;
 
-        // Clear vanilla walk targets even while the controller is planning or waiting
-        // for resources. Otherwise stroll/work tasks can keep moving the builder away
-        // from the point where its construction state machine expects it to be.
-        villager.getBrain().forget(MemoryModuleType.WALK_TARGET);
-        if (task.failedNavigationTarget != null || task.moveTarget == null) {
-            villager.getNavigation().stop();
-            return; // The controller will choose a bounded fallback or issue a new route.
-        }
+        if (!BuilderNavigationPolicy.isNavigationCheckDue(now, task.nextBrainNavigationCheckAt)) return;
+        task.nextBrainNavigationCheckAt = BuilderNavigationPolicy.nextNavigationCheckAt(now);
 
-        // Construction owns navigation after every Brain tick, not every 20 ticks.
+        // A null destination means the construction planner is between local
+        // actions, searching for materials, or waiting for the next stage. Do not
+        // cancel Navigation here: the controller may not have issued its next route
+        // yet, and vanilla is allowed to handle movement during this short gap.
+        if (task.failedNavigationTarget != null || task.moveTarget == null) return;
+
         double distance = villager.squaredDistanceTo(task.moveTarget.getX() + 0.5D,
                 task.moveTarget.getY(), task.moveTarget.getZ() + 0.5D);
         if (distance <= 4.0D) {
             villager.getNavigation().stop();
             return;
         }
+
+        // getTargetPos() may be the last reachable path node rather than the exact
+        // requested block. Compare it only at this throttled arbitration point, not
+        // on every Brain tick. The 20-tick gate prevents pathological path resets.
         BlockPos navigationTarget = villager.getNavigation().getTargetPos();
         boolean navigationWasOverridden = navigationTarget == null
                 || navigationTarget.getSquaredDistance(task.moveTarget) > 4.0D;
         if (villager.getNavigation().isIdle() || navigationWasOverridden
-                || now - task.lastBrainNavigationOverride >= VillageExpansionConfig.navigationReassertIntervalTicks) {
+                || BuilderNavigationPolicy.shouldReassertNavigation(now, task.lastBrainNavigationOverride,
+                VillageExpansionConfig.navigationReassertIntervalTicks)) {
             villager.getNavigation().startMovingTo(task.moveTarget.getX() + 0.5D,
                     task.moveTarget.getY(), task.moveTarget.getZ() + 0.5D,
                     VillageExpansionConfig.navigationSpeed);
@@ -5550,6 +5555,7 @@ public final class VillageBuilderController {
         private long lastNavigationProgressAt;
         private long lastNavigationCommandAt;
         private long lastBrainNavigationOverride;
+        private long nextBrainNavigationCheckAt;
         private int navigationRepathCount;
         private int navigationFallbackIndex;
         private int resourceSearchFailures;

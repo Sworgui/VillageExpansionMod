@@ -1,6 +1,14 @@
-# Village Expansion 1.4.2
+# Village Expansion 1.4.3
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
+
+## 1.4.3 changes
+
+- Fixed a navigation arbitration regression that could leave builders planning work but not moving. The controller no longer stops Navigation whenever its transient `moveTarget` is null during a planning/stage transition.
+- Throttled Brain-vs-builder navigation arbitration to one check every 20 ticks. Reissuing `startMovingTo()` every entity tick could rebuild a valid path before it advanced, appearing as a frozen villager.
+- Kept profession enforcement and active mining progress on every entity tick, independently from the slower navigation arbitration.
+- Added pure JUnit regression tests for navigation arbitration timing and route reassertion.
+- Added a new in-game acceptance scenario for movement during planner transitions and confirmed that an active route is not restarted every tick.
 
 ## 1.4.2 changes
 
@@ -10,7 +18,7 @@ Fabric mod that lets unemployed villagers start settlements, prepare land, gathe
 - Failed resource/navigation targets are temporarily rejected. Tree logs, leveling stands, mine entrances and construction stands have bounded retries/fallbacks.
 - A blueprint cell occupied by a living entity is retried for at most 600 ticks; after that, only that blocked cell is skipped. Other cells continue.
 - While a construction task is active, its villager is forced to the temporary Builder profession and vanilla `JOB_SITE` / `POTENTIAL_JOB_SITE` memories are cleared after each Brain tick. Vanilla safety and sleep behavior remain available.
-- JUnit regression tests and a 41-scenario in-game acceptance matrix are included under `src/test` and `docs/TEST_SCENARIOS_1.4.2.md`.
+- JUnit regression tests and a 42-scenario in-game acceptance matrix are included under `src/test` and `docs/TEST_SCENARIOS_1.4.3.md`.
 
 
 ## Requirements
@@ -26,7 +34,7 @@ This is a source project. It is not a precompiled JAR. The included GitHub Actio
 
 ### Construction priority, danger and sleep
 
-- The vanilla Villager Brain continues ticking. After each Brain tick, the mod compares its active navigation target with the current construction target and reapplies the construction route if vanilla wandering has replaced it.
+- The vanilla Villager Brain continues ticking. After Brain updates, the mod arbitrates construction navigation at a 20-tick interval. It only rebuilds the route when navigation is idle, its destination was replaced, or the configured reassertion interval elapsed; transient planner states with no custom destination do not cancel a valid navigation path.
 - If a hostile mob enters the configured danger radius or the villager is attacked, construction navigation priority is temporarily yielded so vanilla flee behavior can run. The same pause is applied while the villager is burning, drowning or at critically low health (25% or less), giving vanilla movement/safety goals control before construction resumes from its saved stage.
 - A navigation watchdog detects lack of movement progress, retries alternate nearby standing positions, and logs repeated route failures instead of silently waiting forever.
 - If a material search repeatedly fails, the worker expands its search radius (up to 96 blocks), logs the exact requested item and retries without discarding the active house project. Stone-like crafting ingredients and supported raw ores can use the underground mining route when no exposed target is found. If surface dirt is unavailable for a leveling fill, the worker can obtain stone through the mine and use it as a substitute.
