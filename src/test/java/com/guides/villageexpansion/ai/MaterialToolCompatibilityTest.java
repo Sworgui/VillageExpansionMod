@@ -1,6 +1,9 @@
 package com.guides.villageexpansion.ai;
 
+import net.minecraft.Bootstrap;
+import net.minecraft.SharedConstants;
 import net.minecraft.item.Items;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -8,6 +11,18 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MaterialToolCompatibilityTest {
+    /**
+     * These tests use vanilla Items, whose static initialization depends on
+     * Minecraft's built-in registries. Plain JUnit does not launch Minecraft,
+     * so initialize the game version and vanilla registries before the first
+     * reference to Items or registry-backed planner helpers.
+     */
+    @BeforeAll
+    static void bootstrapMinecraftRegistries() {
+        SharedConstants.createGameVersion();
+        Bootstrap.initialize();
+    }
+
     @Test
     void stoneShovelSatisfiesWoodenShovelGoal() {
         assertTrue(MaterialAcquisitionPlanner.isCompatibleProviderItem(Items.STONE_SHOVEL, Items.WOODEN_SHOVEL));

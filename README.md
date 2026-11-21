@@ -1,6 +1,12 @@
-# Village Expansion 1.4.10
+# Village Expansion 1.4.11
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
+
+## 1.4.11 test bootstrap fix
+
+- Initialized Minecraft's game version and vanilla registries in `MaterialToolCompatibilityTest` before tests access static `Items` constants. The previous six failures all originated from the first registry-backed test invocation; the remaining `NoClassDefFoundError` failures were follow-on errors after the initial class initialization failed.
+- GitHub Actions now uploads the JUnit HTML and XML reports whenever the test/build job fails, making the full exception chain available for the next diagnosis.
+- No gameplay logic changed.
 
 ## 1.4.10 build fix
 
