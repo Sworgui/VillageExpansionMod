@@ -1,6 +1,23 @@
-# Village Expansion 1.4.3
+# Village Expansion 1.4.5
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
+
+## 1.4.5 changes
+
+- Exact raw-log requests skip recipe/provider planning and immediately search for the matching natural tree; harvesting does not require an axe.
+- Natural-tree lookup now advances through every block column in a center-out spiral, with bounded 1,024-column slices and no repeated sampling of the same positions.
+- Wood search retries more frequently, reports whether the builder is searching or walking to a tree, and preserves the blueprint's biome-native wood requirement. The template palette is reloaded after plot selection, so it uses the actual house site's biome rather than the village center.
+- Existing saved tasks migrate wooden material goals to the family used by the reloaded, biome-adapted blueprint (for example, stale spruce requests become oak requests in Oak Forest).
+- The direct raw-log path resets its retry timer only when a new log goal begins; failed scans no longer cause a full search attempt every task tick.
+- Adds spiral-search unit tests and eight additional in-game acceptance cases for off-grid trees, Oak Forest logs, saved-task migration and retry cooldowns.
+
+## 1.4.4 changes
+
+- Fixed a circular dependency that stopped exact oak/spruce log requests before movement: a builder can now harvest natural logs by hand when it has no axe, then craft a tool from the collected wood.
+- Tool selection no longer deletes an unrelated item from the main hand when no tool of the requested family is available.
+- Replaced sparse random tree searches with a deterministic, retry-shifted grid. It finds the exact required species, checks more natural forest-floor blocks and gradually expands the search radius.
+- Converted wooden blocks in vanilla house templates to the local biome's wood family. Oak/regular forest uses oak; birch forest uses birch; dark forest uses dark oak; taiga/snow uses spruce; jungle, savanna, mangrove, cherry and pale garden use their corresponding wood families.
+- Preserved block-state properties during conversion and added regression tests for biome selection and block-path mapping.
 
 ## 1.4.3 changes
 
@@ -18,7 +35,7 @@ Fabric mod that lets unemployed villagers start settlements, prepare land, gathe
 - Failed resource/navigation targets are temporarily rejected. Tree logs, leveling stands, mine entrances and construction stands have bounded retries/fallbacks.
 - A blueprint cell occupied by a living entity is retried for at most 600 ticks; after that, only that blocked cell is skipped. Other cells continue.
 - While a construction task is active, its villager is forced to the temporary Builder profession and vanilla `JOB_SITE` / `POTENTIAL_JOB_SITE` memories are cleared after each Brain tick. Vanilla safety and sleep behavior remain available.
-- JUnit regression tests and a 42-scenario in-game acceptance matrix are included under `src/test` and `docs/TEST_SCENARIOS_1.4.3.md`.
+- JUnit regression tests and versioned in-game acceptance matrices are included under `src/test` and `docs/TEST_SCENARIOS_*.md`.
 
 
 ## Requirements
@@ -54,9 +71,9 @@ This is a source project. It is not a precompiled JAR. The included GitHub Actio
 
 ### Houses by biome
 
-The mod loads structure templates from Minecraft's own `minecraft:village/...` structure data. It selects plains, desert, savanna, taiga or snowy template families based on the current biome; biomes outside those families fall back to plains. Professional houses prefer a template that contains a known vanilla workstation. If no matching professional template can be found, a compact fallback blueprint is used.
+The mod loads structure templates from Minecraft's own `minecraft:village/...` structure data. It selects plains, desert, savanna, taiga or snowy layouts based on the current biome. Where Minecraft has no dedicated village layout (for example, a regular Forest/Oak Forest, Birch Forest, Dark Forest, Jungle, Mangrove Swamp or Cherry Grove), the plains layout is used as the structural base but its vanilla wooden blocks are converted to the local tree family. Oak Forest therefore requests oak logs, not spruce logs; Taiga requests spruce; Birch Forest requests birch; Dark Forest requests dark oak; other supported biome families use their matching wood.
 
-The template loader uses one palette per structure, since a structure's palettes represent alternative block variants rather than additive layers. This prevents duplicated block placement.
+The conversion covers logs, wood, planks, stairs, slabs, doors, trapdoors, fences, gates, signs and other vanilla wood-family blocks. Existing state properties such as axis, facing, half and waterlogging are preserved. The template loader uses one palette per structure, since a structure's palettes represent alternative block variants rather than additive layers. This prevents duplicated block placement.
 
 ### Roads, trees and terrain
 
@@ -81,7 +98,7 @@ The template loader uses one palette per structure, since a structure's palettes
 ### Block harvesting, tools and exact material planning
 
 - Tree logs, cave stone, ores and surface materials use visible vanilla block-breaking progress. Leaves are never harvested by the builder. The time is calculated from block hardness, tool mining speed and suitability; damageable tools lose durability when a block is harvested. Loot tables receive the actual held tool, so stone drops cobblestone and pickaxe-gated ores produce their normal drops.
-- Wood is requested by exact item and may only be sourced from a verified natural tree. The builder never mines arbitrary log blocks as a wood resource. Tree felling collects the whole selected tree, rather than leaving floating trunks. A conservative nearby-building check protects trees close to beds, doors, workstations and block entities.
+- Wood is requested by exact item and may only be sourced from a verified natural tree. The builder never mines arbitrary log blocks as a wood resource. Natural logs can be harvested by hand when the worker has no axe; this is the bootstrap path that lets it collect wood before crafting its first tools. Tree search advances through every column in a center-out spiral, in bounded slices of 1,024 columns, and expands its radius only after the previous square has been searched. Tree felling collects the whole selected tree, rather than leaving floating trunks. A conservative nearby-building check protects trees close to beds, doors, workstations and block entities.
 - The selected house template is counted as an item plan. Before gathering an item type, the builder counts every still-placeable occurrence of that item remaining in the blueprint and resolves the recipe ingredients for the total. Existing inventory is deducted, and the saved request count prevents repeated one-at-a-time collection loops. One item is consumed only when its block is placed. Upper door halves and bed head halves do not consume a second item; occupied non-replaceable positions are skipped without consuming materials.
 - Existing inventory is used first. When an item is missing, the builder follows registered crafting recipes recursively and collects only the missing ingredients. Recipe output is produced in normal recipe batches (for example, a door recipe yields three doors), so a small remainder can be carried into later placements or future jobs.
 - Recipe-based material sourcing includes wood from verified natural trees, stone and ore from exposed caves/mines or safe exposed rock faces, sand and clay from terrain, and wool from shearable sheep. During exact material requests, mining collects only the requested item to avoid filling the worker inventory with unrelated tunnel debris. Sheep are only sheared after the worker has crafted and equipped shears; wool can then be crafted into beds through the registered recipe system. Grass-block placements are planned as dirt items because vanilla grass blocks drop dirt without Silk Touch.

@@ -13,6 +13,7 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3i;
+import net.minecraft.state.property.Property;
 import net.minecraft.world.World;
 import net.minecraft.server.world.ServerWorld;
 
@@ -77,7 +78,7 @@ public final class VillageTemplateLibrary {
         for (int index = 1; index <= 4; index++) candidates.add(style + "_medium_house_" + index);
 
         for (String name : candidates) {
-            Optional<HouseTemplate> found = load(world, Identifier.of("minecraft", base + name));
+            Optional<HouseTemplate> found = load(world, Identifier.of("minecraft", base + name), near);
             if (found.isPresent() && found.get().hasUsefulHomeFeatures()
                     && (!professional || found.get().workstationOffset() != null)) {
                 return found;
@@ -102,6 +103,14 @@ public final class VillageTemplateLibrary {
     }
 
     public static Optional<HouseTemplate> load(ServerWorld world, Identifier id) {
+        return load(world, id, null);
+    }
+
+    /** Loads a template and converts its vanilla wooden blocks to the local biome's tree family. */
+    public static Optional<HouseTemplate> load(ServerWorld world, Identifier id, BlockPos biomePosition) {
+        String localWoodFamily = biomePosition == null ? null
+                : BiomeWoodProfile.familyForBiome(world.getBiome(biomePosition).getKey()
+                        .map(key -> key.getValue().getPath()).orElse("forest"));
         return world.getServer().getStructureTemplateManager().getTemplate(id).map(template -> {
             List<StructureTemplate.StructureBlockInfo> infos = new ArrayList<>();
             StructureTemplateAccessor accessor = (StructureTemplateAccessor) template;
@@ -117,6 +126,7 @@ public final class VillageTemplateLibrary {
             Direction doorFacing = Direction.SOUTH;
             for (StructureTemplate.StructureBlockInfo info : infos) {
                 BlockState state = info.state();
+                if (localWoodFamily != null) state = adaptWoodState(state, localWoodFamily);
                 if (state.isAir() || state.getBlock() == net.minecraft.block.Blocks.STRUCTURE_BLOCK
                         || state.getBlock() == net.minecraft.block.Blocks.JIGSAW) {
                     continue;
@@ -155,11 +165,44 @@ public final class VillageTemplateLibrary {
         });
     }
 
+
+    private static BlockState adaptWoodState(BlockState original, String targetFamily) {
+        if (original == null || original.isAir()) return original;
+        Identifier originalId = Registries.BLOCK.getId(original.getBlock());
+        if (!"minecraft".equals(originalId.getNamespace())) return original;
+        String remappedPath = BiomeWoodProfile.remapVanillaBlockPath(originalId.getPath(), targetFamily);
+        if (remappedPath.equals(originalId.getPath())) return original;
+        Identifier remappedId = Identifier.of("minecraft", remappedPath);
+        net.minecraft.block.Block replacement = Registries.BLOCK.getOrEmpty(remappedId).orElse(null);
+        if (replacement == null || replacement == Blocks.AIR) return original;
+
+        BlockState adapted = replacement.getDefaultState();
+        for (var entry : original.getEntries().entrySet()) {
+            if (adapted.contains(entry.getKey())) {
+                adapted = copyStateProperty(adapted, entry.getKey(), entry.getValue());
+            }
+        }
+        return adapted;
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static BlockState copyStateProperty(BlockState target, Property property, Comparable value) {
+        try {
+            return target.with(property, value);
+        } catch (IllegalArgumentException ignored) {
+            return target;
+        }
+    }
+
     public static String villageStyle(ServerWorld world, BlockPos pos) {
         String biome = world.getBiome(pos).getKey().map(key -> key.getValue().getPath()).orElse("plains");
         if (biome.contains("desert")) return "desert";
         if (biome.contains("savanna")) return "savanna";
-        if (biome.contains("taiga") || biome.contains("grove") || biome.contains("old_growth_pine")
+        // Cherry Grove uses the plains layout as a base, then its wooden palette
+        // is converted to cherry wood. Do not accidentally pick a taiga layout
+        // simply because its biome id contains the word "grove".
+        if (biome.contains("cherry")) return "plains";
+        if (biome.contains("taiga") || biome.equals("grove") || biome.contains("old_growth_pine")
                 || biome.contains("old_growth_spruce")) return "taiga";
         if (biome.contains("snow") || biome.contains("ice_spikes") || biome.contains("frozen")) return "snowy";
         return "plains";

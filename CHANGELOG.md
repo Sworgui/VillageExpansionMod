@@ -1,3 +1,23 @@
+## 1.4.5
+
+- Fixed the idle "missing oak_log/spruce_log" state: exact raw-log objectives now bypass the recipe/provider planner and immediately enter natural-tree acquisition. Raw logs can be harvested by hand, so the first tree is no longer gated on crafting an axe or waiting for an unrelated recipe plan.
+- House palettes are now reloaded after the final plot is selected, using the plot's biome instead of the village-center biome. Restored task material goals (including deferred recipe ingredients) are migrated to that same local wood family.
+- Replaced sparse tree-column sampling with a center-out square spiral processed in bounded 1,024-column slices. Consecutive retries continue where the previous slice stopped instead of sampling the same gaps; the scan still filters by the exact log species required by the blueprint.
+- Fixed the retry timer so a failed search does not restart every task tick. A new exact-log objective resets it once; later scans resume after the retry interval and continue from the next spiral slice.
+- Updated labels to distinguish searching for a matching tree from walking to a selected tree.
+- Added regression coverage for complete spiral coverage, no duplicate columns and correct continuation between slices, plus eight focused in-game acceptance scenarios for Oak Forest wood selection, saved-task migration and reliable log discovery.
+- Bumped the mod version to 1.4.5 and updated the CI artifact name.
+
+## 1.4.4
+
+- Fixed a circular material dependency that prevented builders from collecting exact blueprint log items: raw logs can now be harvested by hand when no axe is available, and the worker no longer tries to craft the axe from the same logs it cannot collect.
+- Tool selection no longer clears an unrelated main-hand item when no tool from the requested family exists.
+- Replaced the 24-column random tree lookup with a deterministic, phase-shifted grid search. The scan retries over an expanding radius, checks the exact log species required by the blueprint, and logs the search radius when no matching natural tree is found.
+- Added podzol, mycelium, moss, rooted dirt and mud to natural surface detection so trees growing on those floors can be found.
+- Added biome-native wood adaptation for vanilla village templates: oak/regular forest, birch forest, dark forest, taiga/snow, jungle, savanna, mangrove, cherry and pale garden templates use the matching local wood family. Block-state properties such as facing, half, axis and waterlogging are preserved during conversion.
+- Added pure JUnit coverage for biome wood selection, block-id remapping and deterministic tree-search coverage.
+- Bumped the mod version to 1.4.4.
+
 ## 1.4.3
 
 - Fixed a movement regression in 1.4.2: the Brain hook no longer stops navigation whenever the custom task has a transient null `moveTarget` during planning or stage transitions.
