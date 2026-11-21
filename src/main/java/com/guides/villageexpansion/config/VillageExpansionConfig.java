@@ -20,13 +20,13 @@ public final class VillageExpansionConfig {
     /** Hard per-dimension safety cap, including unloaded saved construction tasks. */
     public static int maxActiveBuildersPerDimension = 20;
     public static double navigationSpeed = 0.65D;
-    public static int taskTickInterval = 2;
+    public static int taskTickInterval = 1;
     /** Maximum expensive construction task updates performed per world tick. */
     public static int builderTaskUpdatesPerTick = 1;
     /** Global spacing between expensive custom builder updates; vanilla movement still ticks every tick. */
-    public static int builderTaskGlobalIntervalTicks = 2;
+    public static int builderTaskGlobalIntervalTicks = 1;
     /** Minimum spacing between updates of the same builder; vanilla Brain/navigation still ticks normally. */
-    public static int builderTaskMinIntervalTicks = 40;
+    public static int builderTaskMinIntervalTicks = 10;
     /** Hostile-entity queries are cached; direct attacker/health checks remain immediate. */
     public static int dangerCheckIntervalTicks = 100;
     public static int assignmentScanInterval = 40;
@@ -195,16 +195,25 @@ public final class VillageExpansionConfig {
                 performanceTuningVersion = 7;
                 json.addProperty("performanceTuningVersion", performanceTuningVersion);
             }
+            if (performanceTuningVersion < 8) {
+                // Mining progress is now tick-accurate. Make the surrounding task
+                // state machine react faster to broken tools and failed destinations.
+                json.addProperty("taskTickInterval", 1);
+                json.addProperty("builderTaskGlobalIntervalTicks", 1);
+                json.addProperty("builderTaskMinIntervalTicks", 10);
+                performanceTuningVersion = 8;
+                json.addProperty("performanceTuningVersion", performanceTuningVersion);
+            }
 
             enabled = bool(json, "enabled", true);
             maxBuildersPerVillage = clamp(integer(json, "maxBuildersPerVillage", 20), 1, 20);
             maxActiveBuildersPerDimension = clamp(integer(json, "maxActiveBuildersPerDimension", 20), 1, 20);
             navigationSpeed = clamp(decimal(json, "navigationSpeed", 0.65D), 0.1D, 1.5D);
-            taskTickInterval = clamp(integer(json, "taskTickInterval", 2), 1, 20);
+            taskTickInterval = clamp(integer(json, "taskTickInterval", 1), 1, 20);
             assignmentScanInterval = clamp(integer(json, "assignmentScanInterval", 40), 20, 1200);
             builderTaskUpdatesPerTick = clamp(integer(json, "builderTaskUpdatesPerTick", 1), 1, 2);
-            builderTaskGlobalIntervalTicks = clamp(integer(json, "builderTaskGlobalIntervalTicks", 2), 1, 20);
-            builderTaskMinIntervalTicks = clamp(integer(json, "builderTaskMinIntervalTicks", 40), 20, 200);
+            builderTaskGlobalIntervalTicks = clamp(integer(json, "builderTaskGlobalIntervalTicks", 1), 1, 20);
+            builderTaskMinIntervalTicks = clamp(integer(json, "builderTaskMinIntervalTicks", 10), 10, 200);
             dangerCheckIntervalTicks = clamp(integer(json, "dangerCheckIntervalTicks", 100), 20, 400);
             retryDelayTicks = clamp(integer(json, "retryDelayTicks", 600), 20, 12000);
             dangerRadius = clamp(integer(json, "dangerRadius", 12), 4, 48);
@@ -288,7 +297,7 @@ public final class VillageExpansionConfig {
         json.addProperty("particleIntervalTicks", particleIntervalTicks);
         json.addProperty("builderParticlesEnabled", builderParticlesEnabled);
         json.addProperty("spatialSearchIntervalTicks", spatialSearchIntervalTicks);
-        json.addProperty("performanceTuningVersion", 7);
+        json.addProperty("performanceTuningVersion", 8);
         json.addProperty("mineExclusionRadius", mineExclusionRadius);
         json.addProperty("stoneSearchFailuresBeforeMine", stoneSearchFailuresBeforeMine);
         json.addProperty("mineMinimumDistanceFromVillage", mineMinimumDistanceFromVillage);

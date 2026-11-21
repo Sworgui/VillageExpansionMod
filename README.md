@@ -1,6 +1,17 @@
-# Village Expansion 1.4.1
+# Village Expansion 1.4.2
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
+
+## 1.4.2 changes
+
+- Block-breaking duration is calculated from the current block hardness, the held tool's mining-speed multiplier and vanilla's suitable/unsuitable harvest divisor. The legacy `blockBreakBaseTicks` config key is retained for compatibility but no longer controls mining speed.
+- Active block-break progress advances every game tick independently of the round-robin construction planner, so a large builder count does not multiply the time needed to break a block.
+- Broken tools trigger the existing material planner before the worker resumes tree/stone mining; a better tool already in inventory is equipped first.
+- Failed resource/navigation targets are temporarily rejected. Tree logs, leveling stands, mine entrances and construction stands have bounded retries/fallbacks.
+- A blueprint cell occupied by a living entity is retried for at most 600 ticks; after that, only that blocked cell is skipped. Other cells continue.
+- While a construction task is active, its villager is forced to the temporary Builder profession and vanilla `JOB_SITE` / `POTENTIAL_JOB_SITE` memories are cleared after each Brain tick. Vanilla safety and sleep behavior remain available.
+- JUnit regression tests and a 41-scenario in-game acceptance matrix are included under `src/test` and `docs/TEST_SCENARIOS_1.4.2.md`.
+
 
 ## Requirements
 
@@ -69,6 +80,8 @@ The template loader uses one palette per structure, since a structure's palettes
 - Registered smelting recipes (including sand-to-glass and ore processing) are simulated over time and consume coal/charcoal fuel. Coal/charcoal are reserved as processing fuel; the mod does not burn the house's planks, logs or sticks.
 - Crafting and smelting are recipe-driven controller actions with particles, time and ingredient consumption. They do not yet operate a visible crafting-table or furnace block with a physical GUI.
 
+Block-break progress advances once per game tick and uses the held tool's `getMiningSpeedMultiplier`, suitability and block hardness; the legacy `blockBreakBaseTicks` setting is retained for config compatibility but no longer overrides vanilla tool speed. A missing/broken axe, pickaxe or shovel returns the task to the material planner before another block is mined. Navigation failures reject the failed target and select a bounded fallback rather than retrying the same destination forever.
+
 The builder checks its inventory for an appropriate axe, pickaxe or shovel and equips the strongest available one. Before extracting or crafting a missing item, it searches for an employed villager with a matching, currently available trade output within 40 blocks (configurable). The builder walks to that professional and receives the offered item for free: no emeralds, barter ingredients or merchant XP are exchanged. One offer use is reserved per transfer so stock remains finite and can return through normal villager restocking. This applies to all professional villagers and any matching output in their current offers, including tools, food, crops, wool and other recipe inputs. If no suitable offer exists or the provider cannot be reached, the recursive planner falls back to natural collection, crafting, stonecutting or smelting. Legacy `blacksmithToolUpgrades` config is retained for compatibility but the old iron-ingot-consuming upgrade behavior has been replaced by this system.
 
 ### Builder appearance
@@ -95,10 +108,10 @@ On a dedicated server, the file is in the server's `config` directory. Example s
   "maxBuildersPerVillage": 20,
   "maxActiveBuildersPerDimension": 20,
   "navigationSpeed": 0.65,
-  "taskTickInterval": 2,
+  "taskTickInterval": 1,
   "builderTaskUpdatesPerTick": 1,
-  "builderTaskGlobalIntervalTicks": 2,
-  "builderTaskMinIntervalTicks": 40,
+  "builderTaskGlobalIntervalTicks": 1,
+  "builderTaskMinIntervalTicks": 10,
   "assignmentScanInterval": 40,
   "spatialSearchIntervalTicks": 20,
   "lazyPlanningStepIntervalTicks": 40,
@@ -156,9 +169,9 @@ All values are clamped to safe ranges when loaded. The most useful controls are:
 |---|---|
 | `maxBuildersPerVillage` | Maximum simultaneous workers in one settlement |
 | `maxActiveBuildersPerDimension` | Hard dimension-wide limit, including tasks saved in unloaded chunks (default: 20) |
-| `taskTickInterval` | How often the mod controller runs (default: every 2 game ticks) |
-| `builderTaskMinIntervalTicks` | Minimum delay between custom task updates for the same builder (default: 40 ticks) |
-| `builderTaskGlobalIntervalTicks` | Minimum delay between globally scheduled builder task slices (default: 2 ticks) |
+| `taskTickInterval` | How often the mod controller runs (default: every game tick) |
+| `builderTaskMinIntervalTicks` | Minimum delay between custom task updates for the same builder (default: 10 ticks; round-robin still limits total work) |
+| `builderTaskGlobalIntervalTicks` | Minimum delay between globally scheduled builder task slices (default: 1 tick) |
 | `spatialSearchIntervalTicks` | Minimum delay between expensive world-resource scans in one dimension (default: 20 ticks) |
 | `navigationSpeed` | Villager navigation speed while moving between work positions |
 | `dangerRadius` | Distance at which hostile mobs interrupt work |
@@ -169,7 +182,7 @@ All values are clamped to safe ranges when loaded. The most useful controls are:
 | `mineMaxLength` / `mineSupportInterval` | Stair mine length segment and log support spacing |
 | `stoneSearchFailuresBeforeMine` | Completed unsuccessful stone scans before opening a dedicated mine (default: 5) |
 | `mineMinimumDistanceFromVillage` | Minimum horizontal distance from the village centre to a mine entrance (default: 20; values below 20 are clamped) |
-| `blockBreakBaseTicks` | Overall block-breaking pace multiplier |
+| `blockBreakBaseTicks` | Legacy config key retained for compatibility; mining duration now follows block hardness and the equipped tool |
 | `woodSearchRadius` | Search radius for tree logs |
 | `maxPathSearchNodes` | Upper bound for road pathfinding work |
 | `buildBlockDelayTicks` | Delay between placed house blocks |

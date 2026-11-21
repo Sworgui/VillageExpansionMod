@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.2
+
+- Reworked block mining to advance once per game tick and derive break duration from block hardness, the held tool's mining-speed multiplier and vanilla suitable/unsuitable harvest divisors.
+- Tool durability is applied once per completed block. A broken axe, pickaxe or shovel is detected before the next target; replacement acquisition is routed through the existing material/recipe planner before mining resumes.
+- Fixed the exact-ore recovery order: the required pickaxe is acquired before suitability filtering, and the original ore/material goal is preserved while the tool is planned.
+- Added explicit recovery actions for every builder stage when navigation cannot reach its current target; failed resource blocks, tree roots, mine entrances and construction stands are excluded from subsequent searches. Tool swaps preserve the previously held tool instead of overwriting it.
+- Construction now tests alternate work stands while filtering occupied cells. Unreachable blueprint positions, living-entity occupancy and repeated placement rejection have bounded retry windows, after which only the obstructed placement is skipped. Inaccessible individual logs in a connected tree are skipped without abandoning the rest of the tree.
+- Reasserted builder navigation after every vanilla Brain tick and clear vanilla WALK_TARGET/job-site memories while a construction task is active. The temporary builder profession is restored if a vanilla task attempts to assign a workstation profession.
+- Increased default custom-task cadence from a 40-tick minimum to 10 ticks, with one global round-robin slice per tick; actual mining progress is independent and advances every tick.
+- Added JUnit regression tests for mining-time math and exhaustive stage-recovery mapping, plus a 41-scenario in-game acceptance matrix covering tools, AI overlap, navigation, occupied placements, multiple builders and founding projects.
+- Added config migration version 8 and bumped the mod version to 1.4.2. GitHub Actions now runs the JUnit suite before building and uploads the 1.4.2 artifact.
+
 ## 1.4.1
 
 - Fixed route-wide pre-clearing: new builders no longer walk away from the plot to fell trees along the future road before constructing the house.

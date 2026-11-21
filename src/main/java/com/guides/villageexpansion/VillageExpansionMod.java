@@ -25,6 +25,6 @@ public final class VillageExpansionMod implements ModInitializer {
         ServerEntityEvents.ENTITY_UNLOAD.register(VillageBuilderController::onVillagerEntityUnload);
         ServerTickEvents.END_WORLD_TICK.register(VillageBuilderController::tickWorld);
         ServerTickEvents.END_WORLD_TICK.register(VillageBreedingController::tickWorld);
-        LOGGER.info("Village Expansion 1.4.1 initialized: house-first construction, compact site search and adaptive terrain clearing enabled.");
+        LOGGER.info("Village Expansion 1.4.2 initialized: house-first construction, compact site search and adaptive terrain clearing enabled.");
     }
 }
