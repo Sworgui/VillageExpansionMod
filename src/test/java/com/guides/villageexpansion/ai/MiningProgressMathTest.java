@@ -6,6 +6,21 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class MiningProgressMathTest {
     @Test
+    void propertyOnlyStateChangesRetainTheSameMiningSession() {
+        assertEquals(true, MiningProgressMath.shouldRetainSession(true, true));
+        assertEquals(false, MiningProgressMath.shouldRetainSession(false, true));
+        assertEquals(false, MiningProgressMath.shouldRetainSession(true, false));
+    }
+
+    @Test
+    void knockbackPausesMiningOutsideFourBlockHorizontalRadius() {
+        assertEquals(true, MiningProgressMath.isWithinHorizontalReach(4.0D));
+        assertEquals(true, MiningProgressMath.isWithinHorizontalReach(16.0D));
+        assertEquals(false, MiningProgressMath.isWithinHorizontalReach(16.01D));
+        assertEquals(false, MiningProgressMath.isWithinHorizontalReach(100.0D));
+    }
+
+    @Test
     void suitableWoodenAxeUsesVanillaSuitableToolRate() {
         // Vanilla wooden axe multiplier on a log is 2; hardness 2 => 30 ticks.
         assertEquals(30, MiningProgressMath.ticksToBreak(2.0F, true, 2.0F));

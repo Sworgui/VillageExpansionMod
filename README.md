@@ -1,6 +1,35 @@
-# Village Expansion 1.4.5
+# Village Expansion 1.4.8
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
+
+## 1.4.8 changes
+
+- Tree mining tolerates leaf blocks in the working ray and tries another side of the same log after a failed navigation route or knockback. Progress is retained while the worker returns to reach.
+- Plains/Oak/regular Forest house materials normalize to oak, including saved in-flight spruce goals. Nearby trees are checked and ranked before distant candidates.
+- Tool substitution follows harvest capability: stone satisfies wooden shovel, gold remains wooden harvest tier, iron is required for diamond ore, and diamond is required for obsidian.
+- Nearby crafting tables/furnaces are recognized. A temporary crafting table remains placed during its 20-tick use window and is recovered after the recipe. A temporary furnace remains lit throughout the mod's timed/simulated smelting operation and is recovered after.
+- Builder profession overlay uses a slate-blue hardhat and muted teal/leather workwear while retaining the original transparent UV mask.
+- Server acceptance matrix: `docs/TEST_SCENARIOS_1.4.8.md`.
+
+## 1.4.8 follow-up refinements
+
+- Missing professional-supplier checks now continue to ordinary acquisition planning on the next tick instead of waiting another lazy-planning interval.
+- Workstation discovery context is rechecked every 10 ticks while a completed material plan is waiting, so a table/furnace found nearby invalidates a stale plan faster.
+
+## 1.4.7 changes
+
+- Saved in-flight `spruce_log` tree goals are migrated to the house site's oak family for Plains tasks, even when the saved biome marker already says `plains`.
+- Tool capability checks include the offhand and preserve the replaced tool. Nearby workstations are searched within six horizontal and three vertical blocks, and a newly reached workstation refreshes the plan.
+- Temporary crafting tables and lit furnaces can be placed safely and reclaimed after use. Nearby permanent stations are never removed.
+- Tree lookup prioritizes the nearest accessible local tree and retries alternate stands around obstructions while preserving mining progress.
+
+## 1.4.6 changes
+
+- Wood requests are checked against the final house plot biome on every task update (with an early return when unchanged); changing the plot biome remaps its blueprint and pending/deferred wood goals. For a Plains house this means oak-family wood even if the builder currently stands in a different biome. The task label includes the house biome, and the server log records house biome, worker biome and selected family.
+- Mining progress is kept for the same block and coordinate even when only block-state properties change. Knockback temporarily pauses mining outside a four-block horizontal radius; accumulated progress remains and resumes when the villager returns.
+- If a work stand becomes unreachable, the builder tries another side of the same log instead of advancing to the next log and resetting progress. Stand search now examines four rings and avoids occupied feet/head cells.
+- Natural trees are ranked by the distance to their accessible work stand, improving nearest-tree selection where hills or foliage make the trunk coordinate a misleading distance measure.
+- Replaced the bright yellow/gold builder outfit with a slate-blue hardhat, muted teal workwear and brown utility belt. Both villager and zombie-villager profession overlays use the same new 64x64 texture.
 
 ## 1.4.5 changes
 

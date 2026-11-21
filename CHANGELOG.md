@@ -1,3 +1,35 @@
+## 1.4.8
+
+- Corrected tree mining interruptions: leaves are transparent to the working ray, while non-leaf colliders cause a side change rather than a counter reset. If navigation to one side fails (including after knockback or entity pushing), the builder rejects only that stand and retries the same log from another side instead of skipping it immediately.
+- Nearest-tree selection retains its complete local six-block scan and distance ranking; the acceptance checks now explicitly cover a tree beside the worker versus a farther tree.
+- Preserved the profession texture's original alpha mask (2,648 transparent pixels) and recolored only visible pixels. This avoids opaque black pixels in transparent UV areas and replaces the yellow hardhat/orange workwear with a slate-blue hardhat, teal workwear and leather tool trim.
+- Temporary crafting tables now remain placed for a 20-tick use window and are reclaimed after the recipe completes; their position and pending output are saved so a reload does not leave the builder searching or lose ownership. Temporary furnaces remain present and lit throughout the simulated cooking interval, then are reclaimed.
+- Corrected tool harvest-tier ordering: golden tools are fast but have wooden harvest tier. A golden shovel/axe can satisfy a wooden-tool task, but cannot replace stone/iron when a higher harvest tier is required. Stone shovels continue to satisfy wooden-shovel goals, including when held in the offhand or inventory.
+- Added regression assertions for golden-versus-stone tool compatibility and expanded the server acceptance matrix to 21 scenarios, including leaf-transparent mining, failed navigation-side retries, saved temporary workstations and texture alpha integrity.
+- Bumped the mod version and CI artifact to 1.4.8.
+- A negative professional-supplier lookup now yields to ordinary acquisition planning on the next tick; discovering an already-near workstation invalidates stale plans within at most 10 ticks.
+
+## 1.4.7
+
+- Fixed a legacy biome-migration hole: saved `currentTreeLogItem` is now remapped too. If a task was already marked `plains` but retained an in-flight `spruce_log` tree scan, that stale scan is discarded and the pending goal continues with oak-family wood.
+- Tool capability checks now include the offhand. A stone shovel satisfies a wooden-shovel request, and an offhand upgrade is promoted to the main hand without deleting the previous item. Minimum harvest requirements remain enforced end-to-end: diamond ore requires iron-tier pickaxe; obsidian is now a supported mining target and requires diamond-tier.
+- Nearby crafting tables and furnaces are detected within a six-block horizontal / three-block vertical work radius. A completed material plan is refreshed when the villager reaches a previously out-of-range workstation, even if the old plan was technically viable; crafting-table and furnace context are refreshed independently.
+- Builders can place a temporary crafting table or lit furnace from their inventory on a safe, unoccupied solid floor, run the existing recipe/cooking pipeline (with smoke/flame emitted at the furnace), then remove the temporary block and recover the item. Existing world workstations are never removed. Overflow return items are dropped safely instead of deleted.
+- Tree lookup first fully scans a six-block local neighborhood and ranks candidates by reachable work-stand distance. Alternative stands around foliage/colliders preserve accumulated block-breaking progress; knockback pauses rather than resets the same block's mining session.
+- Updated the normal and zombie builder profession textures to a slate-blue hardhat, muted teal workwear and brown tool-belt palette; the 64x64 texture atlas layout is retained.
+- Added regression assertions for shovel/pickaxe tier compatibility and a 15-case in-game acceptance matrix covering stale biome saves, nearby trees, foliage/knockback mining, workstation reuse and texture loading.
+- Bumped the mod version and CI artifact to 1.4.7.
+
+## 1.4.6
+
+- Wood-material normalization is now keyed to the final house-site biome and reruns whenever that site biome changes. Legacy/stale `spruce_log` requests are remapped to oak-family goals for Plains/Oak/regular Forest plots; the debug label and server log identify both the house-site biome and the worker's current biome so a border-site mismatch is visible.
+- Mining sessions now survive block-state property changes for the same block at the same position. If knockback moves the worker away, mining pauses outside a four-block horizontal work radius and resumes on return instead of discarding accumulated progress.
+- A failed route to one side of a tree no longer skips that log or clears the mining counter. The worker rejects the failed stand, searches up to four blocks around the same log, and retries another side. Occupied stand/head cells are excluded.
+- Tree selection is ranked by distance to the actual accessible work stand, not only the trunk's 3D coordinate, reducing trips to a farther tree when a nearer tree has a reachable work position.
+- Added a new slate-blue hardhat, muted teal workwear and brown tool-belt palette for both normal and zombie builder profession overlays. The 64x64 atlas layout and transparency are preserved.
+- Added unit coverage for Plains -> oak mapping and mining-session retention/pause rules, plus an eight-case server acceptance matrix for knockback, foliage, alternative stands, tree distance and texture loading.
+- Bumped the mod version to 1.4.6 and updated the CI artifact name.
+
 ## 1.4.5
 
 - Fixed the idle "missing oak_log/spruce_log" state: exact raw-log objectives now bypass the recipe/provider planner and immediately enter natural-tree acquisition. Raw logs can be harvested by hand, so the first tree is no longer gated on crafting an axe or waiting for an unrelated recipe plan.

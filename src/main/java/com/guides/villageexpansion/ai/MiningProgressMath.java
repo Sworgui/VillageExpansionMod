@@ -11,6 +11,16 @@ public final class MiningProgressMath {
     /**
      * @return number of game ticks required, or -1 for an unbreakable block.
      */
+    /** Keep work when the target coordinate and underlying block identity are unchanged. */
+    public static boolean shouldRetainSession(boolean samePosition, boolean sameBlockType) {
+        return samePosition && sameBlockType;
+    }
+
+    /** Pause (rather than reset) when knockback moves the worker beyond local reach. */
+    public static boolean isWithinHorizontalReach(double horizontalDistanceSquared) {
+        return horizontalDistanceSquared <= 16.0D;
+    }
+
     public static int ticksToBreak(float hardness, boolean suitableTool, float miningSpeed) {
         if (hardness < 0.0F) return -1;
         if (hardness == 0.0F) return 1;

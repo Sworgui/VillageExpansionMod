@@ -352,7 +352,7 @@ final class MaterialAcquisitionPlanner {
             if (dependencies == null) continue;
 
             double recipeCost = requiresCraftingTable(entry.value(), item)
-                    && countInventory(villager, Items.CRAFTING_TABLE) == 0
+                    && !hasWorkstation(world, villager, Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE)
                     ? estimateItemCost(world, villager, Items.CRAFTING_TABLE, 1, depth + 1, visiting) : 0.0D;
             if (recipeCost >= IMPOSSIBLE) continue;
             boolean viable = true;
@@ -397,7 +397,7 @@ final class MaterialAcquisitionPlanner {
             double inputCost = estimateItemCost(world, villager, input.getItem(), batches, depth + 1, visiting);
             if (inputCost >= IMPOSSIBLE) continue;
 
-            double furnaceCost = countInventory(villager, Items.FURNACE) > 0 ? 0.0D
+            double furnaceCost = hasWorkstation(world, villager, Blocks.FURNACE, Items.FURNACE) ? 0.0D
                     : estimateItemCost(world, villager, Items.FURNACE, 1, depth + 1, visiting);
             if (furnaceCost >= IMPOSSIBLE) continue;
             int fuelNeeded = Math.max(1, (entry.value().getCookingTime() * batches + 1599) / 1600);
@@ -433,7 +433,7 @@ final class MaterialAcquisitionPlanner {
             if (ingredients == null) continue;
 
             double score = requiresCraftingTable(entry.value(), desired)
-                    && countInventory(villager, Items.CRAFTING_TABLE) == 0
+                    && !hasWorkstation(world, villager, Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE)
                     ? estimateItemCost(world, villager, Items.CRAFTING_TABLE, 1, 0, new HashSet<>()) : 0.0D;
             if (score >= IMPOSSIBLE) continue;
             boolean viable = true;
@@ -506,7 +506,7 @@ final class MaterialAcquisitionPlanner {
                     0, new HashSet<>(), null, Map.of());
             if (input.isEmpty()) continue;
             double score = estimateItemCost(world, villager, input.getItem(), batches, 0, new HashSet<>());
-            double furnaceCost = countInventory(villager, Items.FURNACE) > 0 ? 0.0D
+            double furnaceCost = hasWorkstation(world, villager, Blocks.FURNACE, Items.FURNACE) ? 0.0D
                     : estimateItemCost(world, villager, Items.FURNACE, 1, 0, new HashSet<>());
             int fuelCount = Math.max(1, (entry.value().getCookingTime() * batches + 1599) / 1600);
             int fuelHeld = countInventory(villager, Items.COAL) + countInventory(villager, Items.CHARCOAL);
@@ -589,7 +589,7 @@ final class MaterialAcquisitionPlanner {
                 recipeDepth = Math.max(recipeDepth, ingredientDepth + 1);
             }
             if (requiresCraftingTable(entry.value(), item)
-                    && countInventory(villager, Items.CRAFTING_TABLE) == 0) {
+                    && !hasWorkstation(world, villager, Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE)) {
                 recipeDepth = Math.max(recipeDepth, 1 + dependencyDepth(world, villager,
                         Items.CRAFTING_TABLE, depth + 1, new HashSet<>(visiting)));
             }
@@ -621,7 +621,7 @@ final class MaterialAcquisitionPlanner {
         for (RecipeEntry<SmeltingRecipe> entry : limited(smeltingRecipesFor(world, item), MAX_RECIPES_PER_OUTPUT)) {
             ItemStack output = entry.value().getResult(world.getRegistryManager());
             if (output.isEmpty() || output.getItem() != item) continue;
-            int recipeDepth = countInventory(villager, Items.FURNACE) > 0 ? 0
+            int recipeDepth = hasWorkstation(world, villager, Blocks.FURNACE, Items.FURNACE) ? 0
                     : 1 + dependencyDepth(world, villager, Items.FURNACE,
                     depth + 1, new HashSet<>(visiting));
             Ingredient input = entry.value().getIngredients().stream()
@@ -854,6 +854,11 @@ final class MaterialAcquisitionPlanner {
         return ItemStack.EMPTY;
     }
 
+    private static boolean hasWorkstation(ServerWorld world, VillagerEntity villager, Block block, Item item) {
+        return countInventory(villager, item) > 0
+                || WorkstationLocator.findNearby(world, villager.getBlockPos(), block, 6, 3) != null;
+    }
+
     private static int countInventory(VillagerEntity villager, Item item) {
         if (villager == null || item == null || item == Items.AIR) return 0;
         int count = 0;
@@ -880,6 +885,7 @@ final class MaterialAcquisitionPlanner {
         int requiredTier = toolTier(required, required);
         if (requiredTier < 0) return false;
         if (toolTier(villager.getEquippedStack(EquipmentSlot.MAINHAND).getItem(), required) >= requiredTier) return true;
+        if (toolTier(villager.getEquippedStack(EquipmentSlot.OFFHAND).getItem(), required) >= requiredTier) return true;
         for (int slot = 0; slot < villager.getInventory().size(); slot++) {
             if (toolTier(villager.getInventory().getStack(slot).getItem(), required) >= requiredTier) return true;
         }
@@ -899,17 +905,19 @@ final class MaterialAcquisitionPlanner {
                     : (candidate == Items.WOODEN_PICKAXE || candidate == Items.GOLDEN_PICKAXE) ? 0 : -1;
         }
         if (axe) {
+            // Gold tools are fast but have wooden-tier harvest capability;
+            // they must not satisfy a stone/iron minimum-harvest requirement.
             return candidate == Items.NETHERITE_AXE ? 5 : candidate == Items.DIAMOND_AXE ? 4
-                    : candidate == Items.IRON_AXE ? 3 : candidate == Items.GOLDEN_AXE ? 2
-                    : candidate == Items.STONE_AXE ? 1 : candidate == Items.WOODEN_AXE ? 0 : -1;
+                    : candidate == Items.IRON_AXE ? 3 : candidate == Items.STONE_AXE ? 1
+                    : (candidate == Items.WOODEN_AXE || candidate == Items.GOLDEN_AXE) ? 0 : -1;
         }
         boolean shovel = familyReference == Items.WOODEN_SHOVEL || familyReference == Items.STONE_SHOVEL
                 || familyReference == Items.IRON_SHOVEL || familyReference == Items.GOLDEN_SHOVEL
                 || familyReference == Items.DIAMOND_SHOVEL || familyReference == Items.NETHERITE_SHOVEL;
         if (shovel) {
             return candidate == Items.NETHERITE_SHOVEL ? 5 : candidate == Items.DIAMOND_SHOVEL ? 4
-                    : candidate == Items.IRON_SHOVEL ? 3 : candidate == Items.GOLDEN_SHOVEL ? 2
-                    : candidate == Items.STONE_SHOVEL ? 1 : candidate == Items.WOODEN_SHOVEL ? 0 : -1;
+                    : candidate == Items.IRON_SHOVEL ? 3 : candidate == Items.STONE_SHOVEL ? 1
+                    : (candidate == Items.WOODEN_SHOVEL || candidate == Items.GOLDEN_SHOVEL) ? 0 : -1;
         }
         return -1;
     }
@@ -933,6 +941,7 @@ final class MaterialAcquisitionPlanner {
         if (isStrippedLog(item)) return Items.WOODEN_AXE;
 
         String path = Registries.ITEM.getId(item).getPath();
+        if (item == Items.OBSIDIAN || path.equals("obsidian")) return Items.DIAMOND_PICKAXE;
         if (item == Items.DIAMOND || item == Items.EMERALD
                 || path.equals("diamond_ore") || path.equals("deepslate_diamond_ore")
                 || path.equals("emerald_ore") || path.equals("deepslate_emerald_ore")) {
@@ -972,7 +981,7 @@ final class MaterialAcquisitionPlanner {
             // These items are the actual vanilla drops from mining. Ore block
             // items are intentionally excluded because they require Silk Touch.
             case "cobblestone", "cobbled_deepslate", "coal", "raw_iron", "raw_copper",
-                    "raw_gold", "redstone", "lapis_lazuli", "diamond", "emerald" -> true;
+                    "raw_gold", "redstone", "lapis_lazuli", "diamond", "emerald", "obsidian" -> true;
             default -> false;
         };
     }

@@ -12,6 +12,7 @@ import net.minecraft.nbt.NbtElement;
 import net.minecraft.nbt.NbtList;
 import net.minecraft.nbt.NbtLong;
 import net.minecraft.block.Block;
+import net.minecraft.block.AbstractFurnaceBlock;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.BedBlock;
 import net.minecraft.block.Blocks;
@@ -44,6 +45,9 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.GlobalPos;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.world.RaycastContext;
 import net.minecraft.world.Heightmap;
 import net.minecraft.world.World;
 import net.minecraft.server.world.ServerWorld;
@@ -352,7 +356,10 @@ public final class VillageBuilderController {
 
         if (task.cachedNearbyDanger || (villager.getAttacker() != null && villager.getAttacker().isAlive())
                 || healthEmergency(villager) || now < task.pausedUntil
-                || task.sleepingAtNight || nightWithAssignedHome(villager)) return;
+                || task.sleepingAtNight || nightWithAssignedHome(villager)) {
+            hideBreakingProgress(world, villager, task);
+            return;
+        }
 
         if (!BuilderNavigationPolicy.isNavigationCheckDue(now, task.nextBrainNavigationCheckAt)) return;
         task.nextBrainNavigationCheckAt = BuilderNavigationPolicy.nextNavigationCheckAt(now);
@@ -435,6 +442,9 @@ public final class VillageBuilderController {
             label = "Dormindo";
         } else if (task.pausedUntil > villager.getWorld().getTime()) {
             label = "Pausado: segurança";
+        } else if (task.breakingPos != null) {
+            String blockName = Registries.BLOCK.getId(villager.getWorld().getBlockState(task.breakingPos).getBlock()).getPath();
+            label = "Quebrando: " + blockName;
         } else if (task.planBlockedItem != null && task.planBlockedItem == task.pendingMaterialItem) {
             String itemName = Registries.ITEM.getId(task.planBlockedItem).getPath();
             label = "Sem plano viável: " + itemName;
@@ -450,10 +460,12 @@ public final class VillageBuilderController {
         } else if (task.pendingMaterialItem != null && task.stage == Stage.GATHER_MATERIAL
                 && isRawNaturalTreeLogItem(task.pendingMaterialItem)) {
             String itemName = Registries.ITEM.getId(task.pendingMaterialItem).getPath();
+            String biomeHint = task.woodBiomePath == null || task.woodBiomePath.isBlank()
+                    ? "" : " (bioma da casa: " + task.woodBiomePath + ")";
             if (task.currentResource != null || task.currentTreeBase != null) {
-                label = "Indo à árvore: " + itemName;
+                label = "Indo à árvore: " + itemName + biomeHint;
             } else {
-                label = "Procurando árvore: " + itemName;
+                label = "Procurando árvore: " + itemName + biomeHint;
             }
         } else if (task.pendingMaterialItem != null
                 && (task.stage == Stage.GATHER_MATERIAL
@@ -487,6 +499,24 @@ public final class VillageBuilderController {
                 : Math.max(1L, Math.min(200L, now - task.lastControllerUpdateAt));
         task.elapsedControllerTicks = (int) elapsed;
         task.lastControllerUpdateAt = now;
+        // Existing in-memory tasks can survive a mod reload or be resumed without
+        // passing through the saved-task restoration path. Normalize their wood
+        // dependencies against the actual house-site biome before any planner runs.
+        if (task.site != null) {
+            migrateSavedWoodMaterialGoals(world, villager, task);
+        }
+        if (task.temporaryFurnacePos != null
+                && (task.stage != Stage.SMELT_MATERIAL || task.pendingSmeltOutput == null)) {
+            releaseTemporaryFurnace(world, villager, task);
+        } else if (task.stage != Stage.SMELT_MATERIAL || task.pendingSmeltOutput == null) {
+            task.smeltWorkstationPos = null;
+        }
+        if (task.temporaryCraftingTablePos != null
+                && (task.temporaryCraftingTarget == null
+                || task.pendingMaterialItem != task.temporaryCraftingTarget
+                || (task.stage != Stage.BUILD && task.stage != Stage.GATHER_MATERIAL))) {
+            releaseTemporaryCraftingTable(world, villager, task);
+        }
         if (now >= task.nextDangerCheckAt) {
             task.cachedNearbyDanger = nearbyDanger(world, villager);
             task.nextDangerCheckAt = now + VillageExpansionConfig.dangerCheckIntervalTicks;
@@ -500,19 +530,19 @@ public final class VillageBuilderController {
             // critically injured. The construction state remains saved.
             task.pausedUntil = Math.max(task.pausedUntil, now + VillageExpansionConfig.dangerPauseTicks);
             task.sleepingAtNight = false;
-            clearBreakingProgress(world, villager, task);
+            hideBreakingProgress(world, villager, task);
             villager.getNavigation().stop();
             return;
         }
         if (now < task.pausedUntil) {
-            clearBreakingProgress(world, villager, task);
+            hideBreakingProgress(world, villager, task);
             villager.getNavigation().stop();
             return; // Vanilla Brain is temporarily allowed to flee/seek safety.
         }
 
         if (nightWithAssignedHome(villager)) {
             task.sleepingAtNight = true;
-            clearBreakingProgress(world, villager, task);
+            hideBreakingProgress(world, villager, task);
             villager.getNavigation().stop();
             return; // Vanilla schedule/Brain can take the villager to its own bed.
         }
@@ -566,20 +596,23 @@ public final class VillageBuilderController {
         task.navigationFallbackIndex = 0;
         villager.getNavigation().stop();
 
-        // A single connected tree may contain one log whose adjacent standing
-        // cells are inaccessible. Skip that log, not the entire plot/tree stage.
+        // A failed route to one side of a tree is not proof that the log itself
+        // is unreachable. This can happen after knockback or when another mod
+        // changes collision/pathing around leaves. Try another stand around the
+        // SAME log and keep the in-flight break counter instead of skipping it.
         if (task.currentTreeBase != null && task.currentTreeStandPosition != null
                 && task.currentTreeStandPosition.equals(failed)
                 && task.currentTreeLogIndex < task.currentTreeLogs.size()) {
-            BlockPos skippedLog = task.currentTreeLogs.get(task.currentTreeLogIndex++);
-            task.currentTreeStandTarget = null;
+            BlockPos currentLog = task.currentTreeLogs.get(task.currentTreeLogIndex);
+            task.rejectedTreeStandPositions.add(failed.asLong());
+            task.currentTreeStandTarget = currentLog.toImmutable();
             task.currentTreeStandPosition = null;
             task.currentTreeStandChecked = false;
             task.failedNavigationTarget = null;
             task.requestedMoveTarget = null;
-            clearBreakingProgress(world, villager, task);
-            VillageExpansionMod.LOGGER.warn("Builder {} skipped unreachable tree log at {}; remaining construction work continues",
-                    uuidShort(villager.getUuid()), skippedLog);
+            VillageExpansionMod.LOGGER.warn(
+                    "Builder {} could not reach stand {} for log {}; retrying another side without resetting mining progress",
+                    uuidShort(villager.getUuid()), failed, currentLog);
             return;
         }
 
@@ -884,6 +917,8 @@ public final class VillageBuilderController {
         nbt.putInt("stone", task.stone);
         nbt.putInt("requiredWood", task.requiredWood);
         nbt.putInt("requiredStone", task.requiredStone);
+        nbt.putString("woodBiomePath", task.woodBiomePath == null ? "" : task.woodBiomePath);
+        nbt.putBoolean("woodPaletteNormalized", task.woodPaletteNormalized);
         nbt.putInt("temporaryStoneRequirement", task.temporaryStoneRequirement);
         nbt.putInt("dirt", task.dirt);
         nbt.putInt("woodPiecesPlaced", task.woodPiecesPlaced);
@@ -923,6 +958,12 @@ public final class VillageBuilderController {
         nbt.putInt("currentTreeLeafIndex", task.currentTreeLeafIndex);
         nbt.putBoolean("currentTreeLeavesScanned", task.currentTreeLeavesScanned);
         nbt.putInt("smeltTicksRemaining", task.smeltTicksRemaining);
+        if (task.temporaryFurnacePos != null) nbt.putLong("temporaryFurnacePos", task.temporaryFurnacePos.asLong());
+        if (task.smeltWorkstationPos != null) nbt.putLong("smeltWorkstationPos", task.smeltWorkstationPos.asLong());
+        if (task.temporaryCraftingTablePos != null) nbt.putLong("temporaryCraftingTablePos", task.temporaryCraftingTablePos.asLong());
+        if (task.temporaryCraftingTarget != null) nbt.putString("temporaryCraftingTarget",
+                Registries.ITEM.getId(task.temporaryCraftingTarget).toString());
+        nbt.putLong("craftingTableReadyAt", task.craftingTableReadyAt);
         nbt.putInt("smeltFuelTicksRemaining", task.smeltFuelTicksRemaining);
         nbt.putInt("smeltOutputCount", task.smeltOutputCount);
         nbt.putString("pendingSmeltOutput", task.pendingSmeltOutput == null ? "" : Registries.ITEM.getId(task.pendingSmeltOutput).toString());
@@ -991,6 +1032,8 @@ public final class VillageBuilderController {
                     founding, originalHand, originalData,
                     templateText.isBlank() ? null : templateText);
             task.stage = Stage.valueOf(nbt.getString("stage"));
+            task.woodBiomePath = nbt.getString("woodBiomePath");
+            task.woodPaletteNormalized = nbt.getBoolean("woodPaletteNormalized");
             String resumeStage = nbt.getString("resumeStage");
             if (!resumeStage.isBlank()) task.resumeStage = Stage.valueOf(resumeStage);
             String materialReturnStage = nbt.getString("materialReturnStage");
@@ -1047,6 +1090,20 @@ public final class VillageBuilderController {
             task.currentTreeLeafIndex = nbt.getInt("currentTreeLeafIndex");
             task.currentTreeLeavesScanned = nbt.getBoolean("currentTreeLeavesScanned");
             task.smeltTicksRemaining = nbt.getInt("smeltTicksRemaining");
+            if (nbt.contains("temporaryFurnacePos", NbtElement.LONG_TYPE)) {
+                task.temporaryFurnacePos = BlockPos.fromLong(nbt.getLong("temporaryFurnacePos"));
+            }
+            if (nbt.contains("smeltWorkstationPos", NbtElement.LONG_TYPE)) {
+                task.smeltWorkstationPos = BlockPos.fromLong(nbt.getLong("smeltWorkstationPos"));
+            }
+            if (nbt.contains("temporaryCraftingTablePos", NbtElement.LONG_TYPE)) {
+                task.temporaryCraftingTablePos = BlockPos.fromLong(nbt.getLong("temporaryCraftingTablePos"));
+            }
+            Identifier temporaryCraftingTargetId = Identifier.tryParse(nbt.getString("temporaryCraftingTarget"));
+            if (temporaryCraftingTargetId != null) {
+                task.temporaryCraftingTarget = Registries.ITEM.getOrEmpty(temporaryCraftingTargetId).orElse(null);
+            }
+            task.craftingTableReadyAt = nbt.getLong("craftingTableReadyAt");
             task.smeltFuelTicksRemaining = nbt.getInt("smeltFuelTicksRemaining");
             task.smeltOutputCount = nbt.contains("smeltOutputCount") ? nbt.getInt("smeltOutputCount") : 1;
             Identifier smeltOutputId = Identifier.tryParse(nbt.getString("pendingSmeltOutput"));
@@ -1893,12 +1950,16 @@ public final class VillageBuilderController {
     }
 
     private static BlockPos findStandingPosition(ServerWorld world, BlockPos workBlock, VillagerEntity villager) {
+        return findStandingPosition(world, workBlock, villager, Set.of());
+    }
+
+    private static BlockPos findStandingPosition(ServerWorld world, BlockPos workBlock,
+                                                  VillagerEntity villager, Set<Long> rejectedPositions) {
         BlockPos best = null;
         double bestDistance = Double.MAX_VALUE;
-        // First try the eight adjacent cells, then a compact radius-two ring.
-        // This prevents a dense tree/undergrowth patch from leaving CLEAR_PATH stuck
-        // forever because no immediately adjacent standing cell is free.
-        for (int radius = 1; radius <= 2; radius++) {
+        // Search four rings, not just two. Dense foliage and modded collision can
+        // make the closest side unusable even when another side of the same tree is open.
+        for (int radius = 1; radius <= 4; radius++) {
             for (int dx = -radius; dx <= radius; dx++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
@@ -1909,10 +1970,13 @@ public final class VillageBuilderController {
                     BlockPos stand = new BlockPos(x, groundY + 1, z);
                     BlockPos head = stand.up();
                     BlockPos floor = stand.down();
-                    if (!isLoaded(world, stand) || !isLoaded(world, head) || !isLoaded(world, floor)
+                    if (rejectedPositions.contains(stand.asLong())
+                            || !isLoaded(world, stand) || !isLoaded(world, head) || !isLoaded(world, floor)
                             || !world.getBlockState(stand).isAir() || !world.getBlockState(head).isAir()
                             || !world.getBlockState(floor).isSolidBlock(world, floor)
-                            || !world.getFluidState(stand).isEmpty()) continue;
+                            || !world.getFluidState(stand).isEmpty()
+                            || hasLivingEntityInBlock(world, stand, villager)
+                            || hasLivingEntityInBlock(world, head, villager)) continue;
                     double distance = villager.squaredDistanceTo(stand.getX() + 0.5D, stand.getY(), stand.getZ() + 0.5D);
                     if (distance < bestDistance) {
                         bestDistance = distance;
@@ -2014,6 +2078,7 @@ public final class VillageBuilderController {
         if (task.currentTreeBase == null || !task.currentTreeBase.equals(base)) {
             clearBreakingProgress(world, villager, task);
             task.currentTreeBase = base.toImmutable();
+            task.rejectedTreeStandPositions.clear();
             task.currentTreeLogItem = world.getBlockState(base).getBlock().asItem();
             task.currentTreeLogs.clear();
             task.currentTreeLeaves.clear();
@@ -2081,30 +2146,56 @@ public final class VillageBuilderController {
                 continue;
             }
             if (task.currentTreeStandTarget == null || !task.currentTreeStandTarget.equals(log)
-                    || task.currentTreeStandChecked && task.currentTreeStandPosition == null) {
+                    || !task.currentTreeStandChecked) {
+                if (task.currentTreeStandTarget == null || !task.currentTreeStandTarget.equals(log)) {
+                    task.rejectedTreeStandPositions.clear();
+                }
                 task.currentTreeStandTarget = log.toImmutable();
-                task.currentTreeStandPosition = findStandingPosition(world, log, villager);
+                task.currentTreeStandPosition = findStandingPosition(
+                        world, log, villager, task.rejectedTreeStandPositions);
                 if (task.currentTreeStandPosition == null) {
-                    task.currentTreeStandPosition = findStandingPosition(world, base, villager);
+                    task.currentTreeStandPosition = findStandingPosition(
+                            world, base, villager, task.rejectedTreeStandPositions);
                 }
                 task.currentTreeStandChecked = true;
             }
             BlockPos stand = task.currentTreeStandPosition;
-            if (stand == null || task.failedNavigationTarget != null && task.failedNavigationTarget.equals(stand)) {
-                // One inaccessible log must not strand the complete house project.
-                // Skip only this log after adjacent/radius-two standing positions fail.
+            if (stand != null && task.failedNavigationTarget != null
+                    && task.failedNavigationTarget.equals(stand)) {
+                // A failed route can be transient (knockback, another mod moving
+                // the villager, or a path node temporarily occupied). Reject only
+                // this approach side and retry the SAME log from another side.
+                task.rejectedTreeStandPositions.add(stand.asLong());
+                task.failedNavigationTarget = null;
+                task.currentTreeStandPosition = null;
+                task.currentTreeStandChecked = false;
+                task.requestedMoveTarget = null;
+                task.moveTarget = null;
+                task.navigationRepathCount = 0;
+                return false;
+            }
+            if (stand == null) {
+                // Search another stand around this log / tree base before moving on.
+                // This is reached only after every nearby candidate has been rejected.
                 task.currentTreeLogIndex++;
                 task.currentTreeStandTarget = null;
                 task.currentTreeStandPosition = null;
                 task.currentTreeStandChecked = false;
                 task.failedNavigationTarget = null;
                 task.requestedMoveTarget = null;
-                clearBreakingProgress(world, villager, task);
-                VillageExpansionMod.LOGGER.warn("Builder {} skipped an unreachable tree log at {} and will continue clearing the plot",
+                VillageExpansionMod.LOGGER.warn("Builder {} skipped tree log {} because no safe standing position exists",
                         uuidShort(villager.getUuid()), log);
                 return false;
             }
             if (!moveNear(villager, task, stand, VillageExpansionConfig.navigationSpeed, true)) return false;
+            if (!hasClearTreeMiningLine(world, villager, log)) {
+                task.rejectedTreeStandPositions.add(stand.asLong());
+                task.currentTreeStandPosition = null;
+                task.currentTreeStandChecked = false;
+                task.requestedMoveTarget = null;
+                task.moveTarget = null;
+                return false; // Keep the same log and accumulated break ticks; approach from another side.
+            }
             equipBestTool(villager, ToolKind.AXE);
             if (!tickBreakBlock(world, villager, task, log, ToolKind.AXE, ItemTags.LOGS)) return false;
             task.currentTreeLogIndex++;
@@ -2130,6 +2221,7 @@ public final class VillageBuilderController {
         task.currentTreeStandTarget = null;
         task.currentTreeStandPosition = null;
         task.currentTreeStandChecked = false;
+        task.rejectedTreeStandPositions.clear();
         clearBreakingProgress(world, villager, task);
         task.wood = countInventoryItems(villager, ItemTags.LOGS);
         return true;
@@ -2257,9 +2349,8 @@ public final class VillageBuilderController {
      */
     private static boolean ensureBuilderTool(ServerWorld world, VillagerEntity villager, BuilderTask task,
                                              Item minimumTool, Stage returnStage) {
-        ToolKind kind = minimumTool == Items.WOODEN_AXE ? ToolKind.AXE
-                : minimumTool == Items.WOODEN_PICKAXE || minimumTool == Items.STONE_PICKAXE
-                || minimumTool == Items.IRON_PICKAXE ? ToolKind.PICKAXE : ToolKind.SHOVEL;
+        ToolKind kind = toolKindForItem(minimumTool);
+        if (kind == null) return false;
         int minimumTier = toolTier(minimumTool, kind);
         if (hasToolAtLeast(villager, kind, minimumTier)) {
             equipBestTool(villager, kind);
@@ -2286,9 +2377,16 @@ public final class VillageBuilderController {
 
     private static void equipBestTool(VillagerEntity villager, ToolKind kind) {
         ItemStack current = villager.getEquippedStack(EquipmentSlot.MAINHAND);
+        ItemStack offhand = villager.getEquippedStack(EquipmentSlot.OFFHAND);
         int bestTier = toolTier(current.getItem(), kind);
         ItemStack best = bestTier >= 0 ? current.copy() : ItemStack.EMPTY;
         int bestSlot = -1;
+        int offhandTier = toolTier(offhand.getItem(), kind);
+        if (offhandTier > bestTier) {
+            bestTier = offhandTier;
+            best = offhand.copy();
+            bestSlot = -2;
+        }
         for (int slot = 0; slot < villager.getInventory().size(); slot++) {
             ItemStack candidate = villager.getInventory().getStack(slot);
             int tier = candidate.isEmpty() ? -1 : toolTier(candidate.getItem(), kind);
@@ -2300,29 +2398,41 @@ public final class VillageBuilderController {
             return;
         } else if (!villager.getEquippedStack(EquipmentSlot.MAINHAND).isOf(best.getItem())) {
             if (bestSlot >= 0) {
-                // Swap the selected tool with the current main-hand stack. The old
-                // implementation decremented the inventory tool and overwrote the
-                // held stack, silently deleting (for example) the axe when switching
-                // to a pickaxe. Tool changes must never destroy a still-usable tool.
+                // Swap the selected inventory tool with the previous main-hand stack.
                 villager.getInventory().setStack(bestSlot, current.copy());
                 villager.getInventory().markDirty();
+            } else if (bestSlot == -2) {
+                // A better tool in the offhand is promoted without deleting the
+                // previously held item; it moves into the offhand slot.
+                villager.equipStack(EquipmentSlot.OFFHAND, current.copy());
             }
             villager.equipStack(EquipmentSlot.MAINHAND, best);
         }
     }
 
+    private static ToolKind toolKindForItem(Item item) {
+        if (item == Items.SHEARS) return null;
+        if (item == Items.WOODEN_AXE || item == Items.STONE_AXE || item == Items.IRON_AXE
+                || item == Items.GOLDEN_AXE || item == Items.DIAMOND_AXE || item == Items.NETHERITE_AXE) return ToolKind.AXE;
+        if (item == Items.WOODEN_PICKAXE || item == Items.STONE_PICKAXE || item == Items.IRON_PICKAXE
+                || item == Items.GOLDEN_PICKAXE || item == Items.DIAMOND_PICKAXE || item == Items.NETHERITE_PICKAXE) return ToolKind.PICKAXE;
+        if (item == Items.WOODEN_SHOVEL || item == Items.STONE_SHOVEL || item == Items.IRON_SHOVEL
+                || item == Items.GOLDEN_SHOVEL || item == Items.DIAMOND_SHOVEL || item == Items.NETHERITE_SHOVEL) return ToolKind.SHOVEL;
+        return null;
+    }
+
     private static int toolTier(Item item, ToolKind kind) {
         return switch (kind) {
             case AXE -> item == Items.NETHERITE_AXE ? 5 : item == Items.DIAMOND_AXE ? 4
-                    : item == Items.IRON_AXE ? 3 : item == Items.GOLDEN_AXE ? 2
-                    : item == Items.STONE_AXE ? 1 : item == Items.WOODEN_AXE ? 0 : -1;
+                    : item == Items.IRON_AXE ? 3 : item == Items.STONE_AXE ? 1
+                    : (item == Items.WOODEN_AXE || item == Items.GOLDEN_AXE) ? 0 : -1;
             // Gold pickaxes mine like wooden pickaxes (they cannot harvest iron ore).
             case PICKAXE -> item == Items.NETHERITE_PICKAXE ? 5 : item == Items.DIAMOND_PICKAXE ? 4
                     : item == Items.IRON_PICKAXE ? 3 : item == Items.STONE_PICKAXE ? 1
                     : (item == Items.WOODEN_PICKAXE || item == Items.GOLDEN_PICKAXE) ? 0 : -1;
             case SHOVEL -> item == Items.NETHERITE_SHOVEL ? 5 : item == Items.DIAMOND_SHOVEL ? 4
-                    : item == Items.IRON_SHOVEL ? 3 : item == Items.GOLDEN_SHOVEL ? 2
-                    : item == Items.STONE_SHOVEL ? 1 : item == Items.WOODEN_SHOVEL ? 0 : -1;
+                    : item == Items.IRON_SHOVEL ? 3 : item == Items.STONE_SHOVEL ? 1
+                    : (item == Items.WOODEN_SHOVEL || item == Items.GOLDEN_SHOVEL) ? 0 : -1;
         };
     }
 
@@ -2377,8 +2487,13 @@ public final class VillageBuilderController {
             return true;
         }
 
-        if (task.breakingPos == null || !task.breakingPos.equals(pos)
-                || task.breakingState == null || !task.breakingState.equals(state)) {
+        if (MiningProgressMath.shouldRetainSession(
+                task.breakingPos != null && task.breakingPos.equals(pos),
+                task.breakingState != null && task.breakingState.getBlock() == state.getBlock())) {
+            // Property-only state changes (for example a compatibility mod toggling
+            // a log property) must not restart the mining session for the same block.
+            task.breakingState = state;
+        } else {
             clearBreakingProgress(world, villager, task);
             ItemStack heldTool = villager.getEquippedStack(EquipmentSlot.MAINHAND);
             float miningSpeed = Math.max(0.1F, heldTool.getMiningSpeedMultiplier(state));
@@ -2417,26 +2532,40 @@ public final class VillageBuilderController {
         long now = world.getTime();
         if (task.cachedNearbyDanger || (villager.getAttacker() != null && villager.getAttacker().isAlive())
                 || healthEmergency(villager) || now < task.pausedUntil
-                || task.sleepingAtNight || nightWithAssignedHome(villager)) return;
-        if (!isLoaded(world, pos) || villager.getBlockPos().getSquaredDistance(pos) > 16.0D) {
+                || task.sleepingAtNight || nightWithAssignedHome(villager)) {
+            hideBreakingProgress(world, villager, task);
+            return;
+        }
+        if (!isLoaded(world, pos)) {
             clearBreakingProgress(world, villager, task);
             return;
         }
 
         BlockState currentState = world.getBlockState(pos);
-        if (currentState.isAir() || !currentState.equals(task.breakingState)
+        if (currentState.isAir() || task.breakingState == null
+                || currentState.getBlock() != task.breakingState.getBlock()
                 || currentState.getHardness(world, pos) < 0.0F) {
             clearBreakingProgress(world, villager, task);
             return;
         }
-        ItemStack heldTool = villager.getEquippedStack(EquipmentSlot.MAINHAND);
-        if (heldTool.getItem() != task.breakingTool.getItem()
-                || heldTool.getDamage() != task.breakingTool.getDamage()) {
-            // A vanilla behavior changed the held tool mid-swing. Restart with the
-            // real current tool instead of granting loot as if the old tool remained.
-            clearBreakingProgress(world, villager, task);
+        // Another mod may push the builder out of working range. Pause the break
+        // animation until it returns; do not reset the accumulated work. Vertical
+        // distance is intentionally ignored so the worker can cut upper tree logs.
+        double dx = villager.getX() - (pos.getX() + 0.5D);
+        double dz = villager.getZ() - (pos.getZ() + 0.5D);
+        if (!MiningProgressMath.isWithinHorizontalReach(dx * dx + dz * dz)) {
+            hideBreakingProgress(world, villager, task);
             return;
         }
+        if (task.breakingDropMode == BREAK_DROPS_LOGS && !hasClearTreeMiningLine(world, villager, pos)) {
+            hideBreakingProgress(world, villager, task);
+            return; // The task controller will select another side; accumulated work is retained.
+        }
+        if (!currentState.equals(task.breakingState)) task.breakingState = currentState;
+        ItemStack heldTool = villager.getEquippedStack(EquipmentSlot.MAINHAND);
+        // Keep the original tool snapshot for this mining session. Some compatibility
+        // mods temporarily replace equipment or apply knockback; neither should reset
+        // the block's accumulated progress. The snapshot is used for correct drops.
 
         task.breakingTicks = Math.min(task.breakingDuration, task.breakingTicks + 1);
         if (task.breakingTicks % 5 == 0) villager.swingHand(Hand.MAIN_HAND);
@@ -2459,10 +2588,38 @@ public final class VillageBuilderController {
                 case BREAK_DROPS_SPECIFIC -> collectSpecificDrops(world, villager, pos, task.breakingAcceptedItem);
                 default -> collectDrops(world, villager, pos, null);
             }
-            if (heldTool.isDamageable()) heldTool.damage(1, villager, EquipmentSlot.MAINHAND);
+            if (!heldTool.isEmpty() && heldTool.getItem() == task.breakingTool.getItem()
+                    && heldTool.isDamageable()) heldTool.damage(1, villager, EquipmentSlot.MAINHAND);
             villager.getInventory().markDirty();
         }
         clearBreakingProgress(world, villager, task);
+    }
+
+    private static void hideBreakingProgress(ServerWorld world, VillagerEntity villager, BuilderTask task) {
+        if (task.breakingPos != null) world.setBlockBreakingInfo(villager.getId(), task.breakingPos, -1);
+    }
+
+    /**
+     * Checks the working ray while treating leaves as transparent. Leaf collision
+     * shapes commonly sit between the worker and upper logs, but must not make an
+     * otherwise reachable log reset or remain permanently unmineable.
+     */
+    private static boolean hasClearTreeMiningLine(ServerWorld world, VillagerEntity villager, BlockPos target) {
+        Vec3d end = target.toCenterPos();
+        Vec3d direction = end.subtract(villager.getEyePos()).normalize();
+        Vec3d start = villager.getEyePos();
+        for (int pass = 0; pass < 12; pass++) {
+            var hit = world.raycast(new RaycastContext(start, end, RaycastContext.ShapeType.COLLIDER,
+                    RaycastContext.FluidHandling.NONE, villager));
+            if (hit.getType() == HitResult.Type.MISS) return true;
+            BlockPos hitPos = hit.getBlockPos();
+            if (hitPos.equals(target)) return true;
+            if (!world.getBlockState(hitPos).isIn(BlockTags.LEAVES)) return false;
+            // Continue a few centimeters beyond this leaf collision before raycasting again.
+            start = hit.getPos().add(direction.multiply(0.06D));
+            if (start.squaredDistanceTo(end) < 0.0025D) return true;
+        }
+        return false;
     }
 
     private static void clearBreakingProgress(ServerWorld world, VillagerEntity villager, BuilderTask task) {
@@ -2918,7 +3075,7 @@ public final class VillageBuilderController {
             }
             if (!acquireSpatialSearchPermit(world)) return;
             int[] searchProgress = woodSearchProgress(task.resourceSearchFailures);
-            ResourceTarget target = findWoodTarget(world, task.site, villager, null,
+            ResourceTarget target = findWoodTarget(world, villager.getBlockPos(), villager, null,
                     searchProgress[0], task.rejectedResourceTargets, searchProgress[1]);
             if (target == null) {
                 task.resourceSearchFailures++;
@@ -3003,6 +3160,23 @@ public final class VillageBuilderController {
         // forests, so a builder could report a missing log while standing idle.
         int[][] offsets = com.guides.villageexpansion.structures.BiomeWoodProfile
                 .searchSpiralOffsets(radius, searchCursor, WOOD_SEARCH_COLUMNS_PER_SLICE);
+        // First inspect a compact neighborhood completely. A close tree must win
+        // over an earlier candidate in the first broad spiral slice; the larger
+        // scan is only used when this local pass contains no reachable tree.
+        int localRadius = Math.min(6, Math.max(1, radius));
+        int localWidth = localRadius * 2 + 1;
+        int[][] localOffsets = com.guides.villageexpansion.structures.BiomeWoodProfile
+                .searchSpiralOffsets(localRadius, 0, localWidth * localWidth);
+        ResourceTarget localBest = findBestWoodTargetInOffsets(world, around, villager, requiredLog, rejected, localOffsets);
+        if (localBest != null) return localBest;
+        return findBestWoodTargetInOffsets(world, around, villager, requiredLog, rejected, offsets);
+    }
+
+    private static ResourceTarget findBestWoodTargetInOffsets(ServerWorld world, BlockPos around,
+                                                               VillagerEntity villager, Item requiredLog,
+                                                               Set<Long> rejected, int[][] offsets) {
+        ResourceTarget best = null;
+        double bestDistance = Double.MAX_VALUE;
         for (int[] offset : offsets) {
             int x = around.getX() + offset[0];
             int z = around.getZ() + offset[1];
@@ -3019,9 +3193,13 @@ public final class VillageBuilderController {
             if (isWoodTargetReserved(world, root, villager.getUuid())) continue;
             BlockPos stand = findStandingPosition(world, root, villager);
             if (stand == null) continue;
-            return new ResourceTarget(root.toImmutable(), stand);
+            double distance = villager.squaredDistanceTo(
+                    stand.getX() + 0.5D, stand.getY(), stand.getZ() + 0.5D);
+            if (distance >= bestDistance) continue;
+            bestDistance = distance;
+            best = new ResourceTarget(root.toImmutable(), stand);
         }
-        return null;
+        return best;
     }
 
     private static void tickGatherStone(ServerWorld world, VillagerEntity villager, BuilderTask task) {
@@ -3243,6 +3421,9 @@ public final class VillageBuilderController {
 
     private static boolean isMineableStoneOrOre(BlockState state, VillagerEntity villager) {
         if (state.isIn(BlockTags.BASE_STONE_OVERWORLD)) return true;
+        if (state.isOf(Blocks.OBSIDIAN)) {
+            return villager.getEquippedStack(EquipmentSlot.MAINHAND).isSuitableFor(state);
+        }
         Item minedBlockItem = state.getBlock().asItem();
         if (minedBlockItem != Items.AIR && new ItemStack(minedBlockItem).isIn(ItemTags.STONE_TOOL_MATERIALS)) {
             return villager.getEquippedStack(EquipmentSlot.MAINHAND).isSuitableFor(state);
@@ -3823,13 +4004,33 @@ public final class VillageBuilderController {
     private static void migrateSavedWoodMaterialGoals(ServerWorld world, VillagerEntity villager,
                                                      BuilderTask task) {
         String biomePath = world.getBiome(task.site).getKey()
-                .map(key -> key.getValue().getPath()).orElse("forest");
-        String family = com.guides.villageexpansion.structures.BiomeWoodProfile.familyForBiome(biomePath);
+                .map(key -> key.getValue().getPath()).orElse("plains");
+        String targetFamily = com.guides.villageexpansion.structures.BiomeWoodProfile.familyForBiome(biomePath);
+        boolean pendingWoodMismatch = remapSavedWoodItem(task.pendingMaterialItem, targetFamily) != task.pendingMaterialItem
+                || remapSavedWoodItem(task.deferredMaterialItem, targetFamily) != task.deferredMaterialItem
+                || remapSavedWoodItem(task.planBlockedItem, targetFamily) != task.planBlockedItem
+                || remapSavedWoodItem(task.currentTreeLogItem, targetFamily) != task.currentTreeLogItem;
+        if (!pendingWoodMismatch) {
+            for (MaterialGoal goal : task.materialGoalStack) {
+                if (remapSavedWoodItem(goal.item(), targetFamily) != goal.item()) {
+                    pendingWoodMismatch = true;
+                    break;
+                }
+            }
+        }
+        boolean anySavedWoodGoalChanged = pendingWoodMismatch;
+        if (biomePath.equals(task.woodBiomePath) && task.woodPaletteNormalized && !anySavedWoodGoalChanged) return;
+        String workerBiomePath = world.getBiome(villager.getBlockPos()).getKey()
+                .map(key -> key.getValue().getPath()).orElse("unknown");
+        String family = targetFamily;
 
         Item oldPending = task.pendingMaterialItem;
+        Item oldCurrentTreeLog = task.currentTreeLogItem;
         task.pendingMaterialItem = remapSavedWoodItem(task.pendingMaterialItem, family);
         task.planBlockedItem = remapSavedWoodItem(task.planBlockedItem, family);
         task.deferredMaterialItem = remapSavedWoodItem(task.deferredMaterialItem, family);
+        task.currentTreeLogItem = remapSavedWoodItem(task.currentTreeLogItem, family);
+        boolean currentTreeWoodChanged = oldCurrentTreeLog != task.currentTreeLogItem;
         for (int i = 0; i < task.materialGoalStack.size(); i++) {
             MaterialGoal goal = task.materialGoalStack.get(i);
             Item remapped = remapSavedWoodItem(goal.item(), family);
@@ -3838,17 +4039,61 @@ public final class VillageBuilderController {
             }
         }
 
-        if (oldPending != task.pendingMaterialItem) {
+        boolean blueprintChanged = false;
+        for (int i = Math.max(0, task.buildIndex); i < task.blueprint.size(); i++) {
+            BlockPlacement placement = task.blueprint.get(i);
+            BlockState remappedState = VillageTemplateLibrary.adaptWoodState(placement.state(), family);
+            if (remappedState != placement.state()) {
+                task.blueprint.set(i, new BlockPlacement(placement.pos(), remappedState));
+                blueprintChanged = true;
+            }
+        }
+        if (blueprintChanged || oldPending != task.pendingMaterialItem || currentTreeWoodChanged) {
+            // The remaining material cache was derived from the old palette.
+            task.remainingBlueprintCounts = null;
+            task.remainingBlueprintCountsCursor = -1;
+            task.remainingBlueprintCountsReady = false;
+            task.requiredWood = remainingTaggedMaterialRequirement(world, villager,
+                    countBlueprintItems(task.blueprint.subList(Math.min(task.buildIndex, task.blueprint.size()), task.blueprint.size())),
+                    ItemTags.LOGS);
+        }
+        String previousBiomePath = task.woodBiomePath;
+        task.woodBiomePath = biomePath;
+        if (previousBiomePath != null && !previousBiomePath.isBlank()
+                && !previousBiomePath.equals(biomePath)) {
+            resetCurrentTreeState(world, villager, task);
+            task.currentResource = null;
+            task.moveTarget = null;
+            task.requestedMoveTarget = null;
+            task.lazyMaterialPlans.clear();
+            task.directLogSearchItem = null;
+        }
+        task.woodPaletteNormalized = true;
+        VillageExpansionMod.LOGGER.info(
+                "Builder {} wood palette normalized: houseBiome={}, workerBiome={}, family={}, previousHouseBiome={}",
+                uuidShort(villager.getUuid()), biomePath, workerBiomePath, family,
+                previousBiomePath == null || previousBiomePath.isBlank() ? "legacy/unknown" : previousBiomePath);
+
+        boolean pendingWoodGoalChanged = oldPending != task.pendingMaterialItem;
+        if (currentTreeWoodChanged || pendingWoodGoalChanged || anySavedWoodGoalChanged) {
+            // A restored in-flight tree can retain a log species from the old palette
+            // even when its saved biome marker already matches the current biome.
+            // Discard the stale scan and route, but keep the remapped material goal.
+            resetCurrentTreeState(world, villager, task);
+            task.currentResource = null;
+            task.moveTarget = null;
+            task.requestedMoveTarget = null;
+            task.directLogSearchItem = null;
+            task.lazyMaterialPlans.remove(oldPending);
+            task.lazyMaterialPlans.remove(task.pendingMaterialItem);
             task.nextMaterialSearch = world.getTime();
             task.resourceSearchFailures = 0;
-            task.directLogSearchItem = null;
-            task.currentTreeBase = null;
-            task.currentTreeLogItem = null;
-            task.currentTreeLogs.clear();
-            task.currentTreeLogIndex = 0;
+        }
+        if (pendingWoodGoalChanged) {
             VillageExpansionMod.LOGGER.info(
                     "Migrated saved wood request {} -> {} for villager {} at biome {}",
-                    Registries.ITEM.getId(oldPending), Registries.ITEM.getId(task.pendingMaterialItem),
+                    oldPending == null ? "<none>" : Registries.ITEM.getId(oldPending).toString(),
+                    task.pendingMaterialItem == null ? "<none>" : Registries.ITEM.getId(task.pendingMaterialItem).toString(),
                     uuidShort(villager.getUuid()), biomePath);
         }
     }
@@ -3923,6 +4168,67 @@ public final class VillageBuilderController {
         return false;
     }
 
+    private static boolean hasNearbyWorkstation(ServerWorld world, VillagerEntity villager, Block block) {
+        return WorkstationLocator.findNearby(world, villager.getBlockPos(), block, 6, 3) != null;
+    }
+
+    private static WorkstationLease acquireWorkstation(ServerWorld world, VillagerEntity villager,
+                                                        Block block, Item item) {
+        BlockPos nearby = WorkstationLocator.findNearby(world, villager.getBlockPos(), block, 6, 3);
+        if (nearby != null) return new WorkstationLease(nearby, block, item, false);
+        if (countSpecificItem(villager, item) < 1) return null;
+        BlockPos placement = WorkstationLocator.findPlacement(world, villager, 4);
+        if (placement == null || !consumeItems(villager, item, 1)) return null;
+        BlockState placedState = block.getDefaultState();
+        if (block == Blocks.FURNACE) placedState = placedState.with(AbstractFurnaceBlock.LIT, true);
+        if (!world.setBlockState(placement, placedState, Block.NOTIFY_ALL)) {
+            giveItemBack(world, villager, item);
+            return null;
+        }
+        world.playSound(null, placement, SoundEvents.BLOCK_WOOD_PLACE,
+                SoundCategory.BLOCKS, 0.45F, 0.95F);
+        return new WorkstationLease(placement, block, item, true);
+    }
+
+    private static void releaseWorkstation(ServerWorld world, VillagerEntity villager, WorkstationLease lease) {
+        if (lease == null || !lease.temporary()) return;
+        if (isLoaded(world, lease.position()) && world.getBlockState(lease.position()).isOf(lease.block())) {
+            world.setBlockState(lease.position(), Blocks.AIR.getDefaultState(), Block.NOTIFY_ALL);
+            giveItemBack(world, villager, lease.item());
+            world.playSound(null, lease.position(), SoundEvents.BLOCK_STONE_BREAK,
+                    SoundCategory.BLOCKS, 0.35F, 1.0F);
+        }
+    }
+
+    private static void releaseTemporaryFurnace(ServerWorld world, VillagerEntity villager, BuilderTask task) {
+        BlockPos pos = task.temporaryFurnacePos;
+        task.temporaryFurnacePos = null;
+        task.smeltWorkstationPos = null;
+        if (pos != null) {
+            releaseWorkstation(world, villager, new WorkstationLease(pos, Blocks.FURNACE, Items.FURNACE, true));
+        }
+    }
+
+    private static void releaseTemporaryCraftingTable(ServerWorld world, VillagerEntity villager, BuilderTask task) {
+        BlockPos pos = task.temporaryCraftingTablePos;
+        task.temporaryCraftingTablePos = null;
+        task.temporaryCraftingTarget = null;
+        task.craftingTableReadyAt = 0L;
+        if (pos != null) {
+            releaseWorkstation(world, villager,
+                    new WorkstationLease(pos, Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE, true));
+        }
+    }
+
+    private static void giveItemBack(ServerWorld world, VillagerEntity villager, Item item) {
+        ItemStack remainder = villager.getInventory().addStack(new ItemStack(item));
+        if (!remainder.isEmpty()) {
+            world.spawnEntity(new ItemEntity(world, villager.getX(), villager.getY() + 0.35D,
+                    villager.getZ(), remainder));
+        }
+        villager.getInventory().markDirty();
+    }
+
     private static boolean ensureItemCountAvailable(ServerWorld world, VillagerEntity villager, BuilderTask task,
                                                     Item desired, int amount, int depth, Set<Item> visiting) {
         // Pick up a previous recipe output that could not fit in the villager inventory.
@@ -3949,6 +4255,11 @@ public final class VillageBuilderController {
                 task.lazyMaterialPlans.remove(desired);
                 plan = null;
             }
+            if (plan != null && plan.complete && plan.hasNewNearbyWorkstation(world, villager)) {
+                task.lazyMaterialPlans.remove(desired);
+                plan = null;
+                task.nextMaterialSearch = world.getTime();
+            }
             if (plan != null && plan.complete && !plan.viable
                     && world.getTime() >= task.nextMaterialSearch) {
                 task.lazyMaterialPlans.remove(desired);
@@ -3958,7 +4269,7 @@ public final class VillageBuilderController {
             if (plan == null) {
                 // Supplier scanning is also scheduled lazily; it must not run
                 // synchronously for every villager on the same server tick.
-                plan = new MaterialPlanningJob(desired, amount, world.getTime());
+                plan = new MaterialPlanningJob(desired, amount, world.getTime(), world, villager);
                 if (task.planBlockedItem == desired) task.planBlockedItem = null;
                 task.lazyMaterialPlans.put(desired, plan);
                 task.pendingMaterialItem = desired;
@@ -3989,7 +4300,8 @@ public final class VillageBuilderController {
             if (plan.route != MaterialPlanningRoute.DIRECT
                     && VillageExpansionConfig.useRecipeBookForCrafting) {
                 if (plan.route == MaterialPlanningRoute.CRAFTING && crafting != null) {
-                    if (MaterialAcquisitionPlanner.requiresCraftingTable(crafting.entry().value(), desired)
+                    boolean requiresTable = MaterialAcquisitionPlanner.requiresCraftingTable(crafting.entry().value(), desired);
+                    if (requiresTable && !hasNearbyWorkstation(world, villager, Blocks.CRAFTING_TABLE)
                             && countSpecificItem(villager, Items.CRAFTING_TABLE) == 0
                             && !ensureItemCountAvailable(world, villager, task, Items.CRAFTING_TABLE,
                             1, depth + 1, visiting)) {
@@ -4003,23 +4315,67 @@ public final class VillageBuilderController {
                             return false;
                         }
                     }
-                    for (Map.Entry<Item, Integer> ingredient : crafting.ingredients().entrySet()) {
-                        if (!consumeItems(villager, ingredient.getKey(), ingredient.getValue())) {
-                            task.pendingMaterialItem = ingredient.getKey();
-                            task.pendingMaterialCount = ingredient.getValue();
-                            deferMaterialGoal(task, desired, amount);
-                            return false;
+                    WorkstationLease tableLease = requiresTable
+                            ? acquireWorkstation(world, villager, Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE)
+                            : null;
+                    if (requiresTable && tableLease == null) {
+                        deferMaterialGoal(task, desired, amount);
+                        task.nextMaterialSearch = world.getTime() + 20L;
+                        return false;
+                    }
+                    if (requiresTable && task.temporaryCraftingTablePos != null
+                            && task.temporaryCraftingTablePos.equals(tableLease.position())) {
+                        // The station is ours, but acquireWorkstation sees its block
+                        // as an existing table on the following tick. Keep ownership
+                        // so the table is reclaimed after the actual recipe operation.
+                        tableLease = new WorkstationLease(tableLease.position(), Blocks.CRAFTING_TABLE,
+                                Items.CRAFTING_TABLE, true);
+                    }
+                    if (requiresTable && tableLease.temporary()
+                            && task.temporaryCraftingTablePos == null) {
+                        task.temporaryCraftingTablePos = tableLease.position().toImmutable();
+                        task.temporaryCraftingTarget = desired;
+                        task.craftingTableReadyAt = world.getTime() + 20L;
+                        task.pendingMaterialItem = desired;
+                        task.pendingMaterialCount = amount;
+                        task.nextMaterialSearch = task.craftingTableReadyAt;
+                        villager.swingHand(Hand.MAIN_HAND);
+                        return false; // Give the placed table a real use window before reclaiming it.
+                    }
+                    if (requiresTable && tableLease.temporary()
+                            && world.getTime() < task.craftingTableReadyAt) {
+                        task.pendingMaterialItem = desired;
+                        task.pendingMaterialCount = amount;
+                        task.nextMaterialSearch = task.craftingTableReadyAt;
+                        return false;
+                    }
+                    try {
+                        for (Map.Entry<Item, Integer> ingredient : crafting.ingredients().entrySet()) {
+                            if (!consumeItems(villager, ingredient.getKey(), ingredient.getValue())) {
+                                task.pendingMaterialItem = ingredient.getKey();
+                                task.pendingMaterialCount = ingredient.getValue();
+                                deferMaterialGoal(task, desired, amount);
+                                return false;
+                            }
+                        }
+                        ItemStack output = crafting.entry().value().getResult(world.getRegistryManager()).copy();
+                        int batches = (missing + output.getCount() - 1) / output.getCount();
+                        output.setCount(output.getCount() * batches);
+                        ItemStack remainder = villager.getInventory().addStack(output);
+                        if (!remainder.isEmpty()) {
+                            world.spawnEntity(new ItemEntity(world, villager.getX(), villager.getY() + 0.4D,
+                                    villager.getZ(), remainder));
+                        }
+                        return countSpecificItem(villager, desired) >= amount;
+                    } finally {
+                        releaseWorkstation(world, villager, tableLease);
+                        if (tableLease != null && task.temporaryCraftingTablePos != null
+                                && task.temporaryCraftingTablePos.equals(tableLease.position())) {
+                            task.temporaryCraftingTablePos = null;
+                            task.temporaryCraftingTarget = null;
+                            task.craftingTableReadyAt = 0L;
                         }
                     }
-                    ItemStack output = crafting.entry().value().getResult(world.getRegistryManager()).copy();
-                    int batches = (missing + output.getCount() - 1) / output.getCount();
-                    output.setCount(output.getCount() * batches);
-                    ItemStack remainder = villager.getInventory().addStack(output);
-                    if (!remainder.isEmpty()) {
-                        world.spawnEntity(new ItemEntity(world, villager.getX(), villager.getY() + 0.4D,
-                                villager.getZ(), remainder));
-                    }
-                    return countSpecificItem(villager, desired) >= amount;
                 }
 
                 // Stonecutting is another registered recipe path for blocks such as
@@ -4065,7 +4421,8 @@ public final class VillageBuilderController {
                     // A furnace is a real dependency in the plan. The processing
                     // animation remains simulated, but the worker must first craft
                     // and retain the workstation item from its normal recipe chain.
-                    if (countSpecificItem(villager, Items.FURNACE) == 0
+                    if (!hasNearbyWorkstation(world, villager, Blocks.FURNACE)
+                            && countSpecificItem(villager, Items.FURNACE) == 0
                             && !ensureItemCountAvailable(world, villager, task, Items.FURNACE,
                             1, depth + 1, visiting)) {
                         deferMaterialGoal(task, desired, amount);
@@ -4083,7 +4440,18 @@ public final class VillageBuilderController {
                         deferMaterialGoal(task, desired, amount);
                         return false;
                     }
+                    WorkstationLease furnaceLease = acquireWorkstation(world, villager, Blocks.FURNACE, Items.FURNACE);
+                    if (furnaceLease == null) {
+                        deferMaterialGoal(task, desired, amount);
+                        task.nextMaterialSearch = world.getTime() + 20L;
+                        return false;
+                    }
+                    task.temporaryFurnacePos = furnaceLease.temporary() ? furnaceLease.position() : null;
+                    task.smeltWorkstationPos = furnaceLease.position();
                     if (!consumeItems(villager, smelting.input(), 1)) {
+                        releaseWorkstation(world, villager, furnaceLease);
+                        task.temporaryFurnacePos = null;
+                        task.smeltWorkstationPos = null;
                         task.pendingMaterialItem = smelting.input();
                         task.pendingMaterialCount = 1;
                         deferMaterialGoal(task, desired, amount);
@@ -4100,8 +4468,8 @@ public final class VillageBuilderController {
                     task.stage = Stage.SMELT_MATERIAL;
                     task.moveTarget = null;
                     task.requestedMoveTarget = null;
-                    world.playSound(null, villager.getBlockPos(), SoundEvents.BLOCK_FURNACE_FIRE_CRACKLE,
-                            SoundCategory.BLOCKS, 0.35F, 1.0F);
+                    world.playSound(null, furnaceLease.position(), SoundEvents.BLOCK_FURNACE_FIRE_CRACKLE,
+                            SoundCategory.BLOCKS, 0.5F, 1.0F);
                     return false;
                 }
 
@@ -4160,7 +4528,7 @@ public final class VillageBuilderController {
                     task.lazyMaterialPlans.remove(job.item);
                     return;
                 }
-                job.nextStepAt = now + VillageExpansionConfig.lazyPlanningStepIntervalTicks;
+                job.nextStepAt = now + 1L;
                 task.nextMaterialSearch = job.nextStepAt;
                 return;
             }
@@ -4203,6 +4571,11 @@ public final class VillageBuilderController {
     private static final class MaterialPlanningJob {
         private final Item item;
         private final int amount;
+        private final boolean hadNearbyCraftingTable;
+        private final boolean hadNearbyFurnace;
+        private boolean craftingTableContextRefreshUsed;
+        private boolean furnaceContextRefreshUsed;
+        private long lastWorkstationContextCheck = Long.MIN_VALUE;
         private long nextStepAt;
         private int phase;
         private boolean providerChecked;
@@ -4214,10 +4587,28 @@ public final class VillageBuilderController {
         private boolean complete;
         private boolean viable;
 
-        private MaterialPlanningJob(Item item, int amount, long now) {
+        private MaterialPlanningJob(Item item, int amount, long now, ServerWorld world, VillagerEntity villager) {
             this.item = item;
             this.amount = amount;
+            this.hadNearbyCraftingTable = hasNearbyWorkstation(world, villager, Blocks.CRAFTING_TABLE);
+            this.hadNearbyFurnace = hasNearbyWorkstation(world, villager, Blocks.FURNACE);
             this.nextStepAt = now;
+        }
+
+        private boolean hasNewNearbyWorkstation(ServerWorld world, VillagerEntity villager) {
+            long now = world.getTime();
+            if (lastWorkstationContextCheck != Long.MIN_VALUE
+                    && now - lastWorkstationContextCheck < 10L) return false;
+            lastWorkstationContextCheck = now;
+            boolean nowHasTable = hasNearbyWorkstation(world, villager, Blocks.CRAFTING_TABLE);
+            boolean nowHasFurnace = hasNearbyWorkstation(world, villager, Blocks.FURNACE);
+            boolean newTable = !hadNearbyCraftingTable && nowHasTable && !craftingTableContextRefreshUsed;
+            boolean newFurnace = !hadNearbyFurnace && nowHasFurnace && !furnaceContextRefreshUsed;
+            if (newTable) craftingTableContextRefreshUsed = true;
+            if (newFurnace) furnaceContextRefreshUsed = true;
+            // A job can depend on both stations in different recipe branches.
+            // Refresh each station type once, even if the original plan was viable.
+            return newTable || newFurnace;
         }
 
         private void advance(ServerWorld world, VillagerEntity villager) {
@@ -4315,6 +4706,7 @@ public final class VillageBuilderController {
 
     private static void tickSmeltMaterial(ServerWorld world, VillagerEntity villager, BuilderTask task) {
         if (task.pendingSmeltOutput == null || task.smeltTicksRemaining <= 0) {
+            releaseTemporaryFurnace(world, villager, task);
             task.pendingSmeltOutput = null;
             task.smeltTicksRemaining = 0;
             task.stage = task.resumeStage == null ? Stage.BUILD : task.resumeStage;
@@ -4323,12 +4715,18 @@ public final class VillageBuilderController {
         }
         task.smeltTicksRemaining = Math.max(0, task.smeltTicksRemaining - task.elapsedControllerTicks);
         if (world.getTime() % 10L == 0L) {
-            world.spawnParticles(ParticleTypes.SMOKE, villager.getX(), villager.getY() + 0.4D,
-                    villager.getZ(), 1, 0.12D, 0.08D, 0.12D, 0.005D);
-            world.spawnParticles(ParticleTypes.FLAME, villager.getX(), villager.getY() + 0.25D,
-                    villager.getZ(), 1, 0.08D, 0.02D, 0.08D, 0.0D);
+            BlockPos furnacePos = task.smeltWorkstationPos != null
+                    ? task.smeltWorkstationPos : villager.getBlockPos();
+            double fx = furnacePos.getX() + 0.5D;
+            double fy = furnacePos.getY() + 0.65D;
+            double fz = furnacePos.getZ() + 0.5D;
+            world.spawnParticles(ParticleTypes.SMOKE, fx, fy, fz,
+                    1, 0.12D, 0.08D, 0.12D, 0.005D);
+            world.spawnParticles(ParticleTypes.FLAME, fx, fy - 0.15D, fz,
+                    1, 0.08D, 0.02D, 0.08D, 0.0D);
         }
         if (task.smeltTicksRemaining > 0) return;
+        releaseTemporaryFurnace(world, villager, task);
         ItemStack result = new ItemStack(task.pendingSmeltOutput, Math.max(1, task.smeltOutputCount));
         ItemStack remainder = villager.getInventory().addStack(result);
         if (!remainder.isEmpty()) world.spawnEntity(new ItemEntity(world, villager.getX(), villager.getY() + 0.4D,
@@ -4343,11 +4741,13 @@ public final class VillageBuilderController {
     private static Item requiredPickaxeForDrop(Item wanted) {
         Item required = MaterialAcquisitionPlanner.requiredToolFor(wanted);
         return required == Items.WOODEN_PICKAXE || required == Items.STONE_PICKAXE
-                || required == Items.IRON_PICKAXE ? required : null;
+                || required == Items.IRON_PICKAXE || required == Items.DIAMOND_PICKAXE
+                || required == Items.NETHERITE_PICKAXE ? required : null;
     }
 
     private static boolean hasToolAtLeast(VillagerEntity villager, ToolKind kind, int tier) {
         if (toolTier(villager.getEquippedStack(EquipmentSlot.MAINHAND).getItem(), kind) >= tier) return true;
+        if (toolTier(villager.getEquippedStack(EquipmentSlot.OFFHAND).getItem(), kind) >= tier) return true;
         for (int slot = 0; slot < villager.getInventory().size(); slot++) {
             if (toolTier(villager.getInventory().getStack(slot).getItem(), kind) >= tier) return true;
         }
@@ -4526,6 +4926,7 @@ public final class VillageBuilderController {
         task.currentTreeStandTarget = null;
         task.currentTreeStandPosition = null;
         task.currentTreeStandChecked = false;
+        task.rejectedTreeStandPositions.clear();
     }
 
     private static void tickGatherExactLog(ServerWorld world, VillagerEntity villager, BuilderTask task,
@@ -4572,7 +4973,7 @@ public final class VillageBuilderController {
             villager.getNavigation().stop();
             if (!acquireSpatialSearchPermit(world)) return;
             int[] searchProgress = woodSearchProgress(task.resourceSearchFailures);
-            target = findWoodTarget(world, task.site, villager, wanted, searchProgress[0],
+            target = findWoodTarget(world, villager.getBlockPos(), villager, wanted, searchProgress[0],
                     task.rejectedResourceTargets, searchProgress[1]);
             task.currentResource = target;
             task.moveTarget = null;
@@ -4628,6 +5029,26 @@ public final class VillageBuilderController {
             return;
         }
         int requestedCount = Math.max(1, task.pendingMaterialCount);
+        // Tool goals are minimum capabilities, not exact item requests. Satisfy a
+        // wooden-tool objective immediately when a stone/iron/diamond equivalent
+        // already exists; never enter the planner to manufacture a worse tool.
+        if (isToolItem(wanted) && MaterialAcquisitionPlanner.hasToolOrBetter(villager, wanted)) {
+            ToolKind compatibleKind = toolKindForItem(wanted);
+            if (compatibleKind != null) equipBestTool(villager, compatibleKind);
+            task.lazyMaterialPlans.remove(wanted);
+            task.planBlockedItem = null;
+            if (!resumeDeferredMaterialGoal(task)) {
+                task.pendingMaterialItem = null;
+                task.pendingMaterialCount = 0;
+                task.stage = task.materialReturnStage != null ? task.materialReturnStage
+                        : (task.resumeStage == null ? Stage.BUILD : task.resumeStage);
+                task.resumeStage = null;
+                task.materialReturnStage = null;
+            }
+            task.moveTarget = null;
+            task.requestedMoveTarget = null;
+            return;
+        }
         boolean itemAlreadyAvailable = countSpecificItem(villager, wanted) >= requestedCount
                 || (isToolItem(wanted) && MaterialAcquisitionPlanner.hasToolOrBetter(villager, wanted));
         boolean exactRawLogRequest = isRawNaturalTreeLogItem(wanted);
@@ -5025,6 +5446,7 @@ public final class VillageBuilderController {
             case "cobblestone" -> state.isOf(Blocks.STONE);
             case "cobbled_deepslate" -> state.isOf(Blocks.DEEPSLATE)
                     || blockId.equals("cobbled_deepslate");
+            case "obsidian" -> state.isOf(Blocks.OBSIDIAN);
             case "coal" -> blockId.equals("coal_ore") || blockId.equals("deepslate_coal_ore");
             case "raw_iron" -> blockId.equals("iron_ore") || blockId.equals("deepslate_iron_ore");
             case "raw_copper" -> blockId.equals("copper_ore") || blockId.equals("deepslate_copper_ore");
@@ -5534,6 +5956,8 @@ public final class VillageBuilderController {
     }
 
     private static void completeProject(ServerWorld world, VillagerEntity villager, BuilderTask task) {
+        releaseTemporaryFurnace(world, villager, task);
+        releaseTemporaryCraftingTable(world, villager, task);
         VillageExpansionState saved = world.getPersistentStateManager().getOrCreate(
                 VillageExpansionState.TYPE, VillageExpansionState.STORAGE_ID);
         VillageExpansionState.VillageRecord village = saved.getVillage(task.villageId);
@@ -5631,6 +6055,8 @@ public final class VillageBuilderController {
     }
 
     private static void abandonTask(ServerWorld world, VillagerEntity villager, BuilderTask task) {
+        releaseTemporaryFurnace(world, villager, task);
+        releaseTemporaryCraftingTable(world, villager, task);
         clearBreakingProgress(world, villager, task);
         villager.getNavigation().stop();
         restoreBuilderProfession(villager, task);
@@ -5731,6 +6157,9 @@ public final class VillageBuilderController {
         private int stone;
         private int dirt;
         private int requiredWood = VillageExpansionConfig.woodRequired;
+        /** Last house-site biome used to adapt this task's blueprint/material goals. */
+        private String woodBiomePath = "";
+        private boolean woodPaletteNormalized;
         private int requiredStone = VillageExpansionConfig.stoneRequired;
         // Stores the blueprint quota while one temporary stone block is gathered for terrain fill.
         private int temporaryStoneRequirement = -1;
@@ -5778,9 +6207,17 @@ public final class VillageBuilderController {
         private BlockPos currentTreeStandTarget;
         private BlockPos currentTreeStandPosition;
         private boolean currentTreeStandChecked;
+        /** Failed stand positions for the current tree log; the log itself is retained. */
+        private final Set<Long> rejectedTreeStandPositions = new HashSet<>();
         private int currentTreeLeafIndex;
         private boolean currentTreeLeavesScanned;
         private int smeltTicksRemaining;
+        /** A furnace placed by this builder for the active smelting operation; removed and reclaimed on completion. */
+        private BlockPos temporaryFurnacePos;
+        /** Temporary table remains in the world during the crafting-use window, then is reclaimed. */
+        private BlockPos temporaryCraftingTablePos;
+        private Item temporaryCraftingTarget;
+        private long craftingTableReadyAt;
         private int smeltFuelTicksRemaining;
         private int smeltOutputCount = 1;
         private Item pendingSmeltOutput;
@@ -5861,6 +6298,9 @@ public final class VillageBuilderController {
     }
 
     private record MaterialGoal(Item item, int count) {
+    }
+
+    private record WorkstationLease(BlockPos position, Block block, Item item, boolean temporary) {
     }
 
     private record ResourceTarget(BlockPos block, BlockPos stand) {

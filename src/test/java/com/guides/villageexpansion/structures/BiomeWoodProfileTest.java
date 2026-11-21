@@ -13,6 +13,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BiomeWoodProfileTest {
     @Test
     void regularOakForestNeverSelectsSpruceMaterials() {
+        assertEquals("oak", BiomeWoodProfile.familyForBiome("plains"));
+        assertEquals("oak", BiomeWoodProfile.familyForBiome("meadow"));
         assertEquals("oak", BiomeWoodProfile.familyForBiome("forest"));
         assertEquals("oak", BiomeWoodProfile.familyForBiome("oak_forest"));
         assertEquals("oak", BiomeWoodProfile.familyForBiome("flower_forest"));

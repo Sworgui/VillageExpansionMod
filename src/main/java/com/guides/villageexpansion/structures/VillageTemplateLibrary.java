@@ -166,7 +166,7 @@ public final class VillageTemplateLibrary {
     }
 
 
-    private static BlockState adaptWoodState(BlockState original, String targetFamily) {
+    public static BlockState adaptWoodState(BlockState original, String targetFamily) {
         if (original == null || original.isAir()) return original;
         Identifier originalId = Registries.BLOCK.getId(original.getBlock());
         if (!"minecraft".equals(originalId.getNamespace())) return original;
