@@ -1,6 +1,11 @@
-# Village Expansion 1.4.8
+# Village Expansion 1.4.9
 
 Fabric mod that lets unemployed villagers start settlements, prepare land, gather materials, dig mines and build village-style homes. The project currently targets **Minecraft 1.21.1 only**.
+
+## 1.4.9 build fix
+
+- Added the missing `net.minecraft.block.Block` import in `MaterialAcquisitionPlanner`, resolving the reported `cannot find symbol: class Block` compiler error. No gameplay logic changed.
+- The previous 1.4.8 behavior and acceptance scenarios remain unchanged; see `docs/TEST_SCENARIOS_1.4.8.md`.
 
 ## 1.4.8 changes
 

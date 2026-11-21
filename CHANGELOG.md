@@ -1,3 +1,8 @@
+## 1.4.9
+
+- Fixed the Fabric compilation error in `MaterialAcquisitionPlanner`: imported `net.minecraft.block.Block`, which is used by the nearby-workstation lookup helper. This is a compile-only fix; runtime behavior is unchanged from 1.4.8.
+- Bumped the mod version and CI artifact name to 1.4.9.
+
 ## 1.4.8
 
 - Corrected tree mining interruptions: leaves are transparent to the working ray, while non-leaf colliders cause a side change rather than a counter reset. If navigation to one side fails (including after knockback or entity pushing), the builder rejects only that stand and retries the same log from another side instead of skipping it immediately.
