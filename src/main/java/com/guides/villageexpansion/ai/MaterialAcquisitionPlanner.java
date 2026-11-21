@@ -292,11 +292,11 @@ final class MaterialAcquisitionPlanner {
 
     /** Exact items are preferred; an equal-or-better tool of the same family is also valid. */
     static boolean isCompatibleProviderItem(Item offered, Item wanted) {
-        if (offered == null || wanted == null || offered == Items.AIR || wanted == Items.AIR) return false;
-        if (offered == wanted) return true;
-        if (!isTool(wanted)) return false;
-        int wantedTier = toolTier(wanted, wanted);
-        return wantedTier >= 0 && toolTier(offered, wanted) >= wantedTier;
+        if (offered == null || wanted == null) return false;
+        Identifier offeredId = Registries.ITEM.getId(offered);
+        Identifier wantedId = Registries.ITEM.getId(wanted);
+        return offeredId != null && wantedId != null
+                && MaterialToolRules.isCompatibleProviderItem(offeredId.toString(), wantedId.toString());
     }
 
     static boolean shouldUseDirectSource(ServerWorld world, VillagerEntity villager, Item item, int count) {
@@ -894,33 +894,11 @@ final class MaterialAcquisitionPlanner {
     }
 
     static int toolTier(Item candidate, Item familyReference) {
-        boolean pickaxe = familyReference == Items.WOODEN_PICKAXE || familyReference == Items.STONE_PICKAXE
-                || familyReference == Items.IRON_PICKAXE || familyReference == Items.GOLDEN_PICKAXE
-                || familyReference == Items.DIAMOND_PICKAXE || familyReference == Items.NETHERITE_PICKAXE;
-        boolean axe = familyReference == Items.WOODEN_AXE || familyReference == Items.STONE_AXE
-                || familyReference == Items.IRON_AXE || familyReference == Items.GOLDEN_AXE
-                || familyReference == Items.DIAMOND_AXE || familyReference == Items.NETHERITE_AXE;
-        if (pickaxe) {
-            return candidate == Items.NETHERITE_PICKAXE ? 5 : candidate == Items.DIAMOND_PICKAXE ? 4
-                    : candidate == Items.IRON_PICKAXE ? 3 : candidate == Items.STONE_PICKAXE ? 1
-                    : (candidate == Items.WOODEN_PICKAXE || candidate == Items.GOLDEN_PICKAXE) ? 0 : -1;
-        }
-        if (axe) {
-            // Gold tools are fast but have wooden-tier harvest capability;
-            // they must not satisfy a stone/iron minimum-harvest requirement.
-            return candidate == Items.NETHERITE_AXE ? 5 : candidate == Items.DIAMOND_AXE ? 4
-                    : candidate == Items.IRON_AXE ? 3 : candidate == Items.STONE_AXE ? 1
-                    : (candidate == Items.WOODEN_AXE || candidate == Items.GOLDEN_AXE) ? 0 : -1;
-        }
-        boolean shovel = familyReference == Items.WOODEN_SHOVEL || familyReference == Items.STONE_SHOVEL
-                || familyReference == Items.IRON_SHOVEL || familyReference == Items.GOLDEN_SHOVEL
-                || familyReference == Items.DIAMOND_SHOVEL || familyReference == Items.NETHERITE_SHOVEL;
-        if (shovel) {
-            return candidate == Items.NETHERITE_SHOVEL ? 5 : candidate == Items.DIAMOND_SHOVEL ? 4
-                    : candidate == Items.IRON_SHOVEL ? 3 : candidate == Items.STONE_SHOVEL ? 1
-                    : (candidate == Items.WOODEN_SHOVEL || candidate == Items.GOLDEN_SHOVEL) ? 0 : -1;
-        }
-        return -1;
+        if (candidate == null || familyReference == null) return -1;
+        Identifier candidateId = Registries.ITEM.getId(candidate);
+        Identifier familyId = Registries.ITEM.getId(familyReference);
+        if (candidateId == null || familyId == null) return -1;
+        return MaterialToolRules.toolTier(candidateId.toString(), familyId.toString());
     }
 
     private static boolean isTool(Item item) {
@@ -941,26 +919,20 @@ final class MaterialAcquisitionPlanner {
         if (item == null || item == Items.AIR) return null;
         if (isStrippedLog(item)) return Items.WOODEN_AXE;
 
-        String path = Registries.ITEM.getId(item).getPath();
-        if (item == Items.OBSIDIAN || path.equals("obsidian")) return Items.DIAMOND_PICKAXE;
-        if (item == Items.DIAMOND || item == Items.EMERALD
-                || path.equals("diamond_ore") || path.equals("deepslate_diamond_ore")
-                || path.equals("emerald_ore") || path.equals("deepslate_emerald_ore")) {
-            return Items.IRON_PICKAXE;
+        Identifier itemId = Registries.ITEM.getId(item);
+        if (itemId == null) return null;
+        int explicitPickaxeTier = MaterialToolRules.requiredPickaxeTierForMaterial(itemId.toString());
+        if (explicitPickaxeTier >= 0) {
+            return switch (explicitPickaxeTier) {
+                case 0 -> Items.WOODEN_PICKAXE;
+                case 1 -> Items.STONE_PICKAXE;
+                case 3 -> Items.IRON_PICKAXE;
+                case 4 -> Items.DIAMOND_PICKAXE;
+                default -> null;
+            };
         }
-        if (item == Items.RAW_IRON || item == Items.RAW_COPPER || item == Items.RAW_GOLD
-                || item == Items.LAPIS_LAZULI || item == Items.REDSTONE
-                || path.equals("iron_ore") || path.equals("deepslate_iron_ore")
-                || path.equals("copper_ore") || path.equals("deepslate_copper_ore")
-                || path.equals("gold_ore") || path.equals("deepslate_gold_ore")
-                || path.equals("lapis_ore") || path.equals("deepslate_lapis_ore")
-                || path.equals("redstone_ore") || path.equals("deepslate_redstone_ore")) {
-            return Items.STONE_PICKAXE;
-        }
-        BlockState blockState = Registries.BLOCK.get(Registries.ITEM.getId(item)).getDefaultState();
-        if (item == Items.COAL || item == Items.COBBLESTONE || item == Items.COBBLED_DEEPSLATE
-                || path.equals("coal_ore") || path.equals("deepslate_coal_ore")
-                || new ItemStack(item).isIn(ItemTags.STONE_TOOL_MATERIALS)
+        BlockState blockState = Registries.BLOCK.get(itemId).getDefaultState();
+        if (new ItemStack(item).isIn(ItemTags.STONE_TOOL_MATERIALS)
                 || (blockState.getBlock().asItem() == item
                 && blockState.isIn(BlockTags.BASE_STONE_OVERWORLD)
                 && item != Items.STONE && item != Items.DEEPSLATE)) {

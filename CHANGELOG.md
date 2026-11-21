@@ -1,3 +1,10 @@
+## 1.4.12
+
+- Removed the JUnit test's direct `Bootstrap.initialize()` call, which raised `IllegalAccessError` under the Fabric Loom remapped test runtime.
+- Extracted vanilla tool-family and harvest-tier compatibility into `MaterialToolRules`, a registry-independent pure Java helper. Runtime planning converts registered Minecraft items to identifiers and delegates to the same rule implementation.
+- Reworked `MaterialToolCompatibilityTest` to use vanilla item identifiers rather than initializing `Items` and Minecraft registries. This preserves coverage for shovel upgrades, tool-family separation, golden harvest tiers, diamond ore and obsidian thresholds.
+- Corrected the GitHub Actions artifact path to the current versioned JAR name (`village-expansion-1.4.12.jar`).
+
 ## 1.4.10
 
 - Fixed the server-world variable passed to `hideBreakingProgress()` after the vanilla Brain tick.

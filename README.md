@@ -151,7 +151,7 @@ The builder checks its inventory for an appropriate axe, pickaxe or shovel and e
 
 ### Builder appearance
 
-The mod includes its own 64×64 profession overlay: a yellow hard hat and orange workwear with dark tool-belt details. The texture is original and stored in both villager and zombie-villager profession texture paths. The mod must also be installed on clients so they can render the custom profession skin.
+The mod includes its own 64×64 profession overlay: a slate-blue hard hat, muted teal workwear and brown tool-belt details. The texture is stored in both villager and zombie-villager profession texture paths. The mod must also be installed on clients so they can render the custom profession skin.
 
 ### Bed-independent reproduction
 

@@ -33,7 +33,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: village-expansion-test-reports-1.4.11
+          name: village-expansion-test-reports-1.4.12
           path: |
             build/reports/tests/test/
             build/test-results/test/
@@ -43,7 +43,7 @@ jobs:
       - name: Upload mod JAR
         uses: actions/upload-artifact@v4
         with:
-          name: village-expansion-1.4.11
-          path: build/libs/village-expansion-1.4.10.jar
+          name: village-expansion-1.4.12
+          path: build/libs/village-expansion-1.4.12.jar
           if-no-files-found: error
           retention-days: 14
